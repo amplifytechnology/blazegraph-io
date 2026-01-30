@@ -1,0 +1,143 @@
+document_type: Generic
+
+# Pipeline configuration - defines which rules to run and in what order
+# NEW APPROACH: Section detection FIRST, then spatial clustering
+pipeline:
+  rules:
+    - name: "SectionDetection"
+      enabled: true
+    - name: "PatternBasedSectionDetection"
+      enabled: false
+    - name: "ListDetection"
+      enabled: false
+    - name: "SpatialClustering"
+      enabled: true
+    - name: "SizeEnforcer"
+      enabled: false
+    - name: "Validation"
+      enabled: false
+section_and_hierarchy:
+  # Font size analysis parameters
+  large_header_threshold: 0.7
+  medium_header_threshold: 0.5
+  small_header_threshold: 0.15 # More selective - 15% above median
+  min_header_size: 9.5 # Just below 10pt to catch those bold headers
+  use_bold_indicator: true
+  bold_size_strict: false # true = bold AND larger, false = bold OR larger
+  # Contextual hierarchy parameters
+  max_depth: 6
+  font_size_tolerance: 0.1
+  enforce_max_depth: true
+  starting_section_level: 1
+  # Pattern-based section detection configuration
+  pattern_detection:
+    enabled: true
+    respect_font_constraints: true
+    patterns:
+      # More restrictive patterns to avoid false positives like "Meaningful"
+      - "^[A-Z][A-Z\\s]{2,}$" # ALL CAPS (min 3 chars total)
+      - "^\\d+\\.\\s+[A-Z][a-z]{3,}" # "1. Title" (min 4 chars in title)
+      - "^(Chapter|Section|Part|Article)\\s+\\d+" # Explicit structural words
+      - "^[A-Z][a-z]{2,}(?:\\s+[A-Z][a-z]{2,})*:$" # "Title Case:" (with colon, min 3 chars per word)
+# 🎯 SPATIAL CLUSTERING CONFIG - Two-stage clustering approach
+spatial_clustering:
+  enabled: true
+  # 📝 NEW: Paragraph merging based on Tika's paragraph detection
+  enable_paragraph_merging: true # Merge segments with same paragraph_number
+  # 🧩 NEW: Spatial adjacency clustering (groups spatially close elements)
+  enable_spatial_adjacency: true # Disabled by default - paragraph merging is often sufficient
+  min_line_height: 8.0
+  # 🔧 KEY PARAMETER: Higher value = less sensitive = fewer segments
+  vertical_gap_threshold_multiplier: 10.0 # Much less sensitive - allow natural line spacing
+  horizontal_alignment_tolerance: 15.0 # More tolerance for alignment
+  line_grouping_tolerance: 0.5 # More tolerance for line grouping
+  # Separate configuration for different element types
+  sections:
+    min_segment_size: 20 # Short section titles allowed
+    max_segment_size: 300 # Keep section headers concise
+  paragraphs:
+    min_segment_size: 50 # Lower minimum to preserve small content
+    max_segment_size: 3000 # Larger maximum for complete paragraphs
+section_patterns:
+  # - "customer-related success factors"
+  # - "success factors related to collaboration"
+  # - "success factors related to communication"
+  # - "chapter"
+  # - "section"
+  # - "part"
+  # - "overview"
+  # - "principles"
+  # - "approach"
+
+# List detection configuration - two-phase processing
+list_detection:
+  enabled: true
+
+  # Phase 1: Sequence Detection (NEW - element-based approach)
+  sequence_lookahead_elements: 10 # How far to look for next marker (in elements)
+  sequence_boundary_extension: 3 # Elements past last marker to include for boundary detection
+
+  # Phase 2: Content Classification
+  y_tolerance: 10.0 # Y-coordinate tolerance for spatial validation (points)
+  last_item_boundary_gap: 80.0 # Y-gap threshold for sequence end detection (points)
+
+  # List item pattern definitions
+  bullet_patterns: ["•", "·", "●", "■", "▪", "▫", "◦", "‣", "⁃", "-", "*", "→"]
+  numbered_patterns: [
+      "^\\d+\\.", # 1., 2., 3.
+      "^\\d+\\)", # 1), 2), 3)
+      "^\\(\\d+\\)", # (1), (2), (3)
+      "^[a-z]\\.", # a., b., c.
+      "^[a-z]\\)", # a), b), c)
+      "^[A-Z]\\.", # A., B., C.
+      "^[A-Z]\\)", # A), B), C)
+      "^[ivx]+\\.", # i., ii., iii.
+      "^[IVX]+\\.", # I., II., III.
+    ]
+
+  # Phase 2.5: List Validation (NEW - false positive elimination)
+  validation:
+    enabled: true # Enable validation framework
+    minimum_size_check: true # Lists must have >1 item
+    first_item_validation: true # Numbered lists must start with "1"
+    parenthetical_context_check: true # (n) format must start with (1)
+
+    # Advanced context-aware validation rules (NEW)
+    sequential_numbering_check: true # Validate sequential numbering (1,2,3 not 1,7)
+    mathematical_context_check: true # Detect mathematical symbols in math contexts
+    hyphen_context_check: true # Distinguish list bullets from word continuations
+
+    # Rule-specific configuration
+    sequential_numbering:
+      allow_letter_sequences: true # Allow a, b, c sequences
+      max_gap_tolerance: 0 # No gaps allowed in numbering
+
+    mathematical_context:
+      symbols: ["→", "←", "⇒", "⇐", "∀", "∃"] # Mathematical symbols to detect
+      terms: ["equation", "formula", "coordinates", "system", "transform"] # Context terms
+
+    hyphen_context:
+      strategy: "strict" # Strategy: reject, strict, context_aware
+      require_space_after: true # Require space after hyphen for valid lists
+
+    # Future validation rules (disabled)
+    sequence_pattern_check: false
+    content_quality_check: false
+    spatial_coherence_check: false
+
+  # Container behavior (UNCHANGED)
+  create_list_containers: true # Group related list items
+  # TODO: Show ListItem Behavior does not look like it is fully defined in the graph
+  preserve_list_items: false # Clean output - just List nodes
+  max_lookahead_elements: 25 # Maximum lookahead elements for content search
+
+# Size enforcement configuration - intelligent text splitting
+size_enforcer:
+  enabled: true
+  max_size: 400 # Maximum characters per node
+  size_unit: "characters" # "characters", "words", or "bytes"
+  preserve_sentences: true # Respect sentence boundaries when splitting
+  min_split_size_ratio: 0.25 # Minimum chunk size (25% of max_size)
+  recursive: true # Keep splitting until all nodes comply
+  max_iterations: 10 # Safety limit for recursive splitting
+  split_direction: "vertical" # "horizontal" (side-by-side) or "vertical" (stacked)

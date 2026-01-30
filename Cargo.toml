@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "blazegraph-core",
+    "blazegraph-cli",
+]
+resolver = "2"
+
+# Note: We don't use [workspace.dependencies] here because these crates
+# need to work both as a standalone workspace AND when referenced by path
+# from the parent blazegraph-io-app workspace. Workspace inheritance
+# doesn't work across nested workspaces.

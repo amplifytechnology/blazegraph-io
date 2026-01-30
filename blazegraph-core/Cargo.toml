@@ -1,0 +1,40 @@
+[package]
+name = "blazegraph-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core library for semantic document graph processing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/amplify-tech/blazegraph-io"
+homepage = "https://blazegraph.io"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.0"
+
+# XML parsing for Tika XHTML
+quick-xml = "0.31"
+
+# Cryptographic hashing for caching
+sha2 = "0.10"
+
+# JNI for Java interop (when jni-backend feature enabled)
+# Requires 'invocation' feature to create JVMs
+jni = { version = "0.21", features = ["invocation"], optional = true }
+
+[features]
+# Default to JNI backend - works cross-platform
+default = ["jni-backend"]
+
+# JNI backend - primary backend for cross-platform deployments
+jni-backend = ["dep:jni"]

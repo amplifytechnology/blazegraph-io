@@ -1,0 +1,41 @@
+# Build artifacts
+/target/
+debug/
+release/
+
+# Cargo
+# Note: Cargo.lock IS committed for reproducible CLI builds
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Test/temp files
+*.tmp
+*.log
+*.out
+
+# JRE downloads (auto-downloaded, don't commit)
+jre/
+
+# Cache directories
+.cache/
+blazegraph-cache/
+
+# Output files (user-generated)
+*.json
+!blazegraph-cli/configs/**/*.json
+
+# Environment
+.env
+.env.local
