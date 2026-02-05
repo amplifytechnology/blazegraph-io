@@ -536,7 +536,7 @@ pub struct PreprocessorOutput {
 // Rule engine structs 
 
 // New struct for enhanced TextElement processing
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedElement {
     pub element_type: ParsedElementType,
     pub text: String,
@@ -551,7 +551,7 @@ pub struct ParsedElement {
     pub token_count: usize,              // Pre-calculated token count for performance
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ParsedElementType {
     Section,
     Paragraph,

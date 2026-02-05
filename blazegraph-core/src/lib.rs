@@ -16,7 +16,7 @@ pub mod storage;
 // Re-export main types and functions for easy use
 pub use types::*;
 pub use preprocessors::{Preprocessor, PdfPreprocessor, TikaPreprocessor};
-pub use processor::DocumentProcessor;
+pub use processor::{DocumentProcessor, PipelineStages};
 pub use config::ParsingConfig;
 
 // Re-export backends for direct use

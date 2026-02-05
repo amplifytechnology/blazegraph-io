@@ -10,6 +10,16 @@ use anyhow::Result;
 use std::time::{Instant, Duration};
 use std::path::Path;
 
+/// Captured intermediate outputs from each pipeline stage
+/// Used for testing and diagnostics — lets you inspect/compare each boundary
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PipelineStages {
+    pub xhtml: String,
+    pub text_elements: Vec<TextElement>,
+    pub parsed_elements: Vec<ParsedElement>,
+    pub graph: DocumentGraph,
+}
+
 /// Simple profiler that collects timings for pipeline steps
 pub struct StepProfiler {
     enabled: bool,
@@ -427,6 +437,55 @@ impl DocumentProcessor {
         println!("⏱️  Total processing time: {:.3}s", start_time.elapsed().as_secs_f64());
 
         Ok(graph)
+    }
+
+    /// Process document and capture all intermediate stage outputs
+    /// Used for pipeline diagnostics and testing stage boundaries
+    pub fn process_document_capture_stages(
+        &mut self,
+        input_path: &str,
+        config: &ParsingConfig,
+    ) -> Result<PipelineStages> {
+        let input_path_ref = Path::new(input_path);
+        let pdf_bytes = std::fs::read(input_path_ref)?;
+
+        // Stage 1a: PDF → XHTML
+        let xhtml = self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)?;
+        println!("📋 Stage 1a: XHTML captured ({} bytes)", xhtml.len());
+
+        // Stage 1b: XHTML → TextElements
+        let preprocessor_output = self.preprocessor.parse_markup_to_preprocessor_output(&xhtml)?;
+        let text_elements = preprocessor_output.text_elements.clone();
+        println!("📋 Stage 1b: {} TextElements captured", text_elements.len());
+
+        // Stage 2: Classification + Rules → ParsedElements
+        let classification = self.classifier.classify(&preprocessor_output)?;
+        let parsed_elements = if config.minimal_parse {
+            self.rule_engine.convert_text_elements_to_parsed(&preprocessor_output.text_elements)
+        } else {
+            let document_analysis = DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
+            let font_size_analysis = self.rule_engine.analyze_font_sizes(&preprocessor_output.text_elements, &preprocessor_output.style_data);
+            self.rule_engine.apply_rules_with_config(
+                &preprocessor_output.text_elements,
+                &classification,
+                &document_analysis,
+                &font_size_analysis,
+                &preprocessor_output.style_data,
+                config,
+            )?
+        };
+        println!("📋 Stage 2: {} ParsedElements captured", parsed_elements.len());
+
+        // Stage 3: ParsedElements → DocumentGraph
+        let graph = self.graph_builder.build_graph(parsed_elements.clone())?;
+        println!("📋 Stage 3: Graph captured ({} nodes, {} edges)", graph.nodes.len(), graph.edges.len());
+
+        Ok(PipelineStages {
+            xhtml,
+            text_elements,
+            parsed_elements,
+            graph,
+        })
     }
 
     /// Simple document processing function using default config
