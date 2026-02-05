@@ -187,6 +187,7 @@ pub struct StyleMetadata {
 pub struct GraphMetadata {
     pub created_at: DateTime<Utc>,
     pub document_type: DocumentType,
+    pub flow_type: FlowType,
     pub total_nodes: usize,
     pub processing_time_ms: u128,
     
@@ -203,6 +204,7 @@ impl Default for GraphMetadata {
         Self {
             created_at: Utc::now(),
             document_type: DocumentType::Unknown,
+            flow_type: FlowType::Fixed,
             total_nodes: 0,
             processing_time_ms: 0,
             total_tokens: 0,
