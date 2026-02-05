@@ -64,6 +64,69 @@ impl DocumentGraph {
         }
     }
 
+    /// Compute breadcrumbs for all nodes by walking the tree top-down.
+    /// Sections contribute their text to the trail. Non-section nodes inherit
+    /// their parent's breadcrumbs without adding to them.
+    /// If document metadata has a title, it becomes the first breadcrumb.
+    pub fn compute_breadcrumbs(&mut self) {
+        let root_id = self.root_node.id;
+        
+        // Start with document title as first crumb if available
+        let root_breadcrumbs: Vec<String> = self.root_node.document_metadata.title
+            .as_ref()
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![t.clone()])
+            .unwrap_or_default();
+        
+        // Set breadcrumbs on the Document node itself
+        if let Some(doc_node) = self.nodes.get_mut(&root_id) {
+            doc_node.location.semantic.breadcrumbs = root_breadcrumbs.clone();
+        }
+        
+        // Collect children to avoid borrow conflict
+        let root_children: Vec<NodeId> = self.nodes
+            .get(&root_id)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        
+        for child_id in root_children {
+            self.propagate_breadcrumbs(child_id, &root_breadcrumbs);
+        }
+    }
+    
+    /// Recursively propagate breadcrumbs down the tree
+    fn propagate_breadcrumbs(&mut self, node_id: NodeId, parent_breadcrumbs: &[String]) {
+        // Determine this node's breadcrumbs
+        let (node_breadcrumbs, children) = {
+            let node = match self.nodes.get(&node_id) {
+                Some(n) => n,
+                None => return,
+            };
+            
+            let breadcrumbs = if node.node_type == "Section" {
+                // Sections contribute their text to the trail
+                let mut crumbs = parent_breadcrumbs.to_vec();
+                crumbs.push(node.content.text.clone());
+                crumbs
+            } else {
+                // Non-sections inherit parent breadcrumbs
+                parent_breadcrumbs.to_vec()
+            };
+            
+            (breadcrumbs, node.children.clone())
+        };
+        
+        // Set breadcrumbs on this node
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.location.semantic.breadcrumbs = node_breadcrumbs.clone();
+        }
+        
+        // Recurse into children
+        for child_id in children {
+            self.propagate_breadcrumbs(child_id, &node_breadcrumbs);
+        }
+    }
+
     /// Analyze any subtree starting from given node
     pub fn _analyze_subtree(&self, root_node_id: NodeId) -> Option<GraphAnalyticsResult> {
         let subtree_nodes = self._collect_subtree_nodes(root_node_id);
