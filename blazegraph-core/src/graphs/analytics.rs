@@ -183,9 +183,10 @@ impl GraphAnalytics {
         let mut max_depth = 0u32;
         
         for node in nodes {
-            *depth_counts.entry(node.depth).or_insert(0) += 1;
-            total_depth += node.depth;
-            max_depth = max_depth.max(node.depth);
+            let depth = node.location.semantic.depth;
+            *depth_counts.entry(depth).or_insert(0) += 1;
+            total_depth += depth;
+            max_depth = max_depth.max(depth);
         }
         
         let avg_depth = if !nodes.is_empty() {

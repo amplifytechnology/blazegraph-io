@@ -6,6 +6,46 @@ use uuid::Uuid;
 pub type NodeId = Uuid;
 pub type EdgeId = Uuid;
 
+// ===== NODE LOCATION TYPES =====
+// These types implement the location model from 001-document-model.
+// SemanticLocation is always present (computed by GraphBuilder from tree structure).
+// PhysicalLocation is only present for fixed-flow formats (PDF).
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeLocation {
+    /// Always present — computed by GraphBuilder from final tree structure
+    pub semantic: SemanticLocation,
+    /// Only for fixed-flow formats (PDF) — passed through from channel
+    pub physical: Option<PhysicalLocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticLocation {
+    /// Hierarchical position in the document tree (e.g. "2.3.4")
+    pub path: String,
+    /// Tree depth (0 = root level)
+    pub depth: u32,
+    /// Human-readable trail (e.g. ["Chapter 2", "Methods", "Overview"])
+    pub breadcrumbs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhysicalLocation {
+    /// Page number (1-indexed)
+    pub page: u32,
+    /// Bounding box on the page
+    pub bounding_box: BoundingBox,
+}
+
+/// Signals whether physical location data is meaningful for this document
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FlowType {
+    /// PDF — has physical layout, physical_location is present
+    Fixed,
+    /// Markdown, DOCX — reflows, physical_location is None
+    Free,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentRootNode {
     pub id: NodeId,
@@ -33,14 +73,11 @@ pub struct SortedDocumentGraph {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentNode {
     pub id: NodeId,
-    pub node_type: String, // Changed from enum to string
-    pub page: Option<u32>, // Moved page from bounding_box to top level
+    pub node_type: String,
+    pub location: NodeLocation,
     pub text_order: Option<u32>,
-    pub hierarchical_path: String,
-    pub depth: u32,
     pub content: NodeContent,
     pub style_info: Option<StyleMetadata>,
-    pub bounding_box: Option<BoundingBox>,
     pub token_count: usize,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
@@ -51,22 +88,41 @@ impl DocumentNode {
         Self {
             id: Uuid::new_v4(),
             node_type: node_type.to_string(),
-            page: None,
+            location: NodeLocation {
+                semantic: SemanticLocation {
+                    path: String::new(),
+                    depth: 0,
+                    breadcrumbs: Vec::new(),
+                },
+                physical: None,
+            },
             text_order: Some(0),
-            hierarchical_path: String::new(),
-            depth: 0,
             content: NodeContent::new(text),
             style_info: None,
-            bounding_box: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
         }
     }
 
-    pub fn new_with_page(node_type: &str, text: String, page: Option<u32>) -> Self {
+    pub fn new_with_physical(
+        node_type: &str,
+        text: String,
+        page: Option<u32>,
+        bounding_box: Option<BoundingBox>,
+    ) -> Self {
         let mut node = Self::new(node_type, text);
-        node.page = page;
+        if let Some(page) = page {
+            node.location.physical = Some(PhysicalLocation {
+                page,
+                bounding_box: bounding_box.unwrap_or(BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                }),
+            });
+        }
         node
     }
 }
@@ -378,13 +434,11 @@ pub struct SequentialDocument {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequentialSegment {
     pub id: usize,
-    pub level: u32,
+    pub node_type: String,
     pub text: String,
-    pub path: String,
-    pub bbox: Option<BoundingBox>,
+    pub location: NodeLocation,
     pub style: Option<StyleMetadata>,
     pub tokens: usize,
-    pub page: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

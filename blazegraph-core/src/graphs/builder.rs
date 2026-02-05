@@ -49,18 +49,22 @@ impl GraphBuilder {
         let document_node = DocumentNode {
             id: root_id,
             node_type: "Document".to_string(),
-            page: Some(0),
+            location: NodeLocation {
+                semantic: SemanticLocation {
+                    path: String::new(),
+                    depth: 0,
+                    breadcrumbs: Vec::new(),
+                },
+                physical: None,
+            },
             text_order: None, // Document comes first (None sorts before Some)
-            hierarchical_path: "".to_string(),
-            depth: 0,
             content: NodeContent {
-                text: "Document".to_string(), // Will be updated with title if available
+                text: "Document".to_string(),
             },
             style_info: None,
-            bounding_box: None,
             token_count: 0,
             parent: None,
-            children: Vec::new(), // Will be populated as we add nodes
+            children: Vec::new(),
         };
         graph.nodes.insert(root_id, document_node);
 
@@ -85,9 +89,9 @@ impl GraphBuilder {
             // Insert node and create relationships
             let mut final_node = node;
             final_node.parent = Some(parent_id);
-            final_node.depth = group.hierarchy_level;
+            final_node.location.semantic.depth = group.hierarchy_level;
             final_node.text_order = Some(index as u32);
-            final_node.hierarchical_path =
+            final_node.location.semantic.path =
                 self.generate_hierarchical_path(&graph, parent_id, index);
 
             graph.nodes.insert(node_id, final_node);
@@ -113,7 +117,7 @@ impl GraphBuilder {
                 // Remove items at same or higher level
                 while let Some(&stack_id) = node_stack.last() {
                     if let Some(stack_node) = graph.nodes.get(&stack_id) {
-                        if stack_node.depth >= group.hierarchy_level {
+                        if stack_node.location.semantic.depth >= group.hierarchy_level {
                             node_stack.pop();
                         } else {
                             break;
@@ -164,7 +168,7 @@ impl GraphBuilder {
             format!("{}", graph.root_node.children.len() + 1)
         } else if let Some(parent) = graph.nodes.get(&parent_id) {
             // Build path from parent's path
-            format!("{}.{}", parent.hierarchical_path, parent.children.len() + 1)
+            format!("{}.{}", parent.location.semantic.path, parent.children.len() + 1)
         } else {
             format!("{}", index + 1)
         }
@@ -210,35 +214,37 @@ impl GraphBuilder {
     }
 
     fn create_node_from_group(&self, group: &ElementGroup, order: u32) -> Result<DocumentNode> {
-        // Determine node type as string based on the original ParsedElementType from the first element
-        let (node_type, page) = if let Some(first_element) = group.elements.first() {
-            let node_type_str = match first_element.element_type {
+        // Determine node type from the first ParsedElement
+        let (node_type_str, physical) = if let Some(first_element) = group.elements.first() {
+            let node_type = match first_element.element_type {
                 crate::types::ParsedElementType::Section => "Section",
                 crate::types::ParsedElementType::List => "List",
                 crate::types::ParsedElementType::ListItem => "ListItem",
                 crate::types::ParsedElementType::Paragraph => "Paragraph",
             };
 
-            // Extract page from first element
-            let page = Some(first_element.page_number);
-            (node_type_str, page)
+            // Build PhysicalLocation from ParsedElement's flat fields
+            let physical = Some(PhysicalLocation {
+                page: first_element.page_number,
+                bounding_box: first_element.bounding_box.clone(),
+            });
+
+            (node_type, physical)
         } else {
-            // Fallback to group type if no element is available
-            let node_type_str = match group.group_type {
+            let node_type = match group.group_type {
                 GroupType::Section => "Section",
                 GroupType::Paragraph => "Paragraph",
             };
-            (node_type_str, None)
+            (node_type, None)
         };
 
-        let mut node = DocumentNode::new_with_page(node_type, group.combined_text.clone(), page);
+        let mut node = DocumentNode::new(node_type_str, group.combined_text.clone());
+        node.location.physical = physical;
         node.text_order = Some(order);
-        // Sum pre-calculated token counts from all elements in the group
         node.token_count = group.elements.iter().map(|e| e.token_count).sum();
 
-        // Use style info from the most prominent element (usually the first)
+        // Style info from the most prominent element
         if let Some(first_element) = group.elements.first() {
-            // Convert FontClass to StyleMetadata for node storage
             node.style_info = Some(StyleMetadata {
                 font_class: first_element.style_info.class_name.clone(),
                 font_size: Some(first_element.style_info.font_size),
@@ -246,14 +252,6 @@ impl GraphBuilder {
                 color: Some(first_element.style_info.color.clone()),
                 is_bold: first_element.style_info.font_weight.to_lowercase().contains("bold"),
                 is_italic: first_element.style_info.font_style.to_lowercase().contains("italic"),
-            });
-            // Create bounding box without page (since page is now at node level)
-            let bbox = &first_element.bounding_box;
-            node.bounding_box = Some(BoundingBox {
-                x: bbox.x,
-                y: bbox.y,
-                width: bbox.width,
-                height: bbox.height,
             });
         }
 

@@ -33,7 +33,7 @@ impl DocumentGraph {
     }
 
     pub fn max_depth(&self) -> u32 {
-        self.nodes.values().map(|n| n.depth).max().unwrap_or(0)
+        self.nodes.values().map(|n| n.location.semantic.depth).max().unwrap_or(0)
     }
 
     pub fn save_to_json(&self, path: &str) -> Result<()> {
