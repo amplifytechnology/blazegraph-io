@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PipelineStages {
     pub xhtml: String,
-    pub text_elements: Vec<PdfElement>,
+    pub text_elements: Vec<PdfTextElement>,
     pub parsed_elements: Vec<ParsedPdfElement>,
     pub graph: DocumentGraph,
 }

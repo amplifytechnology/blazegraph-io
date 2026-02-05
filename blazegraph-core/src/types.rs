@@ -354,7 +354,7 @@ pub enum RichnessLevel {
 pub struct TikaOutput {
     pub xhtml_content: String,
     pub metadata: DocumentMetadata,
-    pub text_elements: Vec<PdfElement>,
+    pub text_elements: Vec<PdfTextElement>,
     /// XHTML content hash for Level 2 cache key generation
     pub xhtml_hash: String,
     // New enhanced structures
@@ -364,7 +364,7 @@ pub struct TikaOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PdfElement {
+pub struct PdfTextElement {
     pub text: String,
     pub style_info: FontClass, // Self-contained style information (no Option)
     pub bounding_box: BoundingBox, // Required positioning (no Option)
@@ -491,7 +491,7 @@ pub struct DocumentAnalysis {
 
 impl DocumentAnalysis {
     /// Create document analysis from text elements
-    pub fn analyze_text_elements(text_elements: &[PdfElement]) -> Self {
+    pub fn analyze_text_elements(text_elements: &[PdfTextElement]) -> Self {
         let mut font_size_counts: HashMap<String, usize> = HashMap::new();
         let mut font_family_counts: HashMap<String, usize> = HashMap::new();
         let mut bold_count = 0;
@@ -594,7 +594,7 @@ pub enum GroupType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreprocessorOutput {
     /// Extracted text elements with positioning and styling
-    pub text_elements: Vec<PdfElement>,
+    pub text_elements: Vec<PdfTextElement>,
     /// Document metadata (title, author, creation date, etc.)
     pub metadata: DocumentMetadata,
     /// Style information (fonts, colors, formatting)

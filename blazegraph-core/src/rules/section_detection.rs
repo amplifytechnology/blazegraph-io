@@ -1,13 +1,13 @@
 use super::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
 use crate::config::{ParsingConfig, SectionAndHierarchyConfig};
 use crate::types::*;
-use crate::types::{DocumentAnalysis, PdfElement, StyleData};
+use crate::types::{DocumentAnalysis, PdfTextElement, StyleData};
 use anyhow::Result;
 
 // SectionAndHierarchyDetectionRule - detects sections and assigns contextual hierarchy levels to all elements
 pub struct SectionAndHierarchyDetectionRule<'a> {
     _engine: &'a RuleEngine,
-    text_elements: &'a [PdfElement],
+    text_elements: &'a [PdfTextElement],
     config: &'a ParsingConfig,
     document_analysis: &'a DocumentAnalysis,
     font_size_analysis: &'a FontSizeAnalysis,
@@ -17,7 +17,7 @@ pub struct SectionAndHierarchyDetectionRule<'a> {
 impl<'a> SectionAndHierarchyDetectionRule<'a> {
     pub fn new(
         engine: &'a RuleEngine,
-        text_elements: &'a [PdfElement],
+        text_elements: &'a [PdfTextElement],
         config: &'a ParsingConfig,
         document_analysis: &'a DocumentAnalysis,
         font_size_analysis: &'a FontSizeAnalysis,
@@ -116,7 +116,7 @@ impl<'a> SectionAndHierarchyDetectionRule<'a> {
     /// Classify a single text element and assign contextual hierarchy level based on spatial branching
     fn classify_individual_element_contextual(
         &self,
-        element: &PdfElement,
+        element: &PdfTextElement,
         font_size_analysis: &FontSizeAnalysis,
         current_element: &ParsedPdfElement,
         hierarchy_context: &mut HierarchyContext,

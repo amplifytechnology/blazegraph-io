@@ -130,7 +130,7 @@ impl RuleEngine {
 
     pub fn apply_rules(
         &self,
-        text_elements: &[PdfElement],
+        text_elements: &[PdfTextElement],
         classification: &ClassificationResult,
         document_analysis: &DocumentAnalysis,
         font_size_analysis: &FontSizeAnalysis,
@@ -203,7 +203,7 @@ impl RuleEngine {
     /// Apply rules with explicit config (new config flow pattern)
     pub fn apply_rules_with_config(
         &self,
-        text_elements: &[PdfElement],
+        text_elements: &[PdfTextElement],
         classification: &ClassificationResult,
         document_analysis: &DocumentAnalysis,
         font_size_analysis: &FontSizeAnalysis,
@@ -250,7 +250,7 @@ impl RuleEngine {
         &self,
         rule_name: &str,
         elements: Vec<ParsedPdfElement>,
-        text_elements: &[PdfElement],
+        text_elements: &[PdfTextElement],
         config: &ParsingConfig,
         document_analysis: &DocumentAnalysis,
         font_size_analysis: &FontSizeAnalysis,
@@ -327,7 +327,7 @@ impl RuleEngine {
     /// This provides rich insights about font usage patterns to make smart decisions
     pub fn analyze_font_sizes(
         &self,
-        text_elements: &[PdfElement],
+        text_elements: &[PdfTextElement],
         style_data: &StyleData,
     ) -> FontSizeAnalysis {
         // STEP 1: Count frequency of each font class used in text elements (single pass)
@@ -470,7 +470,7 @@ impl RuleEngine {
     /// Uses rich semantic data from the enhanced TextElement structure
     pub fn convert_text_elements_to_parsed(
         &self,
-        text_elements: &[PdfElement],
+        text_elements: &[PdfTextElement],
     ) -> Vec<ParsedPdfElement> {
         let mut elements = Vec::new();
 

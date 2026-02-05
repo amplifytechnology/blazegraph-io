@@ -65,7 +65,7 @@ pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
 fn parse_xhtml_content(
     xhtml: &str,
 ) -> Result<(
-    Vec<PdfElement>,
+    Vec<PdfTextElement>,
     DocumentMetadata,
     StyleData,
     Option<BookmarkData>,
@@ -100,7 +100,7 @@ fn extract_text_elements(
     xhtml: &str,
     style_data: &StyleData,
     bookmark_data: &Option<BookmarkData>,
-) -> Result<Vec<PdfElement>> {
+) -> Result<Vec<PdfTextElement>> {
     // Pre-allocate capacity based on estimated element count
     let estimated_elements = xhtml.matches("<span").count();
     let mut text_elements = Vec::with_capacity(estimated_elements);
@@ -174,7 +174,7 @@ fn extract_spans_from_paragraph(
     paragraph_number: u32,
     style_data: &StyleData,
     bookmark_sections: &[BookmarkSection],
-    text_elements: &mut Vec<PdfElement>,
+    text_elements: &mut Vec<PdfTextElement>,
 ) -> Result<()> {
     for cap in SPAN_REGEX.captures_iter(paragraph_html) {
         if let (Some(class), Some(bbox_str), Some(line_str), Some(segment_str), Some(text)) =
@@ -212,7 +212,7 @@ fn extract_spans_from_paragraph(
                         .find(|section| section.title.trim() == text_content)
                         .cloned();
 
-                    text_elements.push(PdfElement {
+                    text_elements.push(PdfTextElement {
                         text: text_content.to_string(),
                         style_info: resolved_font_class,
                         bounding_box: BoundingBox {
