@@ -17,20 +17,20 @@ impl GraphBuilder {
     /// Build graph from elements and populate root node with metadata and analysis
     pub fn build_graph_with_metadata(
         &self,
-        elements: Vec<ParsedElement>,
+        elements: Vec<ParsedPdfElement>,
         document_metadata: DocumentMetadata,
         document_analysis: DocumentAnalysis,
     ) -> Result<DocumentGraph> {
         let mut graph = self.build_graph(elements)?;
-        
+
         // Update root node with proper metadata and analysis
         graph.root_node.document_metadata = document_metadata;
         graph.root_node.document_analysis = document_analysis;
-        
+
         Ok(graph)
     }
 
-    pub fn build_graph(&self, elements: Vec<ParsedElement>) -> Result<DocumentGraph> {
+    pub fn build_graph(&self, elements: Vec<ParsedPdfElement>) -> Result<DocumentGraph> {
         println!(
             "🏗️  Building document graph from {} elements",
             elements.len()
@@ -171,7 +171,11 @@ impl GraphBuilder {
             format!("{}", graph.root_node.children.len() + 1)
         } else if let Some(parent) = graph.nodes.get(&parent_id) {
             // Build path from parent's path
-            format!("{}.{}", parent.location.semantic.path, parent.children.len() + 1)
+            format!(
+                "{}.{}",
+                parent.location.semantic.path,
+                parent.children.len() + 1
+            )
         } else {
             format!("{}", index + 1)
         }
@@ -193,7 +197,7 @@ impl GraphBuilder {
         graph.edges.insert(edge.id, edge);
     }
 
-    fn group_elements_into_chunks(&self, elements: Vec<ParsedElement>) -> Vec<ElementGroup> {
+    fn group_elements_into_chunks(&self, elements: Vec<ParsedPdfElement>) -> Vec<ElementGroup> {
         let mut groups = Vec::new();
 
         // Simple 1:1 mapping - create one ElementGroup per ParsedElement
@@ -253,8 +257,16 @@ impl GraphBuilder {
                 font_size: Some(first_element.style_info.font_size),
                 font_family: Some(first_element.style_info.font_family.clone()),
                 color: Some(first_element.style_info.color.clone()),
-                is_bold: first_element.style_info.font_weight.to_lowercase().contains("bold"),
-                is_italic: first_element.style_info.font_style.to_lowercase().contains("italic"),
+                is_bold: first_element
+                    .style_info
+                    .font_weight
+                    .to_lowercase()
+                    .contains("bold"),
+                is_italic: first_element
+                    .style_info
+                    .font_style
+                    .to_lowercase()
+                    .contains("italic"),
             });
         }
 

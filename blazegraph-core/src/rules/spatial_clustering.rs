@@ -1,25 +1,21 @@
+use super::engine::ParseRule;
 use crate::config::{ElementClusteringConfig, ParsingConfig};
-use crate::types::{BoundingBox};
-use anyhow::Result;
+use crate::types::BoundingBox;
 use crate::types::*;
-use super::engine::{ParseRule};
+use anyhow::Result;
 
 pub struct SpatialClusteringRule<'a> {
     config: &'a ParsingConfig,
 }
 
 impl<'a> SpatialClusteringRule<'a> {
-    pub fn new(
-        config: &'a ParsingConfig,
-    ) -> Self {
-        Self {
-            config,
-        }
+    pub fn new(config: &'a ParsingConfig) -> Self {
+        Self { config }
     }
 }
 
 impl<'a> ParseRule for SpatialClusteringRule<'a> {
-    fn apply(&self, elements: Vec<ParsedElement>) -> Result<Vec<ParsedElement>> {
+    fn apply(&self, elements: Vec<ParsedPdfElement>) -> Result<Vec<ParsedPdfElement>> {
         println!(
             "🧩 SpatialClustering rule applied - clustering {} elements by adjacency",
             elements.len()
@@ -63,19 +59,26 @@ impl<'a> ParseRule for SpatialClusteringRule<'a> {
 }
 
 impl<'a> SpatialClusteringRule<'a> {
-    fn cluster_paragraphs_elements(&self, elements: Vec<ParsedElement>) -> Result<Vec<ParsedElement>> {
+    fn cluster_paragraphs_elements(
+        &self,
+        elements: Vec<ParsedPdfElement>,
+    ) -> Result<Vec<ParsedPdfElement>> {
         println!("🔗 Clustering paragraph segments by paragraph_number and page...");
-        
+
         if elements.is_empty() {
             return Ok(elements);
         }
 
         // Group elements by (page_number, paragraph_number)
-        let mut paragraph_groups: std::collections::HashMap<(u32, u32), Vec<ParsedElement>> = std::collections::HashMap::new();
-        
+        let mut paragraph_groups: std::collections::HashMap<(u32, u32), Vec<ParsedPdfElement>> =
+            std::collections::HashMap::new();
+
         for element in elements {
             let key = (element.page_number, element.paragraph_number);
-            paragraph_groups.entry(key).or_insert_with(Vec::new).push(element);
+            paragraph_groups
+                .entry(key)
+                .or_insert_with(Vec::new)
+                .push(element);
         }
 
         let original_count = paragraph_groups.values().map(|v| v.len()).sum::<usize>();
@@ -90,56 +93,58 @@ impl<'a> SpatialClusteringRule<'a> {
                 // Multiple segments in this paragraph - merge them
                 // Sort by reading_order to maintain proper text flow
                 group.sort_by_key(|e| e.reading_order);
-                
+
                 let _group_len = group.len();
                 let mut group_iter = group.into_iter();
-                
+
                 // Start with the first element as the base
                 let mut merged_element = group_iter.next().unwrap();
-                
+
                 // Merge all subsequent elements into the first one
                 for element in group_iter {
                     // Merge text with space separator
                     merged_element.text = format!("{} {}", merged_element.text, element.text);
-                    
+
                     // Expand bounding box to encompass all segments
-                    merged_element.bounding_box = self.merge_bounding_boxes(
-                        &merged_element.bounding_box, 
-                        &element.bounding_box
-                    );
-                    
+                    merged_element.bounding_box = self
+                        .merge_bounding_boxes(&merged_element.bounding_box, &element.bounding_box);
+
                     // Sum token counts for efficient aggregation
                     merged_element.token_count += element.token_count;
-                    
+
                     // Keep the earliest reading_order (from the sorted first element)
                     // Other fields like style_info, page_number, paragraph_number stay from first element
                 }
-                
-                // println!("   📄 Page {}, Paragraph {}: Merged {} segments", 
+
+                // println!("   📄 Page {}, Paragraph {}: Merged {} segments",
                 //     page_num, para_num, group_len);
-                
+
                 clustered_elements.push(merged_element);
             }
         }
 
         // Sort the final result by page and reading order for consistent output
         clustered_elements.sort_by(|a, b| {
-            a.page_number.cmp(&b.page_number)
+            a.page_number
+                .cmp(&b.page_number)
                 .then(a.reading_order.cmp(&b.reading_order))
         });
 
-        println!("   ✅ Clustered {} segments into {} paragraphs", 
-            original_count, clustered_elements.len());
+        println!(
+            "   ✅ Clustered {} segments into {} paragraphs",
+            original_count,
+            clustered_elements.len()
+        );
 
         Ok(clustered_elements)
     }
     /// Cluster adjacent elements of the same type and hierarchy level on the same page
     fn cluster_adjacent_elements(
         &self,
-        elements: Vec<ParsedElement>,
-    ) -> Result<Vec<ParsedElement>> {
+        elements: Vec<ParsedPdfElement>,
+    ) -> Result<Vec<ParsedPdfElement>> {
         let mut clustered = Vec::new();
-        let mut current_cluster: Option<ParsedElement> = None;
+        let mut current_cluster: Option<ParsedPdfElement> = None;
 
         for element in elements {
             match &mut current_cluster {
@@ -170,7 +175,7 @@ impl<'a> SpatialClusteringRule<'a> {
     }
 
     /// Check if two elements can be merged (same type, hierarchy level, page, and spatially adjacent)
-    fn can_merge_elements(&self, cluster: &ParsedElement, element: &ParsedElement) -> bool {
+    fn can_merge_elements(&self, cluster: &ParsedPdfElement, element: &ParsedPdfElement) -> bool {
         // Must be same type
         if cluster.element_type != element.element_type {
             return false;
@@ -203,12 +208,13 @@ impl<'a> SpatialClusteringRule<'a> {
     }
 
     /// Merge element into cluster, updating text and bounding box
-    fn merge_elements(&self, cluster: &mut ParsedElement, element: ParsedElement) {
+    fn merge_elements(&self, cluster: &mut ParsedPdfElement, element: ParsedPdfElement) {
         // Merge text with space separator
         cluster.text = format!("{} {}", cluster.text, element.text);
 
         // Merge bounding boxes (both elements always have bounding boxes now)
-        cluster.bounding_box = self.merge_bounding_boxes(&cluster.bounding_box, &element.bounding_box);
+        cluster.bounding_box =
+            self.merge_bounding_boxes(&cluster.bounding_box, &element.bounding_box);
 
         // Sum token counts for efficient aggregation
         cluster.token_count += element.token_count;
@@ -235,17 +241,21 @@ impl<'a> SpatialClusteringRule<'a> {
         let min_y = bbox1.y.min(bbox2.y); // Topmost y
         let max_x = (bbox1.x + bbox1.width).max(bbox2.x + bbox2.width); // Rightmost x
         let max_y = (bbox1.y + bbox1.height).max(bbox2.y + bbox2.height); // Bottommost y
-        
+
         BoundingBox {
             x: min_x,
             y: min_y,
-            width: max_x - min_x, // Span full width
+            width: max_x - min_x,  // Span full width
             height: max_y - min_y, // Span full height
         }
     }
 
     /// Check if two elements are spatially adjacent (close enough to merge)
-    fn are_spatially_adjacent(&self, cluster: &ParsedElement, element: &ParsedElement) -> bool {
+    fn are_spatially_adjacent(
+        &self,
+        cluster: &ParsedPdfElement,
+        element: &ParsedPdfElement,
+    ) -> bool {
         // Both elements always have bounding boxes now
         let cluster_bbox = &cluster.bounding_box;
         let element_bbox = &element.bounding_box;

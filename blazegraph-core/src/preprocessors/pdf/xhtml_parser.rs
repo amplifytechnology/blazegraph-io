@@ -5,7 +5,7 @@
 //!
 //! The Blazegraph XHTML format includes:
 //! - Page divs with data-page attributes
-//! - Spans with data-bbox, data-line, data-segment attributes  
+//! - Spans with data-bbox, data-line, data-segment attributes
 //! - CSS font classes in <style> block
 //! - Document metadata in <meta> tags
 //! - Bookmarks/TOC in <ul> structure
@@ -44,7 +44,7 @@ static LIST_ITEM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<li>([^<]+)</li>").unwrap());
 
 /// Parse Blazegraph XHTML into PreprocessorOutput
-/// 
+///
 /// This is the main entry point for XHTML parsing. It extracts:
 /// - Text elements with positioning and styling
 /// - Document metadata
@@ -65,7 +65,7 @@ pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
 fn parse_xhtml_content(
     xhtml: &str,
 ) -> Result<(
-    Vec<TextElement>,
+    Vec<PdfElement>,
     DocumentMetadata,
     StyleData,
     Option<BookmarkData>,
@@ -100,7 +100,7 @@ fn extract_text_elements(
     xhtml: &str,
     style_data: &StyleData,
     bookmark_data: &Option<BookmarkData>,
-) -> Result<Vec<TextElement>> {
+) -> Result<Vec<PdfElement>> {
     // Pre-allocate capacity based on estimated element count
     let estimated_elements = xhtml.matches("<span").count();
     let mut text_elements = Vec::with_capacity(estimated_elements);
@@ -174,7 +174,7 @@ fn extract_spans_from_paragraph(
     paragraph_number: u32,
     style_data: &StyleData,
     bookmark_sections: &[BookmarkSection],
-    text_elements: &mut Vec<TextElement>,
+    text_elements: &mut Vec<PdfElement>,
 ) -> Result<()> {
     for cap in SPAN_REGEX.captures_iter(paragraph_html) {
         if let (Some(class), Some(bbox_str), Some(line_str), Some(segment_str), Some(text)) =
@@ -199,13 +199,12 @@ fn extract_spans_from_paragraph(
 
                     // Resolve font class from style_data
                     let font_class_name = class.as_str();
-                    let resolved_font_class = if let Some(font_class) =
-                        style_data.font_classes.get(font_class_name)
-                    {
-                        font_class.clone()
-                    } else {
-                        fallback_font(font_class_name)
-                    };
+                    let resolved_font_class =
+                        if let Some(font_class) = style_data.font_classes.get(font_class_name) {
+                            font_class.clone()
+                        } else {
+                            fallback_font(font_class_name)
+                        };
 
                     // Check for bookmark match
                     let bookmark_match = bookmark_sections
@@ -213,7 +212,7 @@ fn extract_spans_from_paragraph(
                         .find(|section| section.title.trim() == text_content)
                         .cloned();
 
-                    text_elements.push(TextElement {
+                    text_elements.push(PdfElement {
                         text: text_content.to_string(),
                         style_info: resolved_font_class,
                         bounding_box: BoundingBox {
@@ -274,9 +273,7 @@ fn extract_enhanced_metadata(xhtml: &str) -> Result<DocumentMetadata> {
                 "dcterms:modified" => metadata.modified = Some(content_str),
                 "dc:description" => metadata.description = Some(content_str),
                 "pdf:encrypted" => metadata.encrypted = Some(content_str == "true"),
-                "pdf:hasMarkedContent" => {
-                    metadata.has_marked_content = Some(content_str == "true")
-                }
+                "pdf:hasMarkedContent" => metadata.has_marked_content = Some(content_str == "true"),
                 "xmpTPg:NPages" => {
                     if let Ok(pages) = content_str.parse::<u32>() {
                         metadata.page_count = pages;

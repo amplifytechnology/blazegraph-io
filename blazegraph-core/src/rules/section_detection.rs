@@ -1,27 +1,27 @@
-use crate::config::{ParsingConfig, SectionAndHierarchyConfig};
-use crate::types::{DocumentAnalysis, StyleData, TextElement};
-use anyhow::Result;
-use crate::types::*;
 use super::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
+use crate::config::{ParsingConfig, SectionAndHierarchyConfig};
+use crate::types::*;
+use crate::types::{DocumentAnalysis, PdfElement, StyleData};
+use anyhow::Result;
 
 // SectionAndHierarchyDetectionRule - detects sections and assigns contextual hierarchy levels to all elements
 pub struct SectionAndHierarchyDetectionRule<'a> {
     _engine: &'a RuleEngine,
-    text_elements: &'a [TextElement],
+    text_elements: &'a [PdfElement],
     config: &'a ParsingConfig,
     document_analysis: &'a DocumentAnalysis,
-    font_size_analysis: &'a FontSizeAnalysis, 
-    _style_data: &'a StyleData, 
+    font_size_analysis: &'a FontSizeAnalysis,
+    _style_data: &'a StyleData,
 }
 
 impl<'a> SectionAndHierarchyDetectionRule<'a> {
     pub fn new(
         engine: &'a RuleEngine,
-        text_elements: &'a [TextElement],
+        text_elements: &'a [PdfElement],
         config: &'a ParsingConfig,
         document_analysis: &'a DocumentAnalysis,
         font_size_analysis: &'a FontSizeAnalysis,
-        style_data: &'a StyleData
+        style_data: &'a StyleData,
     ) -> Self {
         Self {
             _engine: engine,
@@ -35,7 +35,7 @@ impl<'a> SectionAndHierarchyDetectionRule<'a> {
 }
 
 impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
-    fn apply(&self, elements: Vec<ParsedElement>) -> Result<Vec<ParsedElement>> {
+    fn apply(&self, elements: Vec<ParsedPdfElement>) -> Result<Vec<ParsedPdfElement>> {
         println!("📝 Applying section detection and contextual hierarchy assignment to {} existing elements...", elements.len());
 
         // If no elements provided, create initial elements from text_elements
@@ -45,7 +45,7 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
                 .iter()
                 .enumerate()
                 .map(|(i, text_element)| {
-                    ParsedElement {
+                    ParsedPdfElement {
                         element_type: ParsedElementType::Paragraph, // Default all to paragraph initially
                         text: text_element.text.clone(),
                         hierarchy_level: 3, // Default hierarchy level (will be updated)
@@ -63,7 +63,6 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
         } else {
             elements
         };
-
 
         // Initialize hierarchy context for contextual level tracking
         let mut hierarchy_context = HierarchyContext::new();
@@ -83,7 +82,7 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
                     );
 
                 // Update element with new classification (which may be unchanged if not a section)
-                processed_elements.push(ParsedElement {
+                processed_elements.push(ParsedPdfElement {
                     element_type: new_element_type,
                     hierarchy_level: new_hierarchy_level,
                     ..element // Keep all other fields unchanged
@@ -92,7 +91,7 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
                 // No corresponding TextElement found, can't do font analysis
                 // But still assign contextual hierarchy level for content
                 let content_level = hierarchy_context.get_content_level();
-                processed_elements.push(ParsedElement {
+                processed_elements.push(ParsedPdfElement {
                     hierarchy_level: content_level,
                     ..element // Keep all other fields unchanged
                 });
@@ -103,7 +102,7 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
             .iter()
             .filter(|e| e.element_type == ParsedElementType::Section)
             .count();
-        println!("   ✅ Detected {} sections and assigned contextual hierarchy levels to all {} elements", 
+        println!("   ✅ Detected {} sections and assigned contextual hierarchy levels to all {} elements",
                 sections_detected, processed_elements.len());
         Ok(processed_elements)
     }
@@ -117,35 +116,41 @@ impl<'a> SectionAndHierarchyDetectionRule<'a> {
     /// Classify a single text element and assign contextual hierarchy level based on spatial branching
     fn classify_individual_element_contextual(
         &self,
-        element: &TextElement,
+        element: &PdfElement,
         font_size_analysis: &FontSizeAnalysis,
-        current_element: &ParsedElement,
+        current_element: &ParsedPdfElement,
         hierarchy_context: &mut HierarchyContext,
     ) -> (ParsedElementType, u32) {
         // Check if this element is a header based on font size and style
         let is_header = {
             let font_size = element.style_info.font_size;
-                // CRITICAL: Enforce minimum header size from config
-                if font_size < self.config.section_and_hierarchy.min_header_size {
-                    false // Too small to be a header regardless of other factors
+            // CRITICAL: Enforce minimum header size from config
+            if font_size < self.config.section_and_hierarchy.min_header_size {
+                false // Too small to be a header regardless of other factors
+            } else {
+                // Check font size thresholds AND minimum size requirement
+                let is_bold = element
+                    .style_info
+                    .font_weight
+                    .to_lowercase()
+                    .contains("bold");
+                let bold_logic = if self.config.section_and_hierarchy.bold_size_strict {
+                    // Strict mode: bold AND larger than typical content
+                    self.config.section_and_hierarchy.use_bold_indicator
+                        && is_bold
+                        && font_size > self.document_analysis.most_common_font_size
                 } else {
-                    // Check font size thresholds AND minimum size requirement
-                    let is_bold = element.style_info.font_weight.to_lowercase().contains("bold");
-                    let bold_logic = if self.config.section_and_hierarchy.bold_size_strict {
-                        // Strict mode: bold AND larger than typical content
-                        self.config.section_and_hierarchy.use_bold_indicator
-                            && is_bold
-                            && font_size > self.document_analysis.most_common_font_size
-                    } else {
-                        // Permissive mode: bold OR larger (original behavior)
-                        self.config.section_and_hierarchy.use_bold_indicator && is_bold
-                    };
-                    
-                    // Use semantic analysis: headers are larger than body text or in potential header sizes
-                    font_size > font_size_analysis.body_text_size || 
-                    font_size_analysis.potential_header_sizes.contains(&font_size) ||
-                    bold_logic
-                }
+                    // Permissive mode: bold OR larger (original behavior)
+                    self.config.section_and_hierarchy.use_bold_indicator && is_bold
+                };
+
+                // Use semantic analysis: headers are larger than body text or in potential header sizes
+                font_size > font_size_analysis.body_text_size
+                    || font_size_analysis
+                        .potential_header_sizes
+                        .contains(&font_size)
+                    || bold_logic
+            }
         };
 
         // Check against section patterns
@@ -298,4 +303,3 @@ impl HierarchyContext {
         self.current_level + 1
     }
 }
-

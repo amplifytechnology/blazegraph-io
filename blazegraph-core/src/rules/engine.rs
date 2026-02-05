@@ -39,7 +39,7 @@ impl DebugConfig {
 /// Debug utility function to trace elements through the pipeline
 pub fn debug_pipeline_elements(
     rule_name: &str,
-    elements: &[ParsedElement],
+    elements: &[ParsedPdfElement],
     debug_config: &DebugConfig,
 ) {
     if !debug_config.enabled || debug_config.filter_patterns.is_empty() {
@@ -62,7 +62,11 @@ pub fn debug_pipeline_elements(
         .collect();
 
     if !matching_elements.is_empty() {
-        println!("🔍 [{}] {} matching elements:", rule_name, matching_elements.len());
+        println!(
+            "🔍 [{}] {} matching elements:",
+            rule_name,
+            matching_elements.len()
+        );
         for (index, element) in matching_elements {
             let text_preview = if element.text.len() > 50 {
                 format!("{}...", &element.text[..47])
@@ -71,7 +75,11 @@ pub fn debug_pipeline_elements(
             };
             println!(
                 "  Element {}: \"{}\" ({:?}, depth: {}, text_order: {})",
-                index, text_preview, element.element_type, element.hierarchy_level, element.position
+                index,
+                text_preview,
+                element.element_type,
+                element.hierarchy_level,
+                element.position
             );
         }
         println!();
@@ -113,18 +121,21 @@ impl RuleEngine {
     }
 
     /// Get the current configuration for cache key generation (requires document type)
-    pub fn get_config_for_cache(&self, doc_type: &crate::types::DocumentType) -> &crate::config::ParsingConfig {
+    pub fn get_config_for_cache(
+        &self,
+        doc_type: &crate::types::DocumentType,
+    ) -> &crate::config::ParsingConfig {
         self.config_manager.get_config(doc_type)
     }
 
     pub fn apply_rules(
         &self,
-        text_elements: &[TextElement],
+        text_elements: &[PdfElement],
         classification: &ClassificationResult,
         document_analysis: &DocumentAnalysis,
         font_size_analysis: &FontSizeAnalysis,
         style_data: &StyleData,
-    ) -> Result<Vec<ParsedElement>> {
+    ) -> Result<Vec<ParsedPdfElement>> {
         // Create a minimal StyleData from the text elements for backward compatibility
         println!(
             "⚙️  Applying enhanced parsing rules with SEQUENTIAL PIPELINE for: {:?}",
@@ -159,7 +170,7 @@ impl RuleEngine {
 
         // STEP 3: Apply rules in sequence based on config
         println!("🔗 Executing config-driven rule pipeline...");
-        
+
         // Clear previous timings
         self.rule_timings.borrow_mut().clear();
 
@@ -192,13 +203,13 @@ impl RuleEngine {
     /// Apply rules with explicit config (new config flow pattern)
     pub fn apply_rules_with_config(
         &self,
-        text_elements: &[TextElement],
+        text_elements: &[PdfElement],
         classification: &ClassificationResult,
         document_analysis: &DocumentAnalysis,
         font_size_analysis: &FontSizeAnalysis,
         style_data: &StyleData,
         config: &ParsingConfig,
-    ) -> Result<Vec<ParsedElement>> {
+    ) -> Result<Vec<ParsedPdfElement>> {
         println!(
             "⚙️  Applying rules with config flow for: {:?}",
             classification.document_type
@@ -238,13 +249,13 @@ impl RuleEngine {
     fn apply_rule_by_name(
         &self,
         rule_name: &str,
-        elements: Vec<ParsedElement>,
-        text_elements: &[TextElement],
+        elements: Vec<ParsedPdfElement>,
+        text_elements: &[PdfElement],
         config: &ParsingConfig,
         document_analysis: &DocumentAnalysis,
         font_size_analysis: &FontSizeAnalysis,
         style_data: &StyleData,
-    ) -> Result<Vec<ParsedElement>> {
+    ) -> Result<Vec<ParsedPdfElement>> {
         let rule_start = std::time::Instant::now();
         let result = match rule_name {
             "SpatialClustering" => {
@@ -277,17 +288,26 @@ impl RuleEngine {
             }
             "PatternBasedSectionDetection" => {
                 println!("🔍 PATTERN-BASED SECTION DETECTION (DISABLED - WILL BE REWRITTEN)");
-                println!("   ⏭️  Passing through {} elements unchanged", elements.len());
+                println!(
+                    "   ⏭️  Passing through {} elements unchanged",
+                    elements.len()
+                );
                 Ok(elements)
             }
             "ListDetection" => {
                 println!("📝 LIST DETECTION (DISABLED - WILL BE REWRITTEN)");
-                println!("   ⏭️  Passing through {} elements unchanged", elements.len());
+                println!(
+                    "   ⏭️  Passing through {} elements unchanged",
+                    elements.len()
+                );
                 Ok(elements)
             }
             "SizeEnforcer" => {
                 println!("🔪 SIZE ENFORCEMENT (DISABLED - WILL BE REWRITTEN)");
-                println!("   ⏭️  Passing through {} elements unchanged", elements.len());
+                println!(
+                    "   ⏭️  Passing through {} elements unchanged",
+                    elements.len()
+                );
                 Ok(elements)
             }
             _ => {
@@ -295,50 +315,56 @@ impl RuleEngine {
                 Ok(elements)
             }
         };
-        
+
         let rule_duration = rule_start.elapsed();
-        self.rule_timings.borrow_mut().push((rule_name.to_string(), rule_duration));
+        self.rule_timings
+            .borrow_mut()
+            .push((rule_name.to_string(), rule_duration));
         result
     }
-
 
     /// Semantic font size analysis using StyleData for intelligent header detection
     /// This provides rich insights about font usage patterns to make smart decisions
     pub fn analyze_font_sizes(
         &self,
-        text_elements: &[TextElement],
+        text_elements: &[PdfElement],
         style_data: &StyleData,
     ) -> FontSizeAnalysis {
         // STEP 1: Count frequency of each font class used in text elements (single pass)
         let mut class_usage_counts = std::collections::HashMap::new();
         for element in text_elements {
-            *class_usage_counts.entry(element.style_info.class_name.clone()).or_insert(0) += 1;
+            *class_usage_counts
+                .entry(element.style_info.class_name.clone())
+                .or_insert(0) += 1;
         }
 
         // STEP 2: Build size frequency map from StyleData + usage counts
         let mut size_frequency_map = std::collections::HashMap::new();
         let mut font_sizes = Vec::new();
         let mut size_to_count_vec: Vec<(f32, usize)> = Vec::new(); // (size, count) pairs
-        
+
         for (class_name, usage_count) in &class_usage_counts {
             if let Some(font_class) = style_data.font_classes.get(class_name) {
                 let size_key = format!("{:.1}", font_class.font_size); // Convert to string key
                 *size_frequency_map.entry(size_key).or_insert(0) += usage_count;
-                
+
                 // Update size_to_count_vec
-                if let Some(existing) = size_to_count_vec.iter_mut().find(|(size, _)| (size - font_class.font_size).abs() < 0.01) {
+                if let Some(existing) = size_to_count_vec
+                    .iter_mut()
+                    .find(|(size, _)| (size - font_class.font_size).abs() < 0.01)
+                {
                     existing.1 += usage_count;
                 } else {
                     size_to_count_vec.push((font_class.font_size, *usage_count));
                 }
-                
+
                 // Add font size multiple times based on its frequency in the document
                 for _ in 0..*usage_count {
                     font_sizes.push(font_class.font_size);
                 }
             }
         }
-        
+
         if font_sizes.is_empty() {
             return FontSizeAnalysis::default();
         }
@@ -367,9 +393,7 @@ impl RuleEngine {
         let frequency_threshold = (total_elements as f32 * 0.1).max(1.0) as usize; // Less than 10% usage
         let rare_large_sizes: Vec<f32> = size_to_count_vec
             .iter()
-            .filter(|(size, count)| {
-                *size > median_size && *count <= frequency_threshold
-            })
+            .filter(|(size, count)| *size > median_size && *count <= frequency_threshold)
             .map(|(size, _)| *size)
             .collect();
 
@@ -395,7 +419,8 @@ impl RuleEngine {
                 other => other,
             }
         });
-        let hierarchy_levels: Vec<f32> = hierarchy_levels.into_iter().map(|(size, _)| size).collect();
+        let hierarchy_levels: Vec<f32> =
+            hierarchy_levels.into_iter().map(|(size, _)| size).collect();
 
         // STEP 8: Calculate usage ratio (uniformity measure)
         let size_usage_ratio = max_frequency as f32 / total_elements as f32;
@@ -404,10 +429,21 @@ impl RuleEngine {
         let body_text_size = most_common_size; // The most frequently used size is body text
 
         println!("🎯 Semantic Font Analysis Results:");
-        println!("   📊 {} unique classes, {} total elements", class_usage_counts.len(), total_elements);
-        println!("   📏 Size range: {:.1}pt - {:.1}pt (median: {:.1}pt)", min_size, max_size, median_size);
-        println!("   📝 Body text: {:.1}pt ({} elements, {:.1}% usage)", 
-                body_text_size, max_frequency, size_usage_ratio * 100.0);
+        println!(
+            "   📊 {} unique classes, {} total elements",
+            class_usage_counts.len(),
+            total_elements
+        );
+        println!(
+            "   📏 Size range: {:.1}pt - {:.1}pt (median: {:.1}pt)",
+            min_size, max_size, median_size
+        );
+        println!(
+            "   📝 Body text: {:.1}pt ({} elements, {:.1}% usage)",
+            body_text_size,
+            max_frequency,
+            size_usage_ratio * 100.0
+        );
         println!("   🎯 Potential headers: {:?}", potential_header_sizes);
         println!("   📚 Hierarchy levels: {:?}", hierarchy_levels);
         if !rare_large_sizes.is_empty() {
@@ -432,7 +468,10 @@ impl RuleEngine {
 
     /// Base conversion method: Convert TextElements to ParsedElements
     /// Uses rich semantic data from the enhanced TextElement structure
-    pub fn convert_text_elements_to_parsed(&self, text_elements: &[TextElement]) -> Vec<ParsedElement> {
+    pub fn convert_text_elements_to_parsed(
+        &self,
+        text_elements: &[PdfElement],
+    ) -> Vec<ParsedPdfElement> {
         let mut elements = Vec::new();
 
         // Convert each enhanced TextElement to ParsedElementNew
@@ -442,18 +481,18 @@ impl RuleEngine {
                 continue;
             }
 
-            let paragraph_element = ParsedElement {
+            let paragraph_element = ParsedPdfElement {
                 element_type: ParsedElementType::Paragraph,
                 text: text_element.text.trim().to_string(),
                 hierarchy_level: 1, // All elements start at level 1 for base conversion
                 position,
-                style_info: text_element.style_info.clone(),    // Rich FontClass data
+                style_info: text_element.style_info.clone(), // Rich FontClass data
                 bounding_box: text_element.bounding_box.clone(), // Always present
                 page_number: text_element.page_number,
-                paragraph_number: text_element.paragraph_number,  // New semantic data
+                paragraph_number: text_element.paragraph_number, // New semantic data
                 reading_order: text_element.reading_order,       // Spatial ordering
                 bookmark_match: text_element.bookmark_match.clone(), // Section context
-                token_count: text_element.token_count,          // Use pre-calculated token count
+                token_count: text_element.token_count,           // Use pre-calculated token count
             };
 
             elements.push(paragraph_element);
@@ -464,30 +503,30 @@ impl RuleEngine {
 }
 
 // Shared types and utilities
-// TODO: Move to types? 
+// TODO: Move to types?
 #[derive(Debug, Clone)]
 pub struct FontSizeAnalysis {
     // Basic statistics
     pub median_size: f32,
     pub min_size: f32,
     pub max_size: f32,
-    
+
     // Usage-based insights
-    pub most_common_size: f32,           // Likely body text
-    pub most_common_class: String,       // The dominant font class
-    pub rare_large_sizes: Vec<f32>,      // Sizes used infrequently + larger than median (likely headers)
-    
+    pub most_common_size: f32,      // Likely body text
+    pub most_common_class: String,  // The dominant font class
+    pub rare_large_sizes: Vec<f32>, // Sizes used infrequently + larger than median (likely headers)
+
     // Style distribution
-    pub size_frequency_map: std::collections::HashMap<String, usize>,  // font_size_string -> count
+    pub size_frequency_map: std::collections::HashMap<String, usize>, // font_size_string -> count
     pub class_usage_counts: std::collections::HashMap<String, usize>, // class_name -> count
-    
+
     // Semantic insights
     pub potential_header_sizes: Vec<f32>, // Sizes that are likely headers based on frequency + size
-    pub body_text_size: f32,             // Most likely body text size
-    
+    pub body_text_size: f32,              // Most likely body text size
+
     // Hierarchy insights
-    pub hierarchy_levels: Vec<f32>,       // Distinct sizes sorted by frequency and size (largest first)
-    pub size_usage_ratio: f32,           // Ratio of most common to total elements (higher = more uniform)
+    pub hierarchy_levels: Vec<f32>, // Distinct sizes sorted by frequency and size (largest first)
+    pub size_usage_ratio: f32, // Ratio of most common to total elements (higher = more uniform)
 }
 
 impl Default for FontSizeAnalysis {
@@ -509,9 +548,8 @@ impl Default for FontSizeAnalysis {
     }
 }
 
-
 // Sequential rule pipeline infrastructure
 pub trait ParseRule {
-    fn apply(&self, elements: Vec<ParsedElement>) -> Result<Vec<ParsedElement>>;
+    fn apply(&self, elements: Vec<ParsedPdfElement>) -> Result<Vec<ParsedPdfElement>>;
     fn name(&self) -> &str;
 }

@@ -190,7 +190,7 @@ pub struct GraphMetadata {
     pub flow_type: FlowType,
     pub total_nodes: usize,
     pub processing_time_ms: u128,
-    
+
     // Enhanced analytics fields
     pub total_tokens: usize,
     pub token_distribution: TokenDistribution,
@@ -253,7 +253,7 @@ pub struct TokenHistogram {
     // Cached statistics for performance
     pub mean: f32,
     pub median: f32,
-    pub mode: Option<u32>, // Bin with highest frequency  
+    pub mode: Option<u32>, // Bin with highest frequency
     pub variance: f32,
 }
 
@@ -273,10 +273,10 @@ impl Default for TokenHistogram {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistogramBin {
-    pub range_start: u32,  // Inclusive
-    pub range_end: u32,    // Exclusive
-    pub count: usize,      // Number of nodes in this range
-    pub token_sum: usize,  // Total tokens in this range
+    pub range_start: u32, // Inclusive
+    pub range_end: u32,   // Exclusive
+    pub count: usize,     // Number of nodes in this range
+    pub token_sum: usize, // Total tokens in this range
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,8 +315,8 @@ impl Default for DepthDistribution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuralHealth {
     pub token_variance_level: VarianceLevel, // Low/Medium/High
-    pub depth_balance: BalanceLevel,         // Balanced/Shallow/Deep  
-    pub node_type_richness: RichnessLevel,  // Rich/Sparse/Unbalanced
+    pub depth_balance: BalanceLevel,         // Balanced/Shallow/Deep
+    pub node_type_richness: RichnessLevel,   // Rich/Sparse/Unbalanced
 }
 
 impl Default for StructuralHealth {
@@ -330,39 +330,51 @@ impl Default for StructuralHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VarianceLevel { Low, Medium, High }
+pub enum VarianceLevel {
+    Low,
+    Medium,
+    High,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BalanceLevel { Balanced, Shallow, Deep }
+pub enum BalanceLevel {
+    Balanced,
+    Shallow,
+    Deep,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RichnessLevel { Rich, Sparse, Unbalanced }
+pub enum RichnessLevel {
+    Rich,
+    Sparse,
+    Unbalanced,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TikaOutput {
     pub xhtml_content: String,
     pub metadata: DocumentMetadata,
-    pub text_elements: Vec<TextElement>,
+    pub text_elements: Vec<PdfElement>,
     /// XHTML content hash for Level 2 cache key generation
     pub xhtml_hash: String,
     // New enhanced structures
-    pub style_data: StyleData,               // CSS font classes (always present)
+    pub style_data: StyleData, // CSS font classes (always present)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark_data: Option<BookmarkData>, // PDF bookmarks/outline
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextElement {
+pub struct PdfElement {
     pub text: String,
-    pub style_info: FontClass,             // Self-contained style information (no Option)
-    pub bounding_box: BoundingBox,         // Required positioning (no Option)
+    pub style_info: FontClass, // Self-contained style information (no Option)
+    pub bounding_box: BoundingBox, // Required positioning (no Option)
     pub page_number: u32,
-    pub paragraph_number: u32,             // Which paragraph this belongs to
-    pub line_number: u32,                  // data-line from XHTML
-    pub segment_number: u32,               // data-segment from XHTML
-    pub reading_order: u32,                // computed from line + segment
-    pub bookmark_match: Option<BookmarkSection>,    // Full bookmark section if this span matches
-    pub token_count: usize,                // Pre-calculated token count for performance
+    pub paragraph_number: u32, // Which paragraph this belongs to
+    pub line_number: u32,      // data-line from XHTML
+    pub segment_number: u32,   // data-segment from XHTML
+    pub reading_order: u32,    // computed from line + segment
+    pub bookmark_match: Option<BookmarkSection>, // Full bookmark section if this span matches
+    pub token_count: usize,    // Pre-calculated token count for performance
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundingBox {
@@ -377,20 +389,20 @@ pub struct BoundingBox {
 pub struct DocumentMetadata {
     // Current fields
     pub title: Option<String>,
-    pub author: Option<String>, 
+    pub author: Option<String>,
     pub language: Option<String>,
     pub page_count: u32,
-    
+
     // Enhanced flat fields from <meta> tags
-    pub publisher: Option<String>,           // xmp:dc:publisher
-    pub creator_tool: Option<String>,        // xmp:CreatorTool  
-    pub producer: Option<String>,            // pdf:producer
-    pub pdf_version: Option<String>,         // pdf:PDFVersion
-    pub created: Option<String>,             // dcterms:created
-    pub modified: Option<String>,            // dcterms:modified
-    pub description: Option<String>,         // dc:description
-    pub encrypted: Option<bool>,             // pdf:encrypted
-    pub has_marked_content: Option<bool>,    // pdf:hasMarkedContent
+    pub publisher: Option<String>,        // xmp:dc:publisher
+    pub creator_tool: Option<String>,     // xmp:CreatorTool
+    pub producer: Option<String>,         // pdf:producer
+    pub pdf_version: Option<String>,      // pdf:PDFVersion
+    pub created: Option<String>,          // dcterms:created
+    pub modified: Option<String>,         // dcterms:modified
+    pub description: Option<String>,      // dc:description
+    pub encrypted: Option<bool>,          // pdf:encrypted
+    pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,12 +412,12 @@ pub struct StyleData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FontClass {
-    pub class_name: String,                  // "f1", "f2", "f3", etc. (kept for convenience)
-    pub font_family: String,                 // "LiberationSerif-Italic"
-    pub font_size: f32,                      // 20.0
-    pub font_style: String,                  // "italic", "normal"
-    pub font_weight: String,                 // "bold", "normal"
-    pub color: String,                       // "#000000"
+    pub class_name: String,  // "f1", "f2", "f3", etc. (kept for convenience)
+    pub font_family: String, // "LiberationSerif-Italic"
+    pub font_size: f32,      // 20.0
+    pub font_style: String,  // "italic", "normal"
+    pub font_weight: String, // "bold", "normal"
+    pub color: String,       // "#000000"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,8 +427,8 @@ pub struct BookmarkData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookmarkSection {
-    pub title: String,                       
-    pub order: u32,                          
+    pub title: String,
+    pub order: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -454,7 +466,7 @@ pub struct FlatDocument {
 pub struct ListSequence {
     pub start_index: usize,
     pub end_index: usize,
-    pub marker_indices: Vec<usize>,  // Positions of actual markers within sequence
+    pub marker_indices: Vec<usize>, // Positions of actual markers within sequence
 }
 
 /// Document analysis meta-attributes calculated from text elements
@@ -479,7 +491,7 @@ pub struct DocumentAnalysis {
 
 impl DocumentAnalysis {
     /// Create document analysis from text elements
-    pub fn analyze_text_elements(text_elements: &[TextElement]) -> Self {
+    pub fn analyze_text_elements(text_elements: &[PdfElement]) -> Self {
         let mut font_size_counts: HashMap<String, usize> = HashMap::new();
         let mut font_family_counts: HashMap<String, usize> = HashMap::new();
         let mut bold_count = 0;
@@ -490,14 +502,16 @@ impl DocumentAnalysis {
 
         for element in text_elements {
             let style = &element.style_info;
-            
+
             // Count font sizes
             let size_key = format!("{:.1}", style.font_size);
             *font_size_counts.entry(size_key).or_insert(0) += 1;
             font_sizes.push(style.font_size);
 
             // Count font families
-            *font_family_counts.entry(style.font_family.clone()).or_insert(0) += 1;
+            *font_family_counts
+                .entry(style.font_family.clone())
+                .or_insert(0) += 1;
 
             // Count bold/non-bold
             let is_bold = style.font_weight.to_lowercase().contains("bold");
@@ -507,7 +521,7 @@ impl DocumentAnalysis {
                 non_bold_count += 1;
             }
 
-            // Count italic/non-italic  
+            // Count italic/non-italic
             let is_italic = style.font_style.to_lowercase().contains("italic");
             if is_italic {
                 italic_count += 1;
@@ -562,7 +576,7 @@ pub struct GraphAnalytics;
 // Graph builder structs
 #[derive(Debug, Clone)]
 pub struct ElementGroup {
-    pub elements: Vec<ParsedElement>,
+    pub elements: Vec<ParsedPdfElement>,
     pub group_type: GroupType,
     pub hierarchy_level: u32,
     pub combined_text: String,
@@ -574,13 +588,13 @@ pub enum GroupType {
     Paragraph,
 }
 /// Complete output from document preprocessing
-/// 
+///
 /// Contains all the data extracted from document parsing, including
 /// text elements, metadata, styling information, and document structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreprocessorOutput {
     /// Extracted text elements with positioning and styling
-    pub text_elements: Vec<TextElement>,
+    pub text_elements: Vec<PdfElement>,
     /// Document metadata (title, author, creation date, etc.)
     pub metadata: DocumentMetadata,
     /// Style information (fonts, colors, formatting)
@@ -589,22 +603,22 @@ pub struct PreprocessorOutput {
     pub bookmark_data: Option<BookmarkData>,
 }
 
-// Rule engine structs 
+// Rule engine structs
 
 // New struct for enhanced TextElement processing
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParsedElement {
+pub struct ParsedPdfElement {
     pub element_type: ParsedElementType,
     pub text: String,
     pub hierarchy_level: u32,
     pub position: usize,
-    pub style_info: FontClass,           // Rich font data (no Option)
-    pub bounding_box: BoundingBox,       // Always present positioning  
+    pub style_info: FontClass,     // Rich font data (no Option)
+    pub bounding_box: BoundingBox, // Always present positioning
     pub page_number: u32,
-    pub paragraph_number: u32,           // New: paragraph context
-    pub reading_order: u32,              // New: spatial reading order
+    pub paragraph_number: u32,                   // New: paragraph context
+    pub reading_order: u32,                      // New: spatial reading order
     pub bookmark_match: Option<BookmarkSection>, // New: bookmark section data
-    pub token_count: usize,              // Pre-calculated token count for performance
+    pub token_count: usize,                      // Pre-calculated token count for performance
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
