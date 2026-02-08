@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub type NodeId = Uuid;
-pub type EdgeId = Uuid;
 
 // ===== NODE LOCATION TYPES =====
 // These types implement the location model from 001-document-model.
@@ -46,27 +45,31 @@ pub enum FlowType {
     Free,
 }
 
+/// Aggregated document-level information computed during parsing.
+/// This is NOT a node in the tree — it is information *about* the document.
+/// Has proto-L1 character: one per document, invariant to tree structure.
+/// See 006-document-info-separation.md for design rationale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentRootNode {
-    pub id: NodeId,
+pub struct DocumentInfo {
+    /// References the Document node in nodes[] (the tree root)
+    pub root_id: NodeId,
+    /// Metadata extracted from the source format (title, author, page count, etc.)
     pub document_metadata: DocumentMetadata,
+    /// Analysis computed from text elements (font distributions, style stats)
     pub document_analysis: DocumentAnalysis,
-    pub children: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
     pub nodes: HashMap<NodeId, DocumentNode>,
-    pub edges: HashMap<EdgeId, DocumentEdge>,
-    pub root_node: DocumentRootNode,
+    pub document_info: DocumentInfo,
     pub metadata: GraphMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
     pub nodes: Vec<DocumentNode>,
-    pub edges: Vec<DocumentEdge>,
-    pub root_node: DocumentRootNode,
+    pub document_info: DocumentInfo,
     pub metadata: GraphMetadata,
 }
 
@@ -155,22 +158,6 @@ pub enum NodeType {
     Figure,
     Header,
     Footer,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentEdge {
-    pub id: EdgeId,
-    pub source: NodeId,
-    pub target: NodeId,
-    pub edge_type: EdgeType,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EdgeType {
-    Parent,
-    Child,
-    NextSibling,
-    PrevSibling,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

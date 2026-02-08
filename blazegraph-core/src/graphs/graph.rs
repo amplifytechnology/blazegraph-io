@@ -6,11 +6,11 @@ use super::analytics::GraphAnalytics;
 impl DocumentGraph {
     pub fn new() -> Self {
         use uuid::Uuid;
-        use crate::types::{DocumentMetadata, DocumentAnalysis, DocumentRootNode};
-        
-        // Create a default root node - this will be properly populated during graph building
-        let root_node = DocumentRootNode {
-            id: Uuid::new_v4(),
+        use crate::types::{DocumentMetadata, DocumentAnalysis, DocumentInfo};
+
+        // Create default document info — will be populated during graph building
+        let document_info = DocumentInfo {
+            root_id: Uuid::new_v4(),
             document_metadata: DocumentMetadata::default(),
             document_analysis: DocumentAnalysis {
                 font_size_counts: std::collections::HashMap::new(),
@@ -21,13 +21,11 @@ impl DocumentGraph {
                 most_common_font_family: "unknown".to_string(),
                 all_font_sizes: Vec::new(),
             },
-            children: Vec::new(),
         };
 
         Self {
             nodes: HashMap::new(),
-            edges: HashMap::new(),
-            root_node,
+            document_info,
             metadata: GraphMetadata::default(),
         }
     }
@@ -58,8 +56,7 @@ impl DocumentGraph {
 
         SortedDocumentGraph {
             nodes: nodes.into_iter().cloned().collect(),
-            edges: self.edges.values().cloned().collect(),
-            root_node: self.root_node.clone(),
+            document_info: self.document_info.clone(),
             metadata: self.metadata.clone(),
         }
     }
@@ -69,10 +66,10 @@ impl DocumentGraph {
     /// their parent's breadcrumbs without adding to them.
     /// If document metadata has a title, it becomes the first breadcrumb.
     pub fn compute_breadcrumbs(&mut self) {
-        let root_id = self.root_node.id;
-        
+        let root_id = self.document_info.root_id;
+
         // Start with document title as first crumb if available
-        let root_breadcrumbs: Vec<String> = self.root_node.document_metadata.title
+        let root_breadcrumbs: Vec<String> = self.document_info.document_metadata.title
             .as_ref()
             .filter(|t| !t.is_empty())
             .map(|t| vec![t.clone()])

@@ -560,9 +560,8 @@ impl DocumentProcessor {
         // Stage 3: ParsedElements → DocumentGraph
         let graph = self.graph_builder.build_graph(parsed_elements.clone())?;
         println!(
-            "📋 Stage 3: Graph captured ({} nodes, {} edges)",
-            graph.nodes.len(),
-            graph.edges.len()
+            "📋 Stage 3: Graph captured ({} nodes)",
+            graph.nodes.len()
         );
 
         Ok(PipelineStages {

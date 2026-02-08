@@ -1,6 +1,5 @@
 use crate::types::*;
 use anyhow::Result;
-use uuid::Uuid;
 pub struct GraphBuilder;
 
 impl Default for GraphBuilder {
@@ -14,7 +13,7 @@ impl GraphBuilder {
         Self
     }
 
-    /// Build graph from elements and populate root node with metadata and analysis
+    /// Build graph from elements and populate document info with metadata and analysis
     pub fn build_graph_with_metadata(
         &self,
         elements: Vec<ParsedPdfElement>,
@@ -23,9 +22,9 @@ impl GraphBuilder {
     ) -> Result<DocumentGraph> {
         let mut graph = self.build_graph(elements)?;
 
-        // Update root node with proper metadata and analysis
-        graph.root_node.document_metadata = document_metadata;
-        graph.root_node.document_analysis = document_analysis;
+        // Populate document info with extracted metadata and computed analysis
+        graph.document_info.document_metadata = document_metadata;
+        graph.document_info.document_analysis = document_analysis;
 
         Ok(graph)
     }
@@ -39,13 +38,11 @@ impl GraphBuilder {
         let mut graph = DocumentGraph::new();
         let mut node_stack: Vec<NodeId> = Vec::new(); // Track hierarchy
 
-        // The root node is already created in DocumentGraph::new()
-        // We just need to track its ID for building the hierarchy
-        let root_id = graph.root_node.id;
+        // The root ID is created in DocumentGraph::new() via document_info
+        let root_id = graph.document_info.root_id;
         node_stack.push(root_id);
 
-        // Create a Document node in the nodes HashMap that mirrors the root_node
-        // This allows the frontend to find and render the document as a visual node
+        // Create the Document root node — same DocumentNode schema as every other node
         let document_node = DocumentNode {
             id: root_id,
             node_type: "Document".to_string(),
@@ -97,20 +94,9 @@ impl GraphBuilder {
             graph.nodes.insert(node_id, final_node);
 
             // Update parent's children list
-            if parent_id == root_id {
-                // If parent is root node, update both root_node and the Document node in nodes
-                graph.root_node.children.push(node_id);
-                // Also update the Document node in the nodes HashMap
-                if let Some(doc_node) = graph.nodes.get_mut(&root_id) {
-                    doc_node.children.push(node_id);
-                }
-            } else if let Some(parent) = graph.nodes.get_mut(&parent_id) {
+            if let Some(parent) = graph.nodes.get_mut(&parent_id) {
                 parent.children.push(node_id);
             }
-
-            // Create edges
-            self.create_edge(&mut graph, parent_id, node_id, EdgeType::Child);
-            self.create_edge(&mut graph, node_id, parent_id, EdgeType::Parent);
 
             // Update hierarchy stack for sections
             if matches!(group.group_type, GroupType::Section) {
@@ -138,9 +124,8 @@ impl GraphBuilder {
         graph.metadata.document_type = DocumentType::Generic; // Will be updated by processor
 
         println!(
-            "✅ Graph built: {} nodes, {} edges",
-            graph.nodes.len(),
-            graph.edges.len()
+            "✅ Graph built: {} nodes",
+            graph.nodes.len()
         );
 
         Ok(graph)
@@ -166,9 +151,12 @@ impl GraphBuilder {
         parent_id: NodeId,
         index: usize,
     ) -> String {
-        if parent_id == graph.root_node.id {
-            // Parent is root node - this is a top-level section
-            format!("{}", graph.root_node.children.len() + 1)
+        if parent_id == graph.document_info.root_id {
+            // Parent is root node — get children count from the Document node in nodes[]
+            let child_count = graph.nodes.get(&parent_id)
+                .map(|n| n.children.len())
+                .unwrap_or(0);
+            format!("{}", child_count + 1)
         } else if let Some(parent) = graph.nodes.get(&parent_id) {
             // Build path from parent's path
             format!(
@@ -179,22 +167,6 @@ impl GraphBuilder {
         } else {
             format!("{}", index + 1)
         }
-    }
-
-    fn create_edge(
-        &self,
-        graph: &mut DocumentGraph,
-        source: NodeId,
-        target: NodeId,
-        edge_type: EdgeType,
-    ) {
-        let edge = DocumentEdge {
-            id: Uuid::new_v4(),
-            source,
-            target,
-            edge_type,
-        };
-        graph.edges.insert(edge.id, edge);
     }
 
     fn group_elements_into_chunks(&self, elements: Vec<ParsedPdfElement>) -> Vec<ElementGroup> {

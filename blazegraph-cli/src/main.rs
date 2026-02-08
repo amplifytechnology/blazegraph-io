@@ -290,7 +290,6 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
             "text_elements": stages.text_elements.len(),
             "parsed_elements": stages.parsed_elements.len(),
             "graph_nodes": stages.graph.nodes.len(),
-            "graph_edges": stages.graph.edges.len(),
         }
     });
     let summary_path = format!("{}/summary.json", output_dir);
