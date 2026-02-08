@@ -119,9 +119,9 @@ impl GraphBuilder {
         // Post-processing: compute breadcrumbs from final tree structure
         graph.compute_breadcrumbs();
 
-        // Update metadata
-        graph.metadata.total_nodes = graph.nodes.len();
-        graph.metadata.document_type = DocumentType::Generic; // Will be updated by processor
+        // Update structural profile
+        graph.structural_profile.total_nodes = graph.nodes.len();
+        graph.structural_profile.document_type = DocumentType::Generic; // Will be updated by processor
 
         println!(
             "✅ Graph built: {} nodes",

@@ -31,7 +31,7 @@ impl DocumentGraph {
         SequentialDocument {
             format: "sequential".to_string(),
             segments,
-            metadata: self.metadata.clone(),
+            structural_profile: self.structural_profile.clone(),
         }
     }
 

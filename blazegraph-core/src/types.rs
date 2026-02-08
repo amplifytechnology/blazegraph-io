@@ -63,14 +63,14 @@ pub struct DocumentInfo {
 pub struct DocumentGraph {
     pub nodes: HashMap<NodeId, DocumentNode>,
     pub document_info: DocumentInfo,
-    pub metadata: GraphMetadata,
+    pub structural_profile: StructuralProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
     pub nodes: Vec<DocumentNode>,
     pub document_info: DocumentInfo,
-    pub metadata: GraphMetadata,
+    pub structural_profile: StructuralProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,35 +170,34 @@ pub struct StyleMetadata {
     pub color: Option<String>, // CSS color value (e.g., "#FF0000" or "rgb(255,0,0)")
 }
 
+/// Quantitative measurement of graph shape — deterministic, mechanically computed from structure.
+/// Travels with graph.json. Describes the L0 tree's statistical properties.
+/// See AmplifyNotes/09-Profile-Types.md for design rationale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphMetadata {
+pub struct StructuralProfile {
     pub created_at: DateTime<Utc>,
     pub document_type: DocumentType,
     pub flow_type: FlowType,
     pub total_nodes: usize,
-    pub processing_time_ms: u128,
 
-    // Enhanced analytics fields
+    // Analytics fields
     pub total_tokens: usize,
     pub token_distribution: TokenDistribution,
     pub node_type_distribution: NodeTypeDistribution,
     pub depth_distribution: DepthDistribution,
-    pub structural_health: StructuralHealth,
 }
 
-impl Default for GraphMetadata {
+impl Default for StructuralProfile {
     fn default() -> Self {
         Self {
             created_at: Utc::now(),
             document_type: DocumentType::Unknown,
             flow_type: FlowType::Fixed,
             total_nodes: 0,
-            processing_time_ms: 0,
             total_tokens: 0,
             token_distribution: TokenDistribution::default(),
             node_type_distribution: NodeTypeDistribution::default(),
             depth_distribution: DepthDistribution::default(),
-            structural_health: StructuralHealth::default(),
         }
     }
 }
@@ -298,44 +297,9 @@ impl Default for DepthDistribution {
     }
 }
 
-/// Quality health metrics (thresholds may need refinement based on experience)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StructuralHealth {
-    pub token_variance_level: VarianceLevel, // Low/Medium/High
-    pub depth_balance: BalanceLevel,         // Balanced/Shallow/Deep
-    pub node_type_richness: RichnessLevel,   // Rich/Sparse/Unbalanced
-}
-
-impl Default for StructuralHealth {
-    fn default() -> Self {
-        Self {
-            token_variance_level: VarianceLevel::Medium,
-            depth_balance: BalanceLevel::Balanced,
-            node_type_richness: RichnessLevel::Sparse,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VarianceLevel {
-    Low,
-    Medium,
-    High,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BalanceLevel {
-    Balanced,
-    Shallow,
-    Deep,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RichnessLevel {
-    Rich,
-    Sparse,
-    Unbalanced,
-}
+// Note: StructuralHealth (variance/balance/richness heuristics) removed.
+// Health assessment requires document-type context and belongs downstream
+// of the L0 parser. See AmplifyNotes/09-Profile-Types.md.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TikaOutput {
@@ -429,7 +393,7 @@ pub struct ClassificationResult {
 pub struct SequentialDocument {
     pub format: String,
     pub segments: Vec<SequentialSegment>,
-    pub metadata: GraphMetadata,
+    pub structural_profile: StructuralProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,7 +518,6 @@ pub struct GraphAnalyticsResult {
     pub token_distribution: TokenDistribution,
     pub node_type_distribution: NodeTypeDistribution,
     pub depth_distribution: DepthDistribution,
-    pub structural_health: StructuralHealth,
 }
 
 /// Analytics computer that can analyze any subset of nodes in the graph

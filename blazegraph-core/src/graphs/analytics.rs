@@ -2,20 +2,19 @@ use crate::types::*;
 use std::collections::HashMap;
 
 impl DocumentGraph {
-    /// Compute enhanced metadata analytics for the entire graph
-    pub fn compute_enhanced_metadata(&mut self) {
+    /// Compute structural profile analytics for the entire graph
+    pub fn compute_structural_profile(&mut self) {
         let all_nodes: Vec<&DocumentNode> = self.nodes.values().collect();
         let analytics = GraphAnalytics::compute_analytics(&all_nodes);
-        
+
         // Extract total_tokens before moving analytics fields
         let total_tokens = analytics.token_distribution.overall.total_tokens;
-        
-        // Update metadata with analytics results
-        self.metadata.token_distribution = analytics.token_distribution;
-        self.metadata.node_type_distribution = analytics.node_type_distribution;
-        self.metadata.depth_distribution = analytics.depth_distribution;
-        self.metadata.structural_health = analytics.structural_health;
-        self.metadata.total_tokens = total_tokens;
+
+        // Update structural profile with analytics results
+        self.structural_profile.token_distribution = analytics.token_distribution;
+        self.structural_profile.node_type_distribution = analytics.node_type_distribution;
+        self.structural_profile.depth_distribution = analytics.depth_distribution;
+        self.structural_profile.total_tokens = total_tokens;
     }
 }
 
@@ -29,7 +28,6 @@ impl GraphAnalytics {
             token_distribution: Self::compute_token_distribution(nodes),
             node_type_distribution: Self::compute_node_type_distribution(nodes),
             depth_distribution: Self::compute_depth_distribution(nodes),
-            structural_health: Self::assess_structural_health(nodes),
         }
     }
     
@@ -202,38 +200,4 @@ impl GraphAnalytics {
         }
     }
     
-    /// Assess structural health metrics for GUI dashboard
-    fn assess_structural_health(nodes: &[&DocumentNode]) -> StructuralHealth {
-        let token_distribution = Self::compute_token_distribution(nodes);
-        let node_type_distribution = Self::compute_node_type_distribution(nodes);
-        let depth_distribution = Self::compute_depth_distribution(nodes);
-        
-        // Assess token variance level
-        let token_variance_level = match token_distribution.overall.variance {
-            v if v < 1000.0 => VarianceLevel::Low,
-            v if v < 10000.0 => VarianceLevel::Medium,
-            _ => VarianceLevel::High,
-        };
-        
-        // Assess depth balance
-        let depth_balance = match depth_distribution.avg_depth {
-            d if d < 2.0 => BalanceLevel::Shallow,
-            d if d > 5.0 => BalanceLevel::Deep,
-            _ => BalanceLevel::Balanced,
-        };
-        
-        // Assess node type richness
-        let type_count = node_type_distribution.counts.len();
-        let node_type_richness = match type_count {
-            0..=2 => RichnessLevel::Sparse,
-            3..=5 => RichnessLevel::Rich,
-            _ => RichnessLevel::Unbalanced,
-        };
-        
-        StructuralHealth {
-            token_variance_level,
-            depth_balance,
-            node_type_richness,
-        }
-    }
 }

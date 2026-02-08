@@ -26,7 +26,7 @@ impl DocumentGraph {
         Self {
             nodes: HashMap::new(),
             document_info,
-            metadata: GraphMetadata::default(),
+            structural_profile: StructuralProfile::default(),
         }
     }
 
@@ -57,7 +57,7 @@ impl DocumentGraph {
         SortedDocumentGraph {
             nodes: nodes.into_iter().cloned().collect(),
             document_info: self.document_info.clone(),
-            metadata: self.metadata.clone(),
+            structural_profile: self.structural_profile.clone(),
         }
     }
 

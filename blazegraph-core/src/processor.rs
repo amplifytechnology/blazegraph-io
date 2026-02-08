@@ -323,11 +323,14 @@ impl DocumentProcessor {
         let stage4_start = Instant::now();
 
         // Stage 4: Graph building (ParsedElements + Config → Graph)
-        let graph = self.graph_builder.build_graph(parsed_elements)?;
+        let mut graph = self.graph_builder.build_graph(parsed_elements)?;
         println!(
             "⏱️  Graph construction: {:.3}s",
             stage4_start.elapsed().as_secs_f64()
         );
+
+        // Stage 5: Compute structural profile (L0 distributions)
+        graph.compute_structural_profile();
 
         Ok(graph)
     }
@@ -387,9 +390,12 @@ impl DocumentProcessor {
         };
 
         // Stage 4: Graph building
-        let graph = profiler.time_step("5. Graph Construction", || {
+        let mut graph = profiler.time_step("5. Graph Construction", || {
             self.graph_builder.build_graph(parsed_elements)
         })?;
+
+        // Stage 5: Compute structural profile (L0 distributions)
+        graph.compute_structural_profile();
 
         Ok(graph)
     }
@@ -496,7 +502,10 @@ impl DocumentProcessor {
         let step4_start = Instant::now();
 
         // Step 5: Build graph from processed elements
-        let graph = self.graph_builder.build_graph(parsed_elements)?;
+        let mut graph = self.graph_builder.build_graph(parsed_elements)?;
+
+        // Step 6: Compute structural profile (L0 distributions)
+        graph.compute_structural_profile();
 
         println!(
             "⏱️  Graph construction: {:.3}s",
@@ -558,7 +567,11 @@ impl DocumentProcessor {
         );
 
         // Stage 3: ParsedElements → DocumentGraph
-        let graph = self.graph_builder.build_graph(parsed_elements.clone())?;
+        let mut graph = self.graph_builder.build_graph(parsed_elements.clone())?;
+
+        // Compute structural profile (L0 distributions)
+        graph.compute_structural_profile();
+
         println!(
             "📋 Stage 3: Graph captured ({} nodes)",
             graph.nodes.len()
