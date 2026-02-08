@@ -63,6 +63,11 @@ struct Args {
     #[arg(long)]
     skip_cache: bool,
 
+    /// Include style_info on each node (font_class, font_size, font_family, bold, italic, color).
+    /// Stripped by default to reduce output size (~20%). Useful for authoring parsing configs.
+    #[arg(long)]
+    include_style_info: bool,
+
     /// Dump all intermediate pipeline stage outputs to a directory
     /// Captures: XHTML, TextElements, ParsedElements, and final Graph as separate files
     #[arg(long)]
@@ -134,11 +139,18 @@ fn main() -> Result<()> {
     // Process the document with config flow (and profiling if enabled)
     match processor.process_document_with_config_and_profiling(&args.input, &config, args.profile, args.skip_cache)
     {
-        Ok(graph) => {
+        Ok(mut graph) => {
             println!("✅ Successfully processed document");
             println!("📊 Graph metrics:");
             println!("   - Nodes: {}", graph.nodes.len());
-            
+
+            // Strip style_info from output unless explicitly requested
+            if !args.include_style_info {
+                for node in graph.nodes.values_mut() {
+                    node.style_info = None;
+                }
+            }
+
             // Generate output path
             let output_path = if let Some(output) = &args.output {
                 output.clone()
