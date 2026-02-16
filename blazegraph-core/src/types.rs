@@ -58,7 +58,7 @@ pub struct DocumentInfo {
     /// Analysis computed from text elements (font distributions, style stats)
     pub document_analysis: DocumentAnalysis,
 }
-
+// TODO: BIGTIME, we need a schema version here right? To avid a lot of headache in the future if we change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
     pub nodes: HashMap<NodeId, DocumentNode>,
