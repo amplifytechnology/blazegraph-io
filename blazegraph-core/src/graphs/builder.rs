@@ -116,10 +116,7 @@ impl GraphBuilder {
             }
         }
 
-        // Post-processing: compute breadcrumbs from final tree structure
-        graph.compute_breadcrumbs();
-
-        // Update structural profile
+        // Update structural profile node count
         graph.structural_profile.total_nodes = graph.nodes.len();
         graph.structural_profile.document_type = DocumentType::Generic; // Will be updated by processor
 

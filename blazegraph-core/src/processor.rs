@@ -290,15 +290,16 @@ impl DocumentProcessor {
 
         let stage3_start = Instant::now();
 
+        // Compute document analysis once (used by rules and stored in DocumentInfo)
+        let document_analysis =
+            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
+
         // Stage 3: Rule processing with config (TextElements + Config → ParsedElements)
         let parsed_elements = if config.minimal_parse {
             println!("🔄 Minimal parse mode - skipping rule processing");
             self.rule_engine
                 .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
         } else {
-            // Analyze document for patterns
-            let document_analysis =
-                DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
             let font_size_analysis = self.rule_engine.analyze_font_sizes(
                 &preprocessor_output.text_elements,
                 &preprocessor_output.style_data,
@@ -322,6 +323,9 @@ impl DocumentProcessor {
 
         let stage4_start = Instant::now();
 
+        // Infer title from content before elements are consumed by graph builder
+        let inferred_title = infer_title(&parsed_elements);
+
         // Stage 4: Graph building (ParsedElements + Config → Graph)
         let mut graph = self.graph_builder.build_graph(parsed_elements)?;
         println!(
@@ -329,8 +333,14 @@ impl DocumentProcessor {
             stage4_start.elapsed().as_secs_f64()
         );
 
-        // Stage 5: Compute structural profile (L0 distributions)
+        // Stage 5: Wire metadata and compute post-processing
+        if let Some(title) = inferred_title {
+            graph.document_info.document_metadata.title = Some(title);
+        }
+        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
+        graph.document_info.document_analysis = document_analysis;
         graph.compute_structural_profile();
+        graph.compute_breadcrumbs();
 
         Ok(graph)
     }
@@ -359,6 +369,11 @@ impl DocumentProcessor {
             self.classifier.classify(&preprocessor_output)
         })?;
 
+        // Compute document analysis once (used by rules and stored in DocumentInfo)
+        let document_analysis = profiler.time_step("4a. Document Analysis", || {
+            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements)
+        });
+
         // Stage 3: Rule processing with detailed timing
         let parsed_elements = if config.minimal_parse {
             profiler.time_step("4. Minimal Parse", || {
@@ -366,10 +381,6 @@ impl DocumentProcessor {
                     .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
             })
         } else {
-            let document_analysis = profiler.time_step("4a. Document Analysis", || {
-                DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements)
-            });
-
             let font_size_analysis = profiler.time_step("4b. Font Analysis", || {
                 self.rule_engine.analyze_font_sizes(
                     &preprocessor_output.text_elements,
@@ -389,13 +400,22 @@ impl DocumentProcessor {
             })?
         };
 
+        // Infer title from content before elements are consumed by graph builder
+        let inferred_title = infer_title(&parsed_elements);
+
         // Stage 4: Graph building
         let mut graph = profiler.time_step("5. Graph Construction", || {
             self.graph_builder.build_graph(parsed_elements)
         })?;
 
-        // Stage 5: Compute structural profile (L0 distributions)
+        // Stage 5: Wire metadata and compute post-processing
+        if let Some(title) = inferred_title {
+            graph.document_info.document_metadata.title = Some(title);
+        }
+        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
+        graph.document_info.document_analysis = document_analysis;
         graph.compute_structural_profile();
+        graph.compute_breadcrumbs();
 
         Ok(graph)
     }
@@ -460,6 +480,10 @@ impl DocumentProcessor {
 
         let step3_start = Instant::now();
 
+        // Compute document analysis once (used by rules and stored in DocumentInfo)
+        let document_analysis =
+            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
+
         // Step 4: Apply rules (skip if minimal parse requested)
         let parsed_elements = if minimal_parse.unwrap_or(false) {
             println!("🔄 Minimal parse mode - skipping rule processing");
@@ -476,9 +500,6 @@ impl DocumentProcessor {
                 self.rule_engine.set_debug_config(debug_config);
             }
 
-            // Analyze document for font size patterns
-            let document_analysis =
-                DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
             let font_size_analysis = self.rule_engine.analyze_font_sizes(
                 &preprocessor_output.text_elements,
                 &preprocessor_output.style_data,
@@ -501,11 +522,20 @@ impl DocumentProcessor {
 
         let step4_start = Instant::now();
 
+        // Infer title from content before elements are consumed by graph builder
+        let inferred_title = infer_title(&parsed_elements);
+
         // Step 5: Build graph from processed elements
         let mut graph = self.graph_builder.build_graph(parsed_elements)?;
 
-        // Step 6: Compute structural profile (L0 distributions)
+        // Step 6: Wire metadata and compute post-processing
+        if let Some(title) = inferred_title {
+            graph.document_info.document_metadata.title = Some(title);
+        }
+        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
+        graph.document_info.document_analysis = document_analysis;
         graph.compute_structural_profile();
+        graph.compute_breadcrumbs();
 
         println!(
             "⏱️  Graph construction: {:.3}s",
@@ -542,12 +572,13 @@ impl DocumentProcessor {
 
         // Stage 2: Classification + Rules → ParsedElements
         let classification = self.classifier.classify(&preprocessor_output)?;
+        let document_analysis =
+            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
+
         let parsed_elements = if config.minimal_parse {
             self.rule_engine
                 .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
         } else {
-            let document_analysis =
-                DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
             let font_size_analysis = self.rule_engine.analyze_font_sizes(
                 &preprocessor_output.text_elements,
                 &preprocessor_output.style_data,
@@ -566,11 +597,20 @@ impl DocumentProcessor {
             parsed_elements.len()
         );
 
+        // Infer title from content before graph build
+        let inferred_title = infer_title(&parsed_elements);
+
         // Stage 3: ParsedElements → DocumentGraph
         let mut graph = self.graph_builder.build_graph(parsed_elements.clone())?;
 
-        // Compute structural profile (L0 distributions)
+        // Wire metadata and compute post-processing
+        if let Some(title) = inferred_title {
+            graph.document_info.document_metadata.title = Some(title);
+        }
+        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
+        graph.document_info.document_analysis = document_analysis;
         graph.compute_structural_profile();
+        graph.compute_breadcrumbs();
 
         println!(
             "📋 Stage 3: Graph captured ({} nodes)",

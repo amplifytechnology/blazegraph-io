@@ -58,7 +58,10 @@ pub struct DocumentInfo {
     /// Analysis computed from text elements (font distributions, style stats)
     pub document_analysis: DocumentAnalysis,
 }
-// TODO: BIGTIME, we need a schema version here right? To avid a lot of headache in the future if we change.
+/// The schema version stamped on every graph output.
+/// Bump this when the output shape changes.
+pub const SCHEMA_VERSION: &str = "0.2.0";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
     pub nodes: HashMap<NodeId, DocumentNode>,
@@ -66,8 +69,11 @@ pub struct DocumentGraph {
     pub structural_profile: StructuralProfile,
 }
 
+/// The serialization-ready output format. Carries a schema version
+/// so consumers can detect and handle shape changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
+    pub schema_version: String,
     pub nodes: Vec<DocumentNode>,
     pub document_info: DocumentInfo,
     pub structural_profile: StructuralProfile,
@@ -356,6 +362,27 @@ pub struct DocumentMetadata {
     pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
 }
 
+impl DocumentMetadata {
+    /// Merge extracted metadata on top of current values.
+    /// Non-None fields from `extracted` overwrite; None fields preserve existing.
+    /// page_count overwrites if > 0.
+    pub fn merge_extracted(&mut self, extracted: DocumentMetadata) {
+        if extracted.title.is_some() { self.title = extracted.title; }
+        if extracted.author.is_some() { self.author = extracted.author; }
+        if extracted.language.is_some() { self.language = extracted.language; }
+        if extracted.page_count > 0 { self.page_count = extracted.page_count; }
+        if extracted.publisher.is_some() { self.publisher = extracted.publisher; }
+        if extracted.creator_tool.is_some() { self.creator_tool = extracted.creator_tool; }
+        if extracted.producer.is_some() { self.producer = extracted.producer; }
+        if extracted.pdf_version.is_some() { self.pdf_version = extracted.pdf_version; }
+        if extracted.created.is_some() { self.created = extracted.created; }
+        if extracted.modified.is_some() { self.modified = extracted.modified; }
+        if extracted.description.is_some() { self.description = extracted.description; }
+        if extracted.encrypted.is_some() { self.encrypted = extracted.encrypted; }
+        if extracted.has_marked_content.is_some() { self.has_marked_content = extracted.has_marked_content; }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleData {
     pub font_classes: std::collections::HashMap<String, FontClass>,
@@ -418,6 +445,20 @@ pub struct ListSequence {
     pub start_index: usize,
     pub end_index: usize,
     pub marker_indices: Vec<usize>, // Positions of actual markers within sequence
+}
+
+// ===== TITLE INFERENCE =====
+
+/// Infer a best-guess document title from parsed elements.
+/// Used as a fallback when Tika metadata doesn't provide a title.
+/// Current strategy: first Section element's text.
+/// Future candidates: largest font on page 1, first bold text, etc.
+pub fn infer_title(elements: &[ParsedPdfElement]) -> Option<String> {
+    // Strategy 1: First section element
+    elements.iter()
+        .find(|e| e.element_type == ParsedElementType::Section)
+        .map(|e| e.text.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Document analysis meta-attributes calculated from text elements

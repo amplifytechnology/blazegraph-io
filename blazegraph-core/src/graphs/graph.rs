@@ -55,6 +55,7 @@ impl DocumentGraph {
         });
 
         SortedDocumentGraph {
+            schema_version: SCHEMA_VERSION.to_string(),
             nodes: nodes.into_iter().cloned().collect(),
             document_info: self.document_info.clone(),
             structural_profile: self.structural_profile.clone(),
