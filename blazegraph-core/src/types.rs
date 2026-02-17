@@ -222,19 +222,12 @@ pub enum DocumentType {
 
 /// Histogram-based token distribution for comprehensive statistical analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct TokenDistribution {
     pub by_node_type: HashMap<String, TokenHistogram>,
     pub overall: TokenHistogram,
 }
 
-impl Default for TokenDistribution {
-    fn default() -> Self {
-        Self {
-            by_node_type: HashMap::new(),
-            overall: TokenHistogram::default(),
-        }
-    }
-}
 
 /// Histogram representation enabling statistical calculations (mean, median, mode, variance)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,19 +265,12 @@ pub struct HistogramBin {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct NodeTypeDistribution {
     pub counts: HashMap<String, usize>,
     pub percentages: HashMap<String, f32>,
 }
 
-impl Default for NodeTypeDistribution {
-    fn default() -> Self {
-        Self {
-            counts: HashMap::new(),
-            percentages: HashMap::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepthDistribution {

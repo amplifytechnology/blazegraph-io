@@ -182,8 +182,6 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     }
-
-    Ok(())
 }
 
 /// Create DocumentProcessor with JNI backend (cross-platform, auto-downloads JRE)

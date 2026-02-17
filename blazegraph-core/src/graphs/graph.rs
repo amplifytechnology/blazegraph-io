@@ -3,6 +3,12 @@ use anyhow::Result;
 use std::collections::HashMap;
 use super::analytics::GraphAnalytics;
 
+impl Default for DocumentGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DocumentGraph {
     pub fn new() -> Self {
         use uuid::Uuid;

@@ -77,7 +77,7 @@ impl<'a> SpatialClusteringRule<'a> {
             let key = (element.page_number, element.paragraph_number);
             paragraph_groups
                 .entry(key)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(element);
         }
 

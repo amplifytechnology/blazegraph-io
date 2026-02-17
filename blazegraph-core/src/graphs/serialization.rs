@@ -71,7 +71,7 @@ impl DocumentGraph {
                 let json = serde_json::to_string_pretty(&flat)?;
                 std::fs::write(path, json)?;
             }
-            "graph" | _ => {
+            _ => {
                 self.save_to_json(path)?;
             }
         }

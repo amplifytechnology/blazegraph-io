@@ -179,6 +179,12 @@ pub fn calculate_xhtml_hash(xhtml: &str) -> String {
 /// No-op storage implementation that disables all caching
 pub struct NoOpStorage;
 
+impl Default for NoOpStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NoOpStorage {
     pub fn new() -> Self {
         Self

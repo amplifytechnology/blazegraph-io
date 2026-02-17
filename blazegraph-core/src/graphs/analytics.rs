@@ -97,7 +97,7 @@ impl GraphAnalytics {
         let mean = if total_count > 0 { total_tokens as f32 / total_count as f32 } else { 0.0 };
         let median = if sorted_tokens.is_empty() { 
             0.0 
-        } else if sorted_tokens.len() % 2 == 0 {
+        } else if sorted_tokens.len().is_multiple_of(2) {
             let mid = sorted_tokens.len() / 2;
             (sorted_tokens[mid - 1] + sorted_tokens[mid]) as f32 / 2.0
         } else {

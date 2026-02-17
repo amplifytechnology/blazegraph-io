@@ -13,22 +13,6 @@ impl GraphBuilder {
         Self
     }
 
-    /// Build graph from elements and populate document info with metadata and analysis
-    pub fn build_graph_with_metadata(
-        &self,
-        elements: Vec<ParsedPdfElement>,
-        document_metadata: DocumentMetadata,
-        document_analysis: DocumentAnalysis,
-    ) -> Result<DocumentGraph> {
-        let mut graph = self.build_graph(elements)?;
-
-        // Populate document info with extracted metadata and computed analysis
-        graph.document_info.document_metadata = document_metadata;
-        graph.document_info.document_analysis = document_analysis;
-
-        Ok(graph)
-    }
-
     pub fn build_graph(&self, elements: Vec<ParsedPdfElement>) -> Result<DocumentGraph> {
         println!(
             "🏗️  Building document graph from {} elements",
@@ -120,10 +104,7 @@ impl GraphBuilder {
         graph.structural_profile.total_nodes = graph.nodes.len();
         graph.structural_profile.document_type = DocumentType::Generic; // Will be updated by processor
 
-        println!(
-            "✅ Graph built: {} nodes",
-            graph.nodes.len()
-        );
+        println!("✅ Graph built: {} nodes", graph.nodes.len());
 
         Ok(graph)
     }
@@ -150,7 +131,9 @@ impl GraphBuilder {
     ) -> String {
         if parent_id == graph.document_info.root_id {
             // Parent is root node — get children count from the Document node in nodes[]
-            let child_count = graph.nodes.get(&parent_id)
+            let child_count = graph
+                .nodes
+                .get(&parent_id)
                 .map(|n| n.children.len())
                 .unwrap_or(0);
             format!("{}", child_count + 1)

@@ -120,8 +120,8 @@ impl DocumentProcessor {
         Self::new_with_dependencies(preprocessor, storage)
     }
 
-    /// Future: Convenience constructor for API usage (server Tika + database storage)
-    /// This will be implemented when server-based Tika preprocessor is available
+    // Future: Convenience constructor for API usage (server Tika + database storage)
+    // This will be implemented when server-based Tika preprocessor is available
     // pub fn new_api(server_url: &str, db_config: &DatabaseConfig) -> Result<Self> {
     //     let preprocessor = Box::new(TikaPreprocessor::new_with_server(server_url)?);
     //     let storage = Box::new(DatabaseStorage::new(db_config)?);
