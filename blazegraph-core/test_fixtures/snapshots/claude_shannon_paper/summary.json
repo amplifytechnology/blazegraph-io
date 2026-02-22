@@ -1,0 +1,10 @@
+{
+  "captured_at": "2026-02-18T22:56:16.720273+00:00",
+  "input_pdf": "claude_shannon_paper.pdf",
+  "stage_counts": {
+    "graph_nodes": 95,
+    "parsed_elements": 94,
+    "text_elements": 3021,
+    "xhtml_bytes": 462555
+  }
+}

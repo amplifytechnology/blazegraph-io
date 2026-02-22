@@ -19,21 +19,19 @@ impl DocumentGraph {
             .into_iter()
             .enumerate()
             .map(|(index, node)| SequentialSegment {
-                id: index, // Start from 0 for root node
-                level: node.depth,
+                id: index,
+                node_type: node.node_type.clone(),
                 text: node.content.text.clone(),
-                path: node.hierarchical_path.clone(),
-                bbox: node.bounding_box.clone(),
+                location: node.location.clone(),
                 style: node.style_info.clone(),
                 tokens: node.token_count,
-                page: node.page,
             })
             .collect();
 
         SequentialDocument {
             format: "sequential".to_string(),
             segments,
-            metadata: self.metadata.clone(),
+            structural_profile: self.structural_profile.clone(),
         }
     }
 
@@ -73,7 +71,7 @@ impl DocumentGraph {
                 let json = serde_json::to_string_pretty(&flat)?;
                 std::fs::write(path, json)?;
             }
-            "graph" | _ => {
+            _ => {
                 self.save_to_json(path)?;
             }
         }

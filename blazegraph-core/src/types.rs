@@ -4,43 +4,89 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub type NodeId = Uuid;
-pub type EdgeId = Uuid;
+
+// ===== NODE LOCATION TYPES =====
+// These types implement the location model from 001-document-model.
+// SemanticLocation is always present (computed by GraphBuilder from tree structure).
+// PhysicalLocation is only present for fixed-flow formats (PDF).
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentRootNode {
-    pub id: NodeId,
-    pub document_metadata: DocumentMetadata,
-    pub document_analysis: DocumentAnalysis,
-    pub children: Vec<NodeId>,
+pub struct NodeLocation {
+    /// Always present — computed by GraphBuilder from final tree structure
+    pub semantic: SemanticLocation,
+    /// Only for fixed-flow formats (PDF) — passed through from channel
+    pub physical: Option<PhysicalLocation>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticLocation {
+    /// Hierarchical position in the document tree (e.g. "2.3.4")
+    pub path: String,
+    /// Tree depth (0 = root level)
+    pub depth: u32,
+    /// Human-readable trail (e.g. ["Chapter 2", "Methods", "Overview"])
+    pub breadcrumbs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhysicalLocation {
+    /// Page number (1-indexed)
+    pub page: u32,
+    /// Bounding box on the page
+    pub bounding_box: BoundingBox,
+}
+
+/// Signals whether physical location data is meaningful for this document
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FlowType {
+    /// PDF — has physical layout, physical_location is present
+    Fixed,
+    /// Markdown, DOCX — reflows, physical_location is None
+    Free,
+}
+
+/// Aggregated document-level information computed during parsing.
+/// This is NOT a node in the tree — it is information *about* the document.
+/// Has proto-L1 character: one per document, invariant to tree structure.
+/// See 006-document-info-separation.md for design rationale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentInfo {
+    /// References the Document node in nodes[] (the tree root)
+    pub root_id: NodeId,
+    /// Metadata extracted from the source format (title, author, page count, etc.)
+    pub document_metadata: DocumentMetadata,
+    /// Analysis computed from text elements (font distributions, style stats)
+    pub document_analysis: DocumentAnalysis,
+}
+/// The schema version stamped on every graph output.
+/// Bump this when the output shape changes.
+pub const SCHEMA_VERSION: &str = "0.2.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
     pub nodes: HashMap<NodeId, DocumentNode>,
-    pub edges: HashMap<EdgeId, DocumentEdge>,
-    pub root_node: DocumentRootNode,
-    pub metadata: GraphMetadata,
+    pub document_info: DocumentInfo,
+    pub structural_profile: StructuralProfile,
 }
 
+/// The serialization-ready output format. Carries a schema version
+/// so consumers can detect and handle shape changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
+    pub schema_version: String,
     pub nodes: Vec<DocumentNode>,
-    pub edges: Vec<DocumentEdge>,
-    pub root_node: DocumentRootNode,
-    pub metadata: GraphMetadata,
+    pub document_info: DocumentInfo,
+    pub structural_profile: StructuralProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentNode {
     pub id: NodeId,
-    pub node_type: String, // Changed from enum to string
-    pub page: Option<u32>, // Moved page from bounding_box to top level
+    pub node_type: String,
+    pub location: NodeLocation,
     pub text_order: Option<u32>,
-    pub hierarchical_path: String,
-    pub depth: u32,
     pub content: NodeContent,
     pub style_info: Option<StyleMetadata>,
-    pub bounding_box: Option<BoundingBox>,
     pub token_count: usize,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
@@ -51,22 +97,41 @@ impl DocumentNode {
         Self {
             id: Uuid::new_v4(),
             node_type: node_type.to_string(),
-            page: None,
+            location: NodeLocation {
+                semantic: SemanticLocation {
+                    path: String::new(),
+                    depth: 0,
+                    breadcrumbs: Vec::new(),
+                },
+                physical: None,
+            },
             text_order: Some(0),
-            hierarchical_path: String::new(),
-            depth: 0,
             content: NodeContent::new(text),
             style_info: None,
-            bounding_box: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
         }
     }
 
-    pub fn new_with_page(node_type: &str, text: String, page: Option<u32>) -> Self {
+    pub fn new_with_physical(
+        node_type: &str,
+        text: String,
+        page: Option<u32>,
+        bounding_box: Option<BoundingBox>,
+    ) -> Self {
         let mut node = Self::new(node_type, text);
-        node.page = page;
+        if let Some(page) = page {
+            node.location.physical = Some(PhysicalLocation {
+                page,
+                bounding_box: bounding_box.unwrap_or(BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                }),
+            });
+        }
         node
     }
 }
@@ -102,22 +167,6 @@ pub enum NodeType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentEdge {
-    pub id: EdgeId,
-    pub source: NodeId,
-    pub target: NodeId,
-    pub edge_type: EdgeType,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EdgeType {
-    Parent,
-    Child,
-    NextSibling,
-    PrevSibling,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleMetadata {
     pub font_class: String,
     pub font_size: Option<f32>,
@@ -127,33 +176,34 @@ pub struct StyleMetadata {
     pub color: Option<String>, // CSS color value (e.g., "#FF0000" or "rgb(255,0,0)")
 }
 
+/// Quantitative measurement of graph shape — deterministic, mechanically computed from structure.
+/// Travels with graph.json. Describes the L0 tree's statistical properties.
+/// See AmplifyNotes/09-Profile-Types.md for design rationale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphMetadata {
+pub struct StructuralProfile {
     pub created_at: DateTime<Utc>,
     pub document_type: DocumentType,
+    pub flow_type: FlowType,
     pub total_nodes: usize,
-    pub processing_time_ms: u128,
-    
-    // Enhanced analytics fields
+
+    // Analytics fields
     pub total_tokens: usize,
     pub token_distribution: TokenDistribution,
     pub node_type_distribution: NodeTypeDistribution,
     pub depth_distribution: DepthDistribution,
-    pub structural_health: StructuralHealth,
 }
 
-impl Default for GraphMetadata {
+impl Default for StructuralProfile {
     fn default() -> Self {
         Self {
             created_at: Utc::now(),
             document_type: DocumentType::Unknown,
+            flow_type: FlowType::Fixed,
             total_nodes: 0,
-            processing_time_ms: 0,
             total_tokens: 0,
             token_distribution: TokenDistribution::default(),
             node_type_distribution: NodeTypeDistribution::default(),
             depth_distribution: DepthDistribution::default(),
-            structural_health: StructuralHealth::default(),
         }
     }
 }
@@ -172,19 +222,12 @@ pub enum DocumentType {
 
 /// Histogram-based token distribution for comprehensive statistical analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct TokenDistribution {
     pub by_node_type: HashMap<String, TokenHistogram>,
     pub overall: TokenHistogram,
 }
 
-impl Default for TokenDistribution {
-    fn default() -> Self {
-        Self {
-            by_node_type: HashMap::new(),
-            overall: TokenHistogram::default(),
-        }
-    }
-}
 
 /// Histogram representation enabling statistical calculations (mean, median, mode, variance)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,7 +238,7 @@ pub struct TokenHistogram {
     // Cached statistics for performance
     pub mean: f32,
     pub median: f32,
-    pub mode: Option<u32>, // Bin with highest frequency  
+    pub mode: Option<u32>, // Bin with highest frequency
     pub variance: f32,
 }
 
@@ -215,26 +258,19 @@ impl Default for TokenHistogram {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistogramBin {
-    pub range_start: u32,  // Inclusive
-    pub range_end: u32,    // Exclusive
-    pub count: usize,      // Number of nodes in this range
-    pub token_sum: usize,  // Total tokens in this range
+    pub range_start: u32, // Inclusive
+    pub range_end: u32,   // Exclusive
+    pub count: usize,     // Number of nodes in this range
+    pub token_sum: usize, // Total tokens in this range
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct NodeTypeDistribution {
     pub counts: HashMap<String, usize>,
     pub percentages: HashMap<String, f32>,
 }
 
-impl Default for NodeTypeDistribution {
-    fn default() -> Self {
-        Self {
-            counts: HashMap::new(),
-            percentages: HashMap::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepthDistribution {
@@ -253,58 +289,35 @@ impl Default for DepthDistribution {
     }
 }
 
-/// Quality health metrics (thresholds may need refinement based on experience)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StructuralHealth {
-    pub token_variance_level: VarianceLevel, // Low/Medium/High
-    pub depth_balance: BalanceLevel,         // Balanced/Shallow/Deep  
-    pub node_type_richness: RichnessLevel,  // Rich/Sparse/Unbalanced
-}
-
-impl Default for StructuralHealth {
-    fn default() -> Self {
-        Self {
-            token_variance_level: VarianceLevel::Medium,
-            depth_balance: BalanceLevel::Balanced,
-            node_type_richness: RichnessLevel::Sparse,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VarianceLevel { Low, Medium, High }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BalanceLevel { Balanced, Shallow, Deep }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RichnessLevel { Rich, Sparse, Unbalanced }
+// Note: StructuralHealth (variance/balance/richness heuristics) removed.
+// Health assessment requires document-type context and belongs downstream
+// of the L0 parser. See AmplifyNotes/09-Profile-Types.md.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TikaOutput {
     pub xhtml_content: String,
     pub metadata: DocumentMetadata,
-    pub text_elements: Vec<TextElement>,
+    pub text_elements: Vec<PdfTextElement>,
     /// XHTML content hash for Level 2 cache key generation
     pub xhtml_hash: String,
     // New enhanced structures
-    pub style_data: StyleData,               // CSS font classes (always present)
+    pub style_data: StyleData, // CSS font classes (always present)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark_data: Option<BookmarkData>, // PDF bookmarks/outline
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextElement {
+pub struct PdfTextElement {
     pub text: String,
-    pub style_info: FontClass,             // Self-contained style information (no Option)
-    pub bounding_box: BoundingBox,         // Required positioning (no Option)
+    pub style_info: FontClass, // Self-contained style information (no Option)
+    pub bounding_box: BoundingBox, // Required positioning (no Option)
     pub page_number: u32,
-    pub paragraph_number: u32,             // Which paragraph this belongs to
-    pub line_number: u32,                  // data-line from XHTML
-    pub segment_number: u32,               // data-segment from XHTML
-    pub reading_order: u32,                // computed from line + segment
-    pub bookmark_match: Option<BookmarkSection>,    // Full bookmark section if this span matches
-    pub token_count: usize,                // Pre-calculated token count for performance
+    pub paragraph_number: u32, // Which paragraph this belongs to
+    pub line_number: u32,      // data-line from XHTML
+    pub segment_number: u32,   // data-segment from XHTML
+    pub reading_order: u32,    // computed from line + segment
+    pub bookmark_match: Option<BookmarkSection>, // Full bookmark section if this span matches
+    pub token_count: usize,    // Pre-calculated token count for performance
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundingBox {
@@ -319,20 +332,41 @@ pub struct BoundingBox {
 pub struct DocumentMetadata {
     // Current fields
     pub title: Option<String>,
-    pub author: Option<String>, 
+    pub author: Option<String>,
     pub language: Option<String>,
     pub page_count: u32,
-    
+
     // Enhanced flat fields from <meta> tags
-    pub publisher: Option<String>,           // xmp:dc:publisher
-    pub creator_tool: Option<String>,        // xmp:CreatorTool  
-    pub producer: Option<String>,            // pdf:producer
-    pub pdf_version: Option<String>,         // pdf:PDFVersion
-    pub created: Option<String>,             // dcterms:created
-    pub modified: Option<String>,            // dcterms:modified
-    pub description: Option<String>,         // dc:description
-    pub encrypted: Option<bool>,             // pdf:encrypted
-    pub has_marked_content: Option<bool>,    // pdf:hasMarkedContent
+    pub publisher: Option<String>,        // xmp:dc:publisher
+    pub creator_tool: Option<String>,     // xmp:CreatorTool
+    pub producer: Option<String>,         // pdf:producer
+    pub pdf_version: Option<String>,      // pdf:PDFVersion
+    pub created: Option<String>,          // dcterms:created
+    pub modified: Option<String>,         // dcterms:modified
+    pub description: Option<String>,      // dc:description
+    pub encrypted: Option<bool>,          // pdf:encrypted
+    pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
+}
+
+impl DocumentMetadata {
+    /// Merge extracted metadata on top of current values.
+    /// Non-None fields from `extracted` overwrite; None fields preserve existing.
+    /// page_count overwrites if > 0.
+    pub fn merge_extracted(&mut self, extracted: DocumentMetadata) {
+        if extracted.title.is_some() { self.title = extracted.title; }
+        if extracted.author.is_some() { self.author = extracted.author; }
+        if extracted.language.is_some() { self.language = extracted.language; }
+        if extracted.page_count > 0 { self.page_count = extracted.page_count; }
+        if extracted.publisher.is_some() { self.publisher = extracted.publisher; }
+        if extracted.creator_tool.is_some() { self.creator_tool = extracted.creator_tool; }
+        if extracted.producer.is_some() { self.producer = extracted.producer; }
+        if extracted.pdf_version.is_some() { self.pdf_version = extracted.pdf_version; }
+        if extracted.created.is_some() { self.created = extracted.created; }
+        if extracted.modified.is_some() { self.modified = extracted.modified; }
+        if extracted.description.is_some() { self.description = extracted.description; }
+        if extracted.encrypted.is_some() { self.encrypted = extracted.encrypted; }
+        if extracted.has_marked_content.is_some() { self.has_marked_content = extracted.has_marked_content; }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,12 +376,12 @@ pub struct StyleData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FontClass {
-    pub class_name: String,                  // "f1", "f2", "f3", etc. (kept for convenience)
-    pub font_family: String,                 // "LiberationSerif-Italic"
-    pub font_size: f32,                      // 20.0
-    pub font_style: String,                  // "italic", "normal"
-    pub font_weight: String,                 // "bold", "normal"
-    pub color: String,                       // "#000000"
+    pub class_name: String,  // "f1", "f2", "f3", etc. (kept for convenience)
+    pub font_family: String, // "LiberationSerif-Italic"
+    pub font_size: f32,      // 20.0
+    pub font_style: String,  // "italic", "normal"
+    pub font_weight: String, // "bold", "normal"
+    pub color: String,       // "#000000"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,8 +391,8 @@ pub struct BookmarkData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookmarkSection {
-    pub title: String,                       
-    pub order: u32,                          
+    pub title: String,
+    pub order: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -372,19 +406,17 @@ pub struct ClassificationResult {
 pub struct SequentialDocument {
     pub format: String,
     pub segments: Vec<SequentialSegment>,
-    pub metadata: GraphMetadata,
+    pub structural_profile: StructuralProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequentialSegment {
     pub id: usize,
-    pub level: u32,
+    pub node_type: String,
     pub text: String,
-    pub path: String,
-    pub bbox: Option<BoundingBox>,
+    pub location: NodeLocation,
     pub style: Option<StyleMetadata>,
     pub tokens: usize,
-    pub page: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,7 +430,21 @@ pub struct FlatDocument {
 pub struct ListSequence {
     pub start_index: usize,
     pub end_index: usize,
-    pub marker_indices: Vec<usize>,  // Positions of actual markers within sequence
+    pub marker_indices: Vec<usize>, // Positions of actual markers within sequence
+}
+
+// ===== TITLE INFERENCE =====
+
+/// Infer a best-guess document title from parsed elements.
+/// Used as a fallback when Tika metadata doesn't provide a title.
+/// Current strategy: first Section element's text.
+/// Future candidates: largest font on page 1, first bold text, etc.
+pub fn infer_title(elements: &[ParsedPdfElement]) -> Option<String> {
+    // Strategy 1: First section element
+    elements.iter()
+        .find(|e| e.element_type == ParsedElementType::Section)
+        .map(|e| e.text.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Document analysis meta-attributes calculated from text elements
@@ -423,7 +469,7 @@ pub struct DocumentAnalysis {
 
 impl DocumentAnalysis {
     /// Create document analysis from text elements
-    pub fn analyze_text_elements(text_elements: &[TextElement]) -> Self {
+    pub fn analyze_text_elements(text_elements: &[PdfTextElement]) -> Self {
         let mut font_size_counts: HashMap<String, usize> = HashMap::new();
         let mut font_family_counts: HashMap<String, usize> = HashMap::new();
         let mut bold_count = 0;
@@ -434,14 +480,16 @@ impl DocumentAnalysis {
 
         for element in text_elements {
             let style = &element.style_info;
-            
+
             // Count font sizes
             let size_key = format!("{:.1}", style.font_size);
             *font_size_counts.entry(size_key).or_insert(0) += 1;
             font_sizes.push(style.font_size);
 
             // Count font families
-            *font_family_counts.entry(style.font_family.clone()).or_insert(0) += 1;
+            *font_family_counts
+                .entry(style.font_family.clone())
+                .or_insert(0) += 1;
 
             // Count bold/non-bold
             let is_bold = style.font_weight.to_lowercase().contains("bold");
@@ -451,7 +499,7 @@ impl DocumentAnalysis {
                 non_bold_count += 1;
             }
 
-            // Count italic/non-italic  
+            // Count italic/non-italic
             let is_italic = style.font_style.to_lowercase().contains("italic");
             if is_italic {
                 italic_count += 1;
@@ -497,7 +545,6 @@ pub struct GraphAnalyticsResult {
     pub token_distribution: TokenDistribution,
     pub node_type_distribution: NodeTypeDistribution,
     pub depth_distribution: DepthDistribution,
-    pub structural_health: StructuralHealth,
 }
 
 /// Analytics computer that can analyze any subset of nodes in the graph
@@ -506,7 +553,7 @@ pub struct GraphAnalytics;
 // Graph builder structs
 #[derive(Debug, Clone)]
 pub struct ElementGroup {
-    pub elements: Vec<ParsedElement>,
+    pub elements: Vec<ParsedPdfElement>,
     pub group_type: GroupType,
     pub hierarchy_level: u32,
     pub combined_text: String,
@@ -518,13 +565,13 @@ pub enum GroupType {
     Paragraph,
 }
 /// Complete output from document preprocessing
-/// 
+///
 /// Contains all the data extracted from document parsing, including
 /// text elements, metadata, styling information, and document structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreprocessorOutput {
     /// Extracted text elements with positioning and styling
-    pub text_elements: Vec<TextElement>,
+    pub text_elements: Vec<PdfTextElement>,
     /// Document metadata (title, author, creation date, etc.)
     pub metadata: DocumentMetadata,
     /// Style information (fonts, colors, formatting)
@@ -533,25 +580,25 @@ pub struct PreprocessorOutput {
     pub bookmark_data: Option<BookmarkData>,
 }
 
-// Rule engine structs 
+// Rule engine structs
 
 // New struct for enhanced TextElement processing
-#[derive(Debug, Clone)]
-pub struct ParsedElement {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedPdfElement {
     pub element_type: ParsedElementType,
     pub text: String,
     pub hierarchy_level: u32,
     pub position: usize,
-    pub style_info: FontClass,           // Rich font data (no Option)
-    pub bounding_box: BoundingBox,       // Always present positioning  
+    pub style_info: FontClass,     // Rich font data (no Option)
+    pub bounding_box: BoundingBox, // Always present positioning
     pub page_number: u32,
-    pub paragraph_number: u32,           // New: paragraph context
-    pub reading_order: u32,              // New: spatial reading order
+    pub paragraph_number: u32,                   // New: paragraph context
+    pub reading_order: u32,                      // New: spatial reading order
     pub bookmark_match: Option<BookmarkSection>, // New: bookmark section data
-    pub token_count: usize,              // Pre-calculated token count for performance
+    pub token_count: usize,                      // Pre-calculated token count for performance
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ParsedElementType {
     Section,
     Paragraph,

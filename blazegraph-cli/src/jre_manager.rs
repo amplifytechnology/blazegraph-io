@@ -77,7 +77,7 @@ impl JreManager {
         ];
 
         for candidate in &candidates {
-            if candidate.exists() && candidate.to_string_lossy().len() > 0 {
+            if candidate.exists() && !candidate.to_string_lossy().is_empty() {
                 return Ok(candidate.clone());
             }
         }
