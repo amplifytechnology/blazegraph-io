@@ -86,6 +86,7 @@ pub struct DocumentNode {
     pub location: NodeLocation,
     pub text_order: Option<u32>,
     pub content: NodeContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub style_info: Option<StyleMetadata>,
     pub token_count: usize,
     pub parent: Option<NodeId>,
