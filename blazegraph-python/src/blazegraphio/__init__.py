@@ -105,7 +105,7 @@ def parse_pdf(
         BlazeGraphNotFoundError: If the CLI binary is not found (local mode).
     """
     cfg = get_config()
-    if cfg.is_api_mode:
+    if cfg.is_http_mode:
         from blazegraphio.client import _sync_parse_pdf
 
         return _sync_parse_pdf(path, cfg)
@@ -135,7 +135,7 @@ async def aparse_pdf(
         BlazeGraphError: If no API key is configured.
     """
     cfg = get_config()
-    if not cfg.is_api_mode:
+    if not cfg.is_http_mode:
         raise BlazeGraphError(
             "aparse_pdf requires an API key. Call bg.configure(api_key=...) first."
         )

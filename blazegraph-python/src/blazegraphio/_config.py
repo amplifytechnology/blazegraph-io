@@ -6,22 +6,34 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+_DEFAULT_URL = "https://api.blazegraph.io"
+
+
 @dataclass
 class _Config:
     """Internal configuration holder."""
 
     api_key: Optional[str] = None
-    url: str = "https://api.blazegraph.io"
+    url: Optional[str] = None  # None = not configured = use local CLI mode
 
     @property
-    def is_api_mode(self) -> bool:
-        """True if an API key is configured (use HTTP mode)."""
-        return self.api_key is not None
+    def is_http_mode(self) -> bool:
+        """True if a URL or API key has been configured (use HTTP mode).
+
+        A URL alone (no key) is sufficient — useful for self-hosted instances
+        that don't require authentication.
+        """
+        return self.url is not None or self.api_key is not None
+
+    @property
+    def resolved_url(self) -> str:
+        """The effective base URL to use for HTTP requests."""
+        return self.url or _DEFAULT_URL
 
     def reset(self) -> None:
         """Reset configuration to defaults."""
         self.api_key = None
-        self.url = "https://api.blazegraph.io"
+        self.url = None
 
 
 # Module-level singleton

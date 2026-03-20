@@ -23,8 +23,10 @@ _TIMEOUT = 300.0  # 5 minutes — PDF processing can be slow
 
 
 def _build_headers(cfg: "_Config") -> dict[str, str]:
-    """Build request headers with authorization."""
-    return {"Authorization": f"Bearer {cfg.api_key}"}
+    """Build request headers. Authorization is omitted if no API key is set."""
+    if cfg.api_key:
+        return {"Authorization": f"Bearer {cfg.api_key}"}
+    return {}
 
 
 def _handle_response(response: httpx.Response) -> BlazeGraph:
@@ -65,7 +67,7 @@ def _sync_parse_pdf(path: str, cfg: "_Config") -> BlazeGraph:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
 
-    url = cfg.url.rstrip("/") + _PROCESS_PATH
+    url = cfg.resolved_url.rstrip("/") + _PROCESS_PATH
     headers = _build_headers(cfg)
 
     with httpx.Client(timeout=_TIMEOUT) as client:
@@ -82,7 +84,7 @@ async def _async_parse_pdf(path: str, cfg: "_Config") -> BlazeGraph:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
 
-    url = cfg.url.rstrip("/") + _PROCESS_PATH
+    url = cfg.resolved_url.rstrip("/") + _PROCESS_PATH
     headers = _build_headers(cfg)
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
