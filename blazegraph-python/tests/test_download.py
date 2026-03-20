@@ -23,20 +23,26 @@ class TestDetectPlatform:
     @patch("blazegraphio._download.platform.system", return_value="Darwin")
     @patch("blazegraphio._download.platform.machine", return_value="arm64")
     def test_macos_arm64(self, _m, _s) -> None:
-        assert _detect_platform() == "aarch64-apple-darwin"
+        assert _detect_platform() == ("aarch64-apple-darwin", ".tar.gz")
 
     @patch("blazegraphio._download.platform.system", return_value="Darwin")
     @patch("blazegraphio._download.platform.machine", return_value="x86_64")
-    def test_macos_x86(self, _m, _s) -> None:
-        assert _detect_platform() == "x86_64-apple-darwin"
+    def test_macos_x86_unsupported(self, _m, _s) -> None:
+        with pytest.raises(BlazeGraphNotFoundError, match="Unsupported platform"):
+            _detect_platform()
 
     @patch("blazegraphio._download.platform.system", return_value="Linux")
     @patch("blazegraphio._download.platform.machine", return_value="x86_64")
     def test_linux_x86(self, _m, _s) -> None:
-        assert _detect_platform() == "x86_64-unknown-linux-gnu"
+        assert _detect_platform() == ("x86_64-unknown-linux-gnu", ".tar.gz")
 
     @patch("blazegraphio._download.platform.system", return_value="Windows")
     @patch("blazegraphio._download.platform.machine", return_value="AMD64")
+    def test_windows_amd64(self, _m, _s) -> None:
+        assert _detect_platform() == ("x86_64-pc-windows-msvc", ".zip")
+
+    @patch("blazegraphio._download.platform.system", return_value="FreeBSD")
+    @patch("blazegraphio._download.platform.machine", return_value="x86_64")
     def test_unsupported_platform(self, _m, _s) -> None:
         with pytest.raises(BlazeGraphNotFoundError, match="Unsupported platform"):
             _detect_platform()
