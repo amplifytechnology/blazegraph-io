@@ -23,6 +23,7 @@ app = FastAPI(
 
 CLI_PATH = os.environ.get("BLAZEGRAPH_CLI_PATH", "/app/bin/blazegraph-cli")
 JAR_PATH = os.environ.get("BLAZEGRAPH_JAR_PATH", "/app/bin/blazing-tika-jni.jar")
+DEFAULT_CONFIG_PATH = os.environ.get("BLAZEGRAPH_CONFIG_PATH")
 
 
 @app.get("/health")
@@ -70,8 +71,9 @@ async def process_pdf(
             "-f", output_format,
             "-o", str(output_path),
         ]
-        if config:
-            cmd.extend(["--config", config])
+        effective_config = config or DEFAULT_CONFIG_PATH
+        if effective_config:
+            cmd.extend(["--config", effective_config])
 
         # Run CLI
         result = subprocess.run(

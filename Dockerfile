@@ -34,8 +34,9 @@ WORKDIR /app
 # Copy CLI binary from builder
 COPY --from=builder /build/target/release/blazegraph-cli /app/bin/blazegraph-cli
 
-# Copy Tika JAR
+# Copy Tika JAR and default processing config
 COPY blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar /app/bin/blazing-tika-jni.jar
+COPY blazegraph-cli/configs/processing/config.yaml /app/bin/config.yaml
 
 # Copy server code and install Python deps using python3.11
 COPY server/ /app/server/
@@ -44,6 +45,7 @@ RUN python3.11 -m pip install --no-cache-dir -r /app/server/requirements.txt
 # Environment
 ENV BLAZEGRAPH_CLI_PATH=/app/bin/blazegraph-cli
 ENV BLAZEGRAPH_JAR_PATH=/app/bin/blazing-tika-jni.jar
+ENV BLAZEGRAPH_CONFIG_PATH=/app/bin/config.yaml
 ENV JAVA_HOME=/opt/java/openjdk
 
 EXPOSE 8080
