@@ -176,8 +176,17 @@ def find_or_download_cli() -> Path:
 def get_jre_dir() -> Path:
     """Return the JRE directory path (for ``--jre-path`` flag).
 
-    Creates the directory if it doesn't exist. The CLI itself handles
-    downloading the JRE into this directory.
+    Resolution order:
+    1. ``JAVA_HOME`` environment variable (if set and exists)
+    2. Package-local ``_runtime/jre/`` directory (for pip-installed JRE)
+
+    Creates the fallback directory if it doesn't exist. The CLI itself
+    handles downloading the JRE into the fallback directory.
     """
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        java_home_path = Path(java_home)
+        if java_home_path.is_dir():
+            return java_home_path
     _JRE_DIR.mkdir(parents=True, exist_ok=True)
     return _JRE_DIR
