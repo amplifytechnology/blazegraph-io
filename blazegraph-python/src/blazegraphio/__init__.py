@@ -11,8 +11,8 @@ Usage::
     bg.configure(api_key="blaze_prod_XXX...")
     graph = bg.parse_pdf("document.pdf")
 
-    # Async API mode
-    graph = await bg.aparse_pdf("document.pdf")
+    # Async mode (self-hosted or API)
+    graph = await bg.parse_pdf_async("document.pdf")
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ __all__ = [
     # Public API functions
     "configure",
     "parse_pdf",
-    "aparse_pdf",
+    "parse_pdf_async",
     # Top-level type
     "BlazeGraph",
     # Node types
@@ -115,7 +115,7 @@ def parse_pdf(
         return _local_parse_pdf(path, config_path=config)
 
 
-async def aparse_pdf(
+async def parse_pdf_async(
     path: str,
 ) -> BlazeGraph:
     """Parse a PDF asynchronously via the API.
@@ -137,7 +137,7 @@ async def aparse_pdf(
     cfg = get_config()
     if not cfg.is_http_mode:
         raise BlazeGraphError(
-            "aparse_pdf requires an API key. Call bg.configure(api_key=...) first."
+            "parse_pdf_async requires a host or API key. Call bg.configure(host=...) or bg.configure(api_key=...) first."
         )
     from blazegraphio.client import _async_parse_pdf
 

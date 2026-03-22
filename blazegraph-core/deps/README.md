@@ -6,18 +6,6 @@ This directory contains external dependencies required for the JNI backend.
 
 The JNI backend requires `blazing-tika.jar` which contains Apache Tika with custom PDF processing.
 
-### Building the JAR
-
-From the `tika` repo:
-
-```bash
-# Build the JAR with JNI support
-mvn clean package -f pom-jni-slim.xml -DskipTests
-
-# Copy to this directory
-cp target/blazing-tika-jni-*.jar /path/to/blazegraph-core/deps/blazing-tika.jar
-```
-
 ### What's in the JAR
 
 The JAR includes:

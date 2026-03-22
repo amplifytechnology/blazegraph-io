@@ -1,11 +1,15 @@
 [package]
-name = "blazegraph-core"
+name = "blazegraph-io-core"
 version = "0.1.0"
 edition = "2021"
-description = "Core library for semantic document graph processing"
+description = "Core library for semantic document graph processing — parse PDFs into structured, queryable graphs"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/amplify-tech/blazegraph-io"
+readme = "README.md"
+repository = "https://github.com/AmplifyTechnology/blazegraph-io"
 homepage = "https://blazegraph.io"
+keywords = ["pdf", "document", "graph", "rag", "parsing"]
+categories = ["text-processing", "parser-implementations"]
+exclude = ["test_fixtures/"]
 
 [dependencies]
 # Serialization

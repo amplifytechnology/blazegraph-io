@@ -2,12 +2,12 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::Path;
 
-// Import from blazegraph-core
-use blazegraph_core::{DocumentProcessor, DocumentGraph, ParsingConfig, PipelineStages};
+// Import from blazegraph-io-core
+use blazegraph_io_core::{DocumentProcessor, DocumentGraph, ParsingConfig, PipelineStages};
 
 // Import CLI utilities
 #[cfg(feature = "jni-backend")]
-use blazegraph_cli::JreManager;
+use blazegraph_io::JreManager;
 
 #[derive(Parser)]
 #[command(name = "blazegraph")]

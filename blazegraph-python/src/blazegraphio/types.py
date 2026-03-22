@@ -408,7 +408,7 @@ class BlazeGraph:
     """Top-level wrapper for a parsed document graph.
 
     This is the return type for :func:`blazegraphio.parse_pdf` and
-    :func:`blazegraphio.aparse_pdf`.
+    :func:`blazegraphio.parse_pdf_async`.
     """
 
     schema_version: str
