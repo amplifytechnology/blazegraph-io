@@ -1,4 +1,4 @@
-"""GitHub Release asset downloader for blazegraph-cli binary.
+"""GitHub Release asset downloader for blazegraph-io binary.
 
 Downloads the correct platform archive on first use in local mode,
 extracts the CLI binary and Tika JAR into ``site-packages/blazegraphio/_runtime/``.
@@ -49,7 +49,7 @@ def _detect_platform() -> tuple[str, str]:
         raise BlazeGraphNotFoundError(
             f"Unsupported platform: {system}/{machine}. "
             f"Supported: {', '.join(f'{s}/{m}' for s, m in _PLATFORM_MAP)}. "
-            f"macOS Intel users: install via `cargo install` or place blazegraph-cli on PATH."
+            f"macOS Intel users: install via `cargo install blazegraph-io` or place blazegraph-io on PATH."
         )
     return _PLATFORM_MAP[key]
 
@@ -63,14 +63,14 @@ def _latest_release_tag() -> str:
 
 
 def _download_and_extract(tag: str, platform_str: str, archive_ext: str) -> Path:
-    """Download and extract the blazegraph-cli archive for the given release.
+    """Download and extract the blazegraph-io archive for the given release.
 
     Extracts both the CLI binary and the Tika JAR into _runtime/bin/.
 
     Returns:
         Path to the extracted CLI binary.
     """
-    asset_name = f"blazegraph-cli-{platform_str}{archive_ext}"
+    asset_name = f"blazegraph-io-{platform_str}{archive_ext}"
     url = (
         f"https://github.com/{_GITHUB_ORG}/{_GITHUB_REPO}"
         f"/releases/download/{tag}/{asset_name}"
@@ -79,11 +79,11 @@ def _download_and_extract(tag: str, platform_str: str, archive_ext: str) -> Path
     _BIN_DIR.mkdir(parents=True, exist_ok=True)
 
     is_windows = platform.system() == "Windows"
-    cli_name = "blazegraph-cli.exe" if is_windows else "blazegraph-cli"
+    cli_name = "blazegraph-io.exe" if is_windows else "blazegraph-io"
     dest_binary = _BIN_DIR / cli_name
     dest_jar = _BIN_DIR / "blazing-tika-jni.jar"
 
-    print(f"Downloading blazegraph-cli {tag} ({platform_str})... ", end="", flush=True)
+    print(f"Downloading blazegraph-io {tag} ({platform_str})... ", end="", flush=True)
 
     with httpx.stream("GET", url, timeout=120.0, follow_redirects=True) as response:
         response.raise_for_status()
@@ -96,7 +96,7 @@ def _download_and_extract(tag: str, platform_str: str, archive_ext: str) -> Path
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
             for member in tar.getmembers():
                 name = Path(member.name).name
-                if name == "blazegraph-cli":
+                if name == "blazegraph-io":
                     with tar.extractfile(member) as f:  # type: ignore[union-attr]
                         dest_binary.write_bytes(f.read())
                 elif name == "blazing-tika-jni.jar":
@@ -106,7 +106,7 @@ def _download_and_extract(tag: str, platform_str: str, archive_ext: str) -> Path
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
             for info in zf.infolist():
                 name = Path(info.filename).name
-                if name == "blazegraph-cli.exe":
+                if name == "blazegraph-io.exe":
                     dest_binary.write_bytes(zf.read(info.filename))
                 elif name == "blazing-tika-jni.jar":
                     dest_jar.write_bytes(zf.read(info.filename))
@@ -122,12 +122,12 @@ def _download_and_extract(tag: str, platform_str: str, archive_ext: str) -> Path
 
 
 def find_or_download_cli() -> Path:
-    """Locate the blazegraph-cli binary, downloading if necessary.
+    """Locate the blazegraph-io binary, downloading if necessary.
 
     Search order:
     1. ``BLAZEGRAPH_CLI_PATH`` environment variable
-    2. ``_runtime/bin/blazegraph-cli`` (package-local, previous download)
-    3. PATH / ``~/.cargo/bin/blazegraph-cli``
+    2. ``_runtime/bin/blazegraph-io`` (package-local, previous download)
+    3. PATH / ``~/.cargo/bin/blazegraph-io``
     4. Download from GitHub Releases
 
     Returns:
@@ -148,13 +148,13 @@ def find_or_download_cli() -> Path:
 
     # 2. Package-local binary
     is_windows = platform.system() == "Windows"
-    cli_name = "blazegraph-cli.exe" if is_windows else "blazegraph-cli"
+    cli_name = "blazegraph-io.exe" if is_windows else "blazegraph-io"
     local_bin = _BIN_DIR / cli_name
     if local_bin.exists():
         return local_bin
 
     # 3. Check PATH and cargo bin
-    path_bin = shutil.which("blazegraph-cli")
+    path_bin = shutil.which("blazegraph-io")
     if path_bin:
         return Path(path_bin)
 
@@ -169,7 +169,7 @@ def find_or_download_cli() -> Path:
         return _download_and_extract(tag, platform_str, archive_ext)
     except Exception as exc:
         raise BlazeGraphNotFoundError(
-            f"Could not find or download blazegraph-cli: {exc}"
+            f"Could not find or download blazegraph-io: {exc}"
         ) from exc
 
 
