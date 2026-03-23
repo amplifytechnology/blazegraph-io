@@ -25,7 +25,18 @@ pip install blazegraph-io
 
 No account needed. No API key. Runs entirely on your machine.
 
-> On first run, the CLI downloads a Java Runtime (~60MB) for PDF text extraction. It's cached for future use.
+> On first run, the CLI downloads a Java Runtime (~60MB) and the Tika JAR for PDF text extraction. Both are cached for future use.
+
+### Uninstall
+
+```bash
+# Python
+pip uninstall blazegraph-io    # removes everything including cached runtime
+
+# Rust CLI
+cargo uninstall blazegraph-io
+rm -rf ~/.local/share/blazegraph   # remove cached JRE and Tika JAR
+```
 
 ## Usage
 
