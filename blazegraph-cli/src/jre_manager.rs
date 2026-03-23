@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 /// JRE version to download (LTS version for stability)
 const JRE_VERSION: &str = "21";
 
+/// Tika JAR download URL — pinned to the published release tag
+const TIKA_JAR_URL: &str = "https://github.com/AmplifyTechnology/blazegraph-io/raw/v0.1.0/blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar";
+const TIKA_JAR_FILENAME: &str = "blazing-tika-jni.jar";
+
 /// Manages JRE installation for the CLI
 pub struct JreManager {
     /// Base directory for blazegraph data (e.g., ~/.local/share/blazegraph)
@@ -51,10 +55,10 @@ impl JreManager {
         self.data_dir.join("jre")
     }
 
-    /// Get the path to the bundled JAR file
-    /// Returns the path relative to the executable or the development path
+    /// Get the path to the Tika JAR file.
+    /// Searches local paths first, then auto-downloads to the data directory.
     pub fn find_jar_path() -> Result<PathBuf> {
-        // Check various locations for the JAR
+        // Check various local locations for the JAR
         let candidates = [
             // Core deps path (running from blazegraph-cli directory)
             PathBuf::from("../blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar"),
@@ -67,12 +71,12 @@ impl JreManager {
             // Installed alongside binary
             std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(|p| p.join("blazing-tika-jni.jar")))
+                .and_then(|p| p.parent().map(|p| p.join(TIKA_JAR_FILENAME)))
                 .unwrap_or_default(),
-            // In data directory (for future auto-download)
+            // In data directory (auto-downloaded)
             Self::get_data_dir()
                 .ok()
-                .map(|p| p.join("blazing-tika-jni.jar"))
+                .map(|p| p.join(TIKA_JAR_FILENAME))
                 .unwrap_or_default(),
         ];
 
@@ -82,16 +86,32 @@ impl JreManager {
             }
         }
 
-        Err(anyhow!(
-            "Could not find blazing-tika JAR file.\n\
-             Searched in:\n\
-             - ../blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar\n\
-             - blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar\n\
-             - blazegraph-io/blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar\n\
-             - src/tika/jars/blazing-tika-jni.jar (legacy)\n\
-             - Next to executable\n\
-             - Data directory"
-        ))
+        // Not found locally — auto-download to data directory
+        Self::download_tika_jar()
+    }
+
+    /// Download the Tika JAR to the data directory
+    fn download_tika_jar() -> Result<PathBuf> {
+        let data_dir = Self::get_data_dir()?;
+        fs::create_dir_all(&data_dir)
+            .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
+
+        let jar_path = data_dir.join(TIKA_JAR_FILENAME);
+
+        println!("📦 Tika JAR not found, downloading (~4.5 MB)...");
+
+        // Download to a temp file first, then rename for atomicity
+        let temp_path = data_dir.join("blazing-tika-jni.jar.tmp");
+
+        // Reuse the same download logic as JRE
+        let manager = Self { data_dir: data_dir.clone() };
+        manager.download_file(TIKA_JAR_URL, &temp_path)?;
+
+        fs::rename(&temp_path, &jar_path)
+            .with_context(|| "Failed to move downloaded JAR to final location")?;
+
+        println!("✅ Tika JAR installed at: {}", jar_path.display());
+        Ok(jar_path)
     }
 
     /// Check if JRE is already installed
