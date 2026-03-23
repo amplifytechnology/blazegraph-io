@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version constants for cache invalidation
 pub mod versions {
-    pub const BLAZEGRAPH_VERSION: &str = "0.1.0";
+    pub const BLAZEGRAPH_VERSION: &str = "0.1.1";
     pub const PROCESSING_VERSION: &str = "1.0.0";
     pub const TIKA_INTERFACE_VERSION: &str = "1.0.0";
 }

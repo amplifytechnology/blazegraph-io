@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 app = FastAPI(
     title="Blazegraph IO — Self-Hosted",
     description="Local document parsing API powered by blazegraph-cli",
-    version="0.1.0",
+    version="0.1.1",
 )
 
 CLI_PATH = os.environ.get("BLAZEGRAPH_CLI_PATH", "/app/bin/blazegraph-cli")

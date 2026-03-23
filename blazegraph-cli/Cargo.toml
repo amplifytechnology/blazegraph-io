@@ -1,6 +1,6 @@
 [package]
 name = "blazegraph-io"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Parse PDFs into semantic document graphs with bounding boxes. Built for GraphRAG."
 license = "MIT OR Apache-2.0"
@@ -39,7 +39,7 @@ zip = "0.6"             # Windows zip extraction
 dirs = "5.0"            # Cross-platform data directories
 
 # Core processing library - default to JNI backend
-blazegraph-io-core = { version = "0.1.0", path = "../blazegraph-core", package = "blazegraph-io-core", default-features = false }
+blazegraph-io-core = { version = "0.1.1", path = "../blazegraph-core", package = "blazegraph-io-core", default-features = false }
 
 [features]
 default = ["jni-backend"]

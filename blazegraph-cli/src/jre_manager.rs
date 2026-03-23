@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 const JRE_VERSION: &str = "21";
 
 /// Tika JAR download URL — pinned to the published release tag
-const TIKA_JAR_URL: &str = "https://github.com/AmplifyTechnology/blazegraph-io/raw/v0.1.0/blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar";
+const TIKA_JAR_URL: &str = "https://github.com/AmplifyTechnology/blazegraph-io/raw/v0.1.1/blazegraph-core/deps/tika/jni-jars/blazing-tika-jni.jar";
 const TIKA_JAR_FILENAME: &str = "blazing-tika-jni.jar";
 
 /// Manages JRE installation for the CLI
