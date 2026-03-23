@@ -5,6 +5,10 @@ use std::path::Path;
 // Import from blazegraph-io-core
 use blazegraph_io_core::{DocumentProcessor, DocumentGraph, ParsingConfig, PipelineStages};
 
+/// Default config embedded at compile time — guarantees every install has working defaults.
+/// Without this, `cargo install` users get raw parse output (3000+ nodes, 0 sections).
+const DEFAULT_CONFIG_YAML: &str = include_str!("../configs/processing/config.yaml");
+
 // Import CLI utilities
 #[cfg(feature = "jni-backend")]
 use blazegraph_io::JreManager;
@@ -98,14 +102,23 @@ fn main() -> Result<()> {
     // Create processor based on available backend
     let mut processor = create_processor(&args)?;
 
-    // Load config using new functional pattern
-    let mut config = ParsingConfig::load_with_fallback(args.config.as_deref());
-    
-    if let Some(config_path) = &args.config {
+    // Load config: user-specified file > embedded default > ParsingConfig::default()
+    let mut config = if let Some(config_path) = &args.config {
+        let c = ParsingConfig::load_with_fallback(Some(config_path));
         println!("📋 Loaded config from: {}", config_path);
+        c
     } else {
-        println!("📋 Using default config");
-    }
+        match serde_yaml::from_str::<ParsingConfig>(DEFAULT_CONFIG_YAML) {
+            Ok(c) => {
+                println!("📋 Using built-in default config");
+                c
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to parse embedded config: {e}, using fallback defaults");
+                ParsingConfig::default()
+            }
+        }
+    };
 
     // Apply CLI overrides to config
     if args.include_raw_tika {
