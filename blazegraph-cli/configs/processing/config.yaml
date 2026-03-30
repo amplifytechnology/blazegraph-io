@@ -23,7 +23,7 @@ section_and_hierarchy:
   small_header_threshold: 0.15 # More selective - 15% above median
   min_header_size: 9.5 # Just below 10pt to catch those bold headers
   use_bold_indicator: true
-  bold_size_strict: false # true = bold AND larger, false = bold OR larger
+  bold_size_strict: true # true = bold AND larger, false = bold OR larger
   # Contextual hierarchy parameters
   max_depth: 6
   font_size_tolerance: 0.1

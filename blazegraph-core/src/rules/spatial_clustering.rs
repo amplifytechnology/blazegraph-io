@@ -94,32 +94,47 @@ impl<'a> SpatialClusteringRule<'a> {
                 // Sort by reading_order to maintain proper text flow
                 group.sort_by_key(|e| e.reading_order);
 
-                let _group_len = group.len();
-                let mut group_iter = group.into_iter();
-
-                // Start with the first element as the base
-                let mut merged_element = group_iter.next().unwrap();
-
-                // Merge all subsequent elements into the first one
-                for element in group_iter {
-                    // Merge text with space separator
-                    merged_element.text = format!("{} {}", merged_element.text, element.text);
-
-                    // Expand bounding box to encompass all segments
-                    merged_element.bounding_box = self
-                        .merge_bounding_boxes(&merged_element.bounding_box, &element.bounding_box);
-
-                    // Sum token counts for efficient aggregation
-                    merged_element.token_count += element.token_count;
-
-                    // Keep the earliest reading_order (from the sorted first element)
-                    // Other fields like style_info, page_number, paragraph_number stay from first element
+                // Split group at element_type boundaries before merging.
+                // This prevents Section headers from absorbing following Paragraph
+                // content that Tika assigns the same paragraph_number.
+                let mut type_groups: Vec<Vec<ParsedPdfElement>> = Vec::new();
+                for element in group {
+                    let same_type = type_groups
+                        .last()
+                        .and_then(|g| g.last())
+                        .map(|last| last.element_type == element.element_type)
+                        .unwrap_or(false);
+                    if same_type {
+                        type_groups.last_mut().unwrap().push(element);
+                    } else {
+                        type_groups.push(vec![element]);
+                    }
                 }
 
-                // println!("   📄 Page {}, Paragraph {}: Merged {} segments",
-                //     page_num, para_num, group_len);
+                for type_group in type_groups {
+                    let mut type_group_iter = type_group.into_iter();
+                    let mut merged_element = type_group_iter.next().unwrap();
 
-                clustered_elements.push(merged_element);
+                    for element in type_group_iter {
+                        // Merge text with space separator
+                        merged_element.text =
+                            format!("{} {}", merged_element.text, element.text);
+
+                        // Expand bounding box to encompass all segments
+                        merged_element.bounding_box = self.merge_bounding_boxes(
+                            &merged_element.bounding_box,
+                            &element.bounding_box,
+                        );
+
+                        // Sum token counts for efficient aggregation
+                        merged_element.token_count += element.token_count;
+
+                        // Keep the earliest reading_order (from the sorted first element)
+                        // Other fields like style_info, page_number, paragraph_number stay from first element
+                    }
+
+                    clustered_elements.push(merged_element);
+                }
             }
         }
 
