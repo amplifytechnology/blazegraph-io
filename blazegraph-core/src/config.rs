@@ -9,6 +9,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_min_alpha_ratio() -> f32 {
+    0.5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsingConfig {
     pub document_type: DocumentType,
@@ -92,6 +96,12 @@ pub struct SectionAndHierarchyConfig {
     /// Starting level for first section (document root is level 0)
     pub starting_section_level: u32,
 
+    /// Minimum ratio of ASCII alphabetic characters to non-whitespace characters
+    /// for a candidate header. Filters out math symbols/formulas that happen to be
+    /// in larger fonts. 0.0 = disabled, 0.5 = at least half must be a-zA-Z.
+    #[serde(default = "default_min_alpha_ratio")]
+    pub min_alpha_ratio: f32,
+
     /// Pattern-based section detection configuration
     pub pattern_detection: PatternDetectionConfig,
 }
@@ -135,6 +145,7 @@ impl Default for SectionAndHierarchyConfig {
             font_size_tolerance: 0.1,
             enforce_max_depth: true,
             starting_section_level: 1,
+            min_alpha_ratio: 0.5,
             pattern_detection: PatternDetectionConfig::default(),
         }
     }
@@ -591,6 +602,7 @@ impl ConfigManager {
                 font_size_tolerance: 0.1,
                 enforce_max_depth: true,
                 starting_section_level: 1,
+                min_alpha_ratio: 0.5,
                 pattern_detection: PatternDetectionConfig::default(),
             },
             spatial_clustering: SpatialClusteringConfig {
@@ -642,6 +654,7 @@ impl ConfigManager {
                 font_size_tolerance: 0.1,
                 enforce_max_depth: true,
                 starting_section_level: 1,
+                min_alpha_ratio: 0.5,
                 pattern_detection: PatternDetectionConfig::default(),
             },
             spatial_clustering: SpatialClusteringConfig {

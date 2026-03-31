@@ -24,6 +24,7 @@ section_and_hierarchy:
   min_header_size: 9.5 # Just below 10pt to catch those bold headers
   use_bold_indicator: true
   bold_size_strict: true # true = bold AND larger, false = bold OR larger
+  min_alpha_ratio: 0.9 # Minimum ratio of ASCII alpha chars — filters math symbols as false headers
   # Contextual hierarchy parameters
   max_depth: 6
   font_size_tolerance: 0.1

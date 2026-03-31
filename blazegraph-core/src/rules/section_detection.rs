@@ -164,11 +164,30 @@ impl<'a> SectionAndHierarchyDetectionRule<'a> {
         let text_length = element.text.trim().len();
         let is_meaningful_header = if is_header || matches_section_pattern {
             // Allow meaningful section headers: minimum 3 characters, not just single words like "To", "Our"
-            text_length >= 3 &&
+            let passes_length = text_length >= 3 &&
             // Additional check: if it's very short, it should be bold or a potential header size
             (text_length >= 8 ||
              element.style_info.font_weight.to_lowercase().contains("bold") ||
-             font_size_analysis.potential_header_sizes.contains(&element.style_info.font_size))
+             font_size_analysis.potential_header_sizes.contains(&element.style_info.font_size));
+
+            // CR-06: Check alphabetic content ratio — reject math symbols/formulas
+            let passes_alpha = {
+                let min_ratio = self.config.section_and_hierarchy.min_alpha_ratio;
+                if min_ratio <= 0.0 {
+                    true // Disabled
+                } else {
+                    let non_ws_chars = element.text.chars().filter(|c| !c.is_whitespace()).count();
+                    let alpha_chars = element.text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+                    let ratio = if non_ws_chars > 0 {
+                        alpha_chars as f32 / non_ws_chars as f32
+                    } else {
+                        0.0
+                    };
+                    ratio >= min_ratio
+                }
+            };
+
+            passes_length && passes_alpha
         } else {
             false
         };
