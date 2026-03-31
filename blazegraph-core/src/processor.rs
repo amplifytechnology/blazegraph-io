@@ -1,4 +1,6 @@
-use crate::cache::{GraphCacheKey, GraphCacheValue};
+use crate::cache::GraphCacheKey;
+// NOTE: GraphCacheValue unused while L2 cache is disabled (CR-07)
+// use crate::cache::GraphCacheValue;
 use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
 use crate::graphs::builder::GraphBuilder;
@@ -170,29 +172,27 @@ impl DocumentProcessor {
         let pdf_bytes = std::fs::read(input_path)?;
         let pdf_hash = calculate_pdf_hash(&pdf_bytes);
 
-        // Calculate config hash for Level 2 cache
-        let config_hash = calculate_config_hash(config)?;
-        let cache_key = GraphCacheKey::new(pdf_hash.clone(), config_hash);
+        // NOTE: Level 2 cache key computed but unused while L2 cache is disabled (CR-07)
+        let _config_hash = calculate_config_hash(config)?;
+        let _cache_key = GraphCacheKey::new(pdf_hash.clone(), _config_hash);
 
-        // Check Level 2 cache: Config + PDF → Graph
-        if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
-            println!("🎯 Cache hit: Found graph for PDF + config combination");
-            println!(
-                "⏱️  Total processing time: {:.3}s (cached)",
-                start_time.elapsed().as_secs_f64()
-            );
-            return Ok(cached.graph);
-        }
+        // NOTE: Level 2 graph cache disabled during config optimisation work (CR-07).
+        // We want every config variant to run through the rule engine fresh.
+        // Preprocessor cache (Level 1) remains active — Tika extraction is still cached.
+        // TODO: Re-enable for production use.
+        // if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
+        //     println!("🎯 Cache hit: Found graph for PDF + config combination");
+        //     println!(
+        //         "⏱️  Total processing time: {:.3}s (cached)",
+        //         start_time.elapsed().as_secs_f64()
+        //     );
+        //     return Ok(cached.graph);
+        // }
 
         println!("📄 Processing document with config: {}", input_path);
 
-        // Process with config flow
-        let graph = self.process_with_config_flow(input_path, config)?;
-
-        // Store in Level 2 cache
-        let processing_time = start_time.elapsed().as_millis() as u64;
-        let cache_value = GraphCacheValue::new(graph.clone(), processing_time);
-        self.storage.store_graph_output(&cache_key, &cache_value)?;
+        // Process with config flow (pass pdf_hash for Level 1 preprocessor caching)
+        let graph = self.process_with_config_flow(input_path, config, &pdf_hash)?;
 
         println!(
             "⏱️  Total processing time: {:.3}s",
@@ -207,12 +207,13 @@ impl DocumentProcessor {
         input_path: &str,
         config: &ParsingConfig,
         mut profiler: StepProfiler,
-        skip_cache: bool,
+        _skip_cache: bool, // NOTE: unused while L2 cache is disabled (CR-07)
     ) -> Result<DocumentGraph> {
         let start_time = Instant::now();
 
         // Check cache first (timed)
-        let (_pdf_hash, cache_key) = profiler.time_step("Cache Key Generation", || {
+        // NOTE: config_hash and cache_key computed but unused while L2 cache is disabled (CR-07)
+        let (pdf_hash, _cache_key) = profiler.time_step("Cache Key Generation", || {
             let pdf_bytes = std::fs::read(input_path)?;
             let pdf_hash = calculate_pdf_hash(&pdf_bytes);
             let config_hash = calculate_config_hash(config)?;
@@ -220,39 +221,15 @@ impl DocumentProcessor {
             Ok::<(String, GraphCacheKey), anyhow::Error>((pdf_hash, cache_key))
         })?;
 
-        let cached_result = if skip_cache {
-            println!("🚫 Skipping cache lookup (--skip-cache enabled)");
-            None
-        } else {
-            profiler.time_step("Cache Lookup", || self.storage.get_graph_output(&cache_key))?
-        };
-
-        if let Some(cached) = cached_result {
-            println!("🎯 Cache hit: Found graph for PDF + config combination");
-            profiler.print_summary();
-            println!(
-                "⏱️  Total processing time: {:.0}ms (cached)",
-                start_time.elapsed().as_millis()
-            );
-            return Ok(cached.graph);
-        }
+        // NOTE: Level 2 graph cache disabled during config optimisation work (CR-07).
+        // Preprocessor cache (Level 1) remains active.
+        // TODO: Re-enable for production use.
 
         println!("📄 Processing document with config: {}", input_path);
 
-        // Process with detailed profiling
+        // Process with detailed profiling (pass pdf_hash for Level 1 preprocessor caching)
         let graph =
-            self.process_with_config_flow_and_profiler(input_path, config, &mut profiler)?;
-
-        // Store in cache (timed) unless skipping cache
-        if !skip_cache {
-            profiler.time_step("Cache Storage", || {
-                let processing_time = start_time.elapsed().as_millis() as u64;
-                let cache_value = GraphCacheValue::new(graph.clone(), processing_time);
-                self.storage.store_graph_output(&cache_key, &cache_value)
-            })?;
-        } else {
-            println!("🚫 Skipping cache storage (--skip-cache enabled)");
-        }
+            self.process_with_config_flow_and_profiler(input_path, config, &mut profiler, &pdf_hash)?;
 
         profiler.print_summary();
         println!(
@@ -267,16 +244,31 @@ impl DocumentProcessor {
         &mut self,
         input_path: &str,
         config: &ParsingConfig,
+        pdf_hash: &str,
     ) -> Result<DocumentGraph> {
         let stage1_start = Instant::now();
 
         // Stage 1: Preprocessing (PDF → TextElements)
-        let input_path = Path::new(input_path);
-        let preprocessor_output = self.preprocessor.process_file(input_path)?;
-        println!(
-            "⏱️  Preprocessing: {:.3}s",
-            stage1_start.elapsed().as_secs_f64()
-        );
+        // Check Level 1 preprocessor cache first (keyed by PDF hash alone, config-independent)
+        let preprocessor_output =
+            if let Some(cached) = self.storage.get_preprocessor_output(pdf_hash)? {
+                println!(
+                    "🎯 Preprocessor cache hit — skipping Tika extraction ({:.3}s)",
+                    stage1_start.elapsed().as_secs_f64()
+                );
+                cached
+            } else {
+                let input_path = Path::new(input_path);
+                let output = self.preprocessor.process_file(input_path)?;
+                // Store in preprocessor cache for future config sweeps
+                self.storage
+                    .store_preprocessor_output(pdf_hash, &output)?;
+                println!(
+                    "⏱️  Preprocessing: {:.3}s (cached for future configs)",
+                    stage1_start.elapsed().as_secs_f64()
+                );
+                output
+            };
 
         let stage2_start = Instant::now();
 
@@ -351,18 +343,31 @@ impl DocumentProcessor {
         input_path: &str,
         config: &ParsingConfig,
         profiler: &mut StepProfiler,
+        pdf_hash: &str,
     ) -> Result<DocumentGraph> {
         // Stage 1: Preprocessing with sub-steps
-        let input_path = Path::new(input_path);
-        let pdf_bytes = std::fs::read(input_path)?;
-        let markup = profiler.time_step("1. PDF → Markup", || {
-            self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)
-        })?;
+        // Check Level 1 preprocessor cache first (keyed by PDF hash alone, config-independent)
+        let preprocessor_output =
+            if let Some(cached) = self.storage.get_preprocessor_output(pdf_hash)? {
+                println!("🎯 Preprocessor cache hit — skipping Tika extraction");
+                cached
+            } else {
+                let input_path = Path::new(input_path);
+                let pdf_bytes = std::fs::read(input_path)?;
+                let markup = profiler.time_step("1. PDF → Markup", || {
+                    self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)
+                })?;
 
-        let preprocessor_output = profiler.time_step("2. Markup → TextElements", || {
-            self.preprocessor
-                .parse_markup_to_preprocessor_output(&markup)
-        })?;
+                let output = profiler.time_step("2. Markup → TextElements", || {
+                    self.preprocessor
+                        .parse_markup_to_preprocessor_output(&markup)
+                })?;
+
+                // Store in preprocessor cache for future config sweeps
+                self.storage
+                    .store_preprocessor_output(pdf_hash, &output)?;
+                output
+            };
 
         // Stage 2: Classification
         let classification = profiler.time_step("3. Classification", || {
