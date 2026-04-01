@@ -57,10 +57,13 @@ pub struct DocumentInfo {
     pub document_metadata: DocumentMetadata,
     /// Analysis computed from text elements (font distributions, style stats)
     pub document_analysis: DocumentAnalysis,
+    /// PDF bookmarks/table of contents (if available in the source PDF)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bookmark_data: Option<BookmarkData>,
 }
 /// The schema version stamped on every graph output.
 /// Bump this when the output shape changes.
-pub const SCHEMA_VERSION: &str = "0.2.0";
+pub const SCHEMA_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -394,6 +397,13 @@ pub struct BookmarkData {
 pub struct BookmarkSection {
     pub title: String,
     pub order: u32,
+    /// Hierarchy level (1 = top-level, 2 = subsection, etc.)
+    #[serde(default = "default_bookmark_level")]
+    pub level: u32,
+}
+
+fn default_bookmark_level() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone)]
@@ -523,8 +533,9 @@ impl DocumentAnalysis {
             .map(|(family, _)| family.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Sort font sizes for analysis
+        // Sort and deduplicate font sizes for analysis
         font_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        font_sizes.dedup();
 
         Self {
             font_size_counts,

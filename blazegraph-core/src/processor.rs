@@ -331,6 +331,7 @@ impl DocumentProcessor {
         }
         graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
         graph.document_info.document_analysis = document_analysis;
+        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 
@@ -419,6 +420,7 @@ impl DocumentProcessor {
         }
         graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
         graph.document_info.document_analysis = document_analysis;
+        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 
@@ -539,6 +541,7 @@ impl DocumentProcessor {
         }
         graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
         graph.document_info.document_analysis = document_analysis;
+        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 
@@ -614,6 +617,7 @@ impl DocumentProcessor {
         }
         graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
         graph.document_info.document_analysis = document_analysis;
+        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 

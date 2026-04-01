@@ -38,10 +38,7 @@ static FONT_CLASS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\.(\w+)\s*\{\s*font-family:\s*([^;]+);\s*font-size:\s*([^;]+);\s*font-style:\s*([^;]+);\s*font-weight:\s*([^;]+);\s*color:\s*([^;]+);\s*\}").unwrap()
 });
 
-static LIST_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<ul>(.*?)</ul>").unwrap());
 
-static LIST_ITEM_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<li>([^<]+)</li>").unwrap());
 
 /// Parse Blazegraph XHTML into PreprocessorOutput
 ///
@@ -350,42 +347,86 @@ fn extract_style_data(xhtml: &str) -> Result<StyleData> {
     })
 }
 
-/// Extract bookmark data from <ul><li> structure
+/// Extract bookmark data from nested <ul><li> structure emitted by Tika.
+///
+/// Tika emits the PDF outline (document bookmarks) as nested <ul>/<li> elements
+/// after the </style> block. The nesting depth corresponds to the outline hierarchy:
+///   <ul>           ← level 1
+///     <li>Title</li>
+///     <ul>         ← level 2
+///       <li>Sub</li>
+///     </ul>
+///   </ul>
+///
+/// Previous implementation used `rfind("<ul>")` which found only the innermost
+/// (last) <ul> block, dropping 99% of outline entries. See CR-XX.
 fn extract_bookmark_data(xhtml: &str) -> Result<Option<BookmarkData>> {
-    if let Some(ul_start) = xhtml.rfind("<ul>") {
-        if let Some(ul_end) = xhtml[ul_start..].find("</ul>") {
-            let ul_block = &xhtml[ul_start..ul_start + ul_end + 5];
+    // Find the bookmark region: first <ul> after </style> (Tika emits bookmarks
+    // at the end of the document, after the CSS style block)
+    let search_start = xhtml.rfind("</style>").unwrap_or(0);
+    let bookmark_region = &xhtml[search_start..];
 
-            if let Some(list_cap) = LIST_REGEX.captures(ul_block) {
-                if let Some(list_content) = list_cap.get(1) {
-                    let content = list_content.as_str();
+    // Find the first <ul> in the bookmark region
+    let Some(first_ul) = bookmark_region.find("<ul>") else {
+        return Ok(None);
+    };
 
-                    let mut sections = Vec::new();
+    let bookmark_html = &bookmark_region[first_ul..];
 
-                    for cap in LIST_ITEM_REGEX.captures_iter(content) {
-                        if let Some(title_match) = cap.get(1) {
-                            let title = title_match.as_str().trim().to_string();
+    // Parse the nested structure by walking through tags, tracking depth
+    let mut sections = Vec::new();
+    let mut depth: u32 = 0;
 
-                            if title.is_empty() {
-                                continue;
-                            }
+    // Simple state machine: scan for <ul>, </ul>, <li>...</li>
+    let mut pos = 0;
+    let bytes = bookmark_html.as_bytes();
+    let len = bytes.len();
 
-                            let order = sections.len() as u32;
+    while pos < len {
+        if bytes[pos] != b'<' {
+            pos += 1;
+            continue;
+        }
 
-                            sections.push(BookmarkSection {
-                                title: title.clone(),
-                                order,
-                            });
-                        }
-                    }
+        let tag_start = pos;
+        // Find end of tag
+        let Some(tag_end_offset) = bookmark_html[pos..].find('>') else {
+            break;
+        };
+        let tag_end = pos + tag_end_offset + 1;
+        let tag = &bookmark_html[tag_start..tag_end];
 
-                    if !sections.is_empty() {
-                        return Ok(Some(BookmarkData { sections }));
-                    }
+        if tag == "<ul>" {
+            depth += 1;
+        } else if tag == "</ul>" {
+            if depth == 0 {
+                break; // Malformed, stop
+            }
+            depth -= 1;
+            if depth == 0 {
+                break; // Closed the outermost <ul>, we're done
+            }
+        } else if tag == "<li>" {
+            // Extract content until </li>
+            if let Some(li_end_offset) = bookmark_html[tag_end..].find("</li>") {
+                let title = bookmark_html[tag_end..tag_end + li_end_offset].trim();
+                if !title.is_empty() {
+                    let order = sections.len() as u32;
+                    sections.push(BookmarkSection {
+                        title: title.to_string(),
+                        order,
+                        level: depth,
+                    });
                 }
             }
         }
+
+        pos = tag_end;
     }
 
-    Ok(None)
+    if sections.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(BookmarkData { sections }))
+    }
 }

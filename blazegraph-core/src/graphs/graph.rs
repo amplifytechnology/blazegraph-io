@@ -27,6 +27,7 @@ impl DocumentGraph {
                 most_common_font_family: "unknown".to_string(),
                 all_font_sizes: Vec::new(),
             },
+            bookmark_data: None,
         };
 
         Self {
