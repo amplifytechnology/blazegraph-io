@@ -203,10 +203,14 @@ fn extract_spans_from_paragraph(
                             fallback_font(font_class_name)
                         };
 
-                    // Check for bookmark match
+                    // Check for bookmark match (normalize whitespace for fuzzy matching)
+                    let normalize_ws = |s: &str| -> String {
+                        s.split_whitespace().collect::<Vec<_>>().join(" ")
+                    };
+                    let text_normalized = normalize_ws(text_content);
                     let bookmark_match = bookmark_sections
                         .iter()
-                        .find(|section| section.title.trim() == text_content)
+                        .find(|section| normalize_ws(&section.title) == text_normalized)
                         .cloned();
 
                     text_elements.push(PdfTextElement {
