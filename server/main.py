@@ -31,8 +31,8 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/v1/process/pdf")
-async def process_pdf(
+@app.post("/v1/parse/pdf")
+async def parse_pdf(
     file: UploadFile = File(...),
     config: str | None = Query(None, description="Path to config YAML"),
     output_format: str = Query("graph", description="graph, sequential, or flat"),

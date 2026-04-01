@@ -18,7 +18,7 @@ from blazegraphio.types import BlazeGraph
 if TYPE_CHECKING:
     from blazegraphio._config import _Config
 
-_PROCESS_PATH = "/v1/process/pdf"
+_PARSE_PATH = "/v1/parse/pdf"
 _TIMEOUT = 300.0  # 5 minutes — PDF processing can be slow
 
 
@@ -67,7 +67,7 @@ def _sync_parse_pdf(path: str, cfg: "_Config") -> BlazeGraph:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
 
-    url = cfg.resolved_url.rstrip("/") + _PROCESS_PATH
+    url = cfg.resolved_url.rstrip("/") + _PARSE_PATH
     headers = _build_headers(cfg)
 
     with httpx.Client(timeout=_TIMEOUT) as client:
@@ -84,7 +84,7 @@ async def _async_parse_pdf(path: str, cfg: "_Config") -> BlazeGraph:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
 
-    url = cfg.resolved_url.rstrip("/") + _PROCESS_PATH
+    url = cfg.resolved_url.rstrip("/") + _PARSE_PATH
     headers = _build_headers(cfg)
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:

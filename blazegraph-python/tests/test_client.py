@@ -137,7 +137,7 @@ class TestSyncParsePdf:
         assert isinstance(graph, BlazeGraph)
         mock_client.post.assert_called_once()
         call_kwargs = mock_client.post.call_args
-        assert "/v1/process/pdf" in call_kwargs[0][0] or "/v1/process/pdf" in str(call_kwargs)
+        assert "/v1/parse/pdf" in call_kwargs[0][0] or "/v1/parse/pdf" in str(call_kwargs)
 
 
 class TestAsyncParsePdf:
