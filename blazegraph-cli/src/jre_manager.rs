@@ -29,7 +29,7 @@ impl JreManager {
     }
 
     /// Get the data directory (~/.local/share/blazegraph on all Unix platforms)
-    fn get_data_dir() -> Result<PathBuf> {
+    pub fn get_data_dir() -> Result<PathBuf> {
         // Use ~/.local/share/blazegraph consistently on macOS/Linux
         // This is more predictable than platform-specific paths like ~/Library/Application Support
         let home = dirs::home_dir()

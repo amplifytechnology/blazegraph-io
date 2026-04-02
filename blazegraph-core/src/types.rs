@@ -297,18 +297,9 @@ impl Default for DepthDistribution {
 // Health assessment requires document-type context and belongs downstream
 // of the L0 parser. See AmplifyNotes/09-Profile-Types.md.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TikaOutput {
-    pub xhtml_content: String,
-    pub metadata: DocumentMetadata,
-    pub text_elements: Vec<PdfTextElement>,
-    /// XHTML content hash for Level 2 cache key generation
-    pub xhtml_hash: String,
-    // New enhanced structures
-    pub style_data: StyleData, // CSS font classes (always present)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bookmark_data: Option<BookmarkData>, // PDF bookmarks/outline
-}
+// TikaOutput struct removed in CR-11 (cache architecture refactor).
+// Raw XHTML is now cached as .xhtml files at cache point C1.
+// Parsed elements live in PreprocessorOutput at cache point C2.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PdfTextElement {

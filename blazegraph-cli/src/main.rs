@@ -3,7 +3,10 @@ use clap::Parser;
 use std::path::Path;
 
 // Import from blazegraph-io-core
-use blazegraph_io_core::{DocumentProcessor, DocumentGraph, ParsingConfig, PipelineStages};
+use blazegraph_io_core::{
+    CacheDefaults, CachePoint, DocumentGraph, DocumentProcessor, FreshFrom, ParsingConfig,
+    PipelineStages,
+};
 
 /// Default config embedded at compile time — guarantees every install has working defaults.
 /// Without this, `cargo install` users get raw parse output (3000+ nodes, 0 sections).
@@ -37,14 +40,6 @@ struct Args {
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Include raw Tika XML/HTML output in graph metadata for debugging
-    #[arg(long)]
-    include_raw_tika: bool,
-
-    /// Output directory for raw tika files (when using --include-raw-tika)  
-    #[arg(long)]
-    output_dir: Option<String>,
-
     /// Enable minimal parse mode (bypass all rule processing)
     #[arg(long)]
     minimal_parse: bool,
@@ -63,10 +58,6 @@ struct Args {
     #[arg(long)]
     profile: bool,
 
-    /// Skip cache and force fresh processing (useful for development/testing)
-    #[arg(long)]
-    skip_cache: bool,
-
     /// Include style_info on each node (font_class, font_size, font_family, bold, italic, color).
     /// Stripped by default to reduce output size (~20%). Useful for authoring parsing configs.
     #[arg(long)]
@@ -77,9 +68,34 @@ struct Args {
     #[arg(long)]
     dump_stages: bool,
 
-    /// Directory for stage dump output (default: test_outputs/stages)
-    #[arg(long, default_value = "test_outputs/stages")]
-    stages_dir: String,
+    /// Directory for stage dump output (default: {cache_dir}/debug)
+    #[arg(long)]
+    stages_dir: Option<String>,
+
+    // =========================================================================
+    // Cache control (CR-11)
+    // =========================================================================
+
+    /// Override cache directory location.
+    /// Default: ~/.local/share/blazegraph/cache/
+    /// Also configurable via BLAZEGRAPH_CACHE_DIR env var.
+    #[arg(long)]
+    cache_dir: Option<String>,
+
+    /// Reprocess from a specific cache point, ignoring cached results downstream.
+    /// Cascades: --fresh-from c1 also invalidates c2 and c3.
+    /// Values: c0 (re-read PDF), c1 (re-extract XHTML), c2 (reparse elements), c3 (rebuild graph)
+    #[arg(long)]
+    fresh_from: Option<String>,
+
+    /// Clear cached files from the specified cache point (cascading) and exit.
+    /// Values: c0, c1, c2, c3, all
+    #[arg(long)]
+    clear_cache: Option<String>,
+
+    /// Alias for --fresh-from c0 (reprocess everything from scratch)
+    #[arg(long)]
+    skip_cache: bool,
 }
 
 fn main() -> Result<()> {
@@ -92,6 +108,30 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Resolve cache directory: CLI flag > env var > default
+    let cache_dir = resolve_cache_dir(&args)?;
+    println!("📁 Cache: {}", cache_dir);
+
+    // Handle --clear-cache (early exit, no processing)
+    if let Some(ref clear_str) = args.clear_cache {
+        let storage = blazegraph_io_core::storage::FileStorage::new(&cache_dir)?;
+        let from_point = CachePoint::from_str_with_all(clear_str)?;
+        let label = from_point
+            .map(|p| format!("{} (cascading)", p))
+            .unwrap_or_else(|| "all".to_string());
+        println!("🗑️  Clearing cache from {}...", label);
+        let result =
+            <blazegraph_io_core::storage::FileStorage as blazegraph_io_core::storage::DocumentStorage>::clear_cache(
+                &storage,
+                from_point,
+            )?;
+        for (point, count) in &result.deleted {
+            println!("   Deleted: {} files from {}/", count, point.dir_name());
+        }
+        println!("✅ Cache cleared.");
+        return Ok(());
+    }
+
     // Check if input file exists
     if !Path::new(&args.input).exists() {
         println!("⚠️  Input PDF not found at: {}", args.input);
@@ -99,8 +139,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Create processor based on available backend
-    let mut processor = create_processor(&args)?;
+    // Create processor with resolved cache dir
+    let mut processor = create_processor(&args, &cache_dir)?;
 
     // Load config: user-specified file > embedded default > ParsingConfig::default()
     let mut config = if let Some(config_path) = &args.config {
@@ -121,22 +161,31 @@ fn main() -> Result<()> {
     };
 
     // Apply CLI overrides to config
-    if args.include_raw_tika {
-        config.include_raw_tika = true;
-    }
     if args.minimal_parse {
         config.minimal_parse = true;
     }
+
+    // Resolve fresh-from: --skip-cache takes precedence
+    let fresh_from = if args.skip_cache {
+        FreshFrom::C0
+    } else if let Some(ref s) = args.fresh_from {
+        FreshFrom::parse(s)?
+    } else {
+        FreshFrom::None
+    };
+
+    let cache_defaults = CacheDefaults::default();
 
     println!("📄 Processing: {}", args.input);
 
     // Stage dump mode: capture and save all intermediates
     if args.dump_stages {
+        let stages_dir = args.stages_dir.unwrap_or_else(|| format!("{}/debug", cache_dir));
         println!("\n🔬 Pipeline stage dump mode");
         match processor.process_document_capture_stages(&args.input, &config) {
             Ok(stages) => {
-                save_stages(&stages, &args.stages_dir)?;
-                println!("\n✅ All stages dumped to: {}", args.stages_dir);
+                save_stages(&stages, &stages_dir)?;
+                println!("\n✅ All stages dumped to: {}", stages_dir);
             }
             Err(e) => {
                 eprintln!("❌ Stage dump failed: {e}");
@@ -149,13 +198,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Process the document with config flow (and profiling if enabled)
-    match processor.process_document_with_config_and_profiling(&args.input, &config, args.profile, args.skip_cache)
-    {
+    // Process the document with cache point awareness
+    match processor.process_document_with_cache(
+        &args.input,
+        &config,
+        fresh_from,
+        &cache_defaults,
+        args.profile,
+    ) {
         Ok(mut graph) => {
             println!("✅ Successfully processed document");
-            println!("📊 Graph metrics:");
-            println!("   - Nodes: {}", graph.nodes.len());
+            println!("📊 Graph: {} nodes", graph.nodes.len());
 
             // Strip style_info from output unless explicitly requested
             if !args.include_style_info {
@@ -184,9 +237,8 @@ fn main() -> Result<()> {
 
             // Save the graph
             save_graph(&graph, &output_path, &args.output_format)?;
-            
-            // Fast exit - skip JVM shutdown sequence (finalizers, GC)
-            // The OS reclaims all memory instantly anyway
+
+            // Fast exit - skip JVM shutdown sequence
             #[cfg(feature = "jni-backend")]
             std::process::exit(0);
         }
@@ -197,26 +249,45 @@ fn main() -> Result<()> {
     }
 }
 
+/// Resolve cache directory: CLI flag > env var > default (~/.local/share/blazegraph/cache/)
+fn resolve_cache_dir(args: &Args) -> Result<String> {
+    if let Some(ref dir) = args.cache_dir {
+        return Ok(dir.clone());
+    }
+    if let Ok(dir) = std::env::var("BLAZEGRAPH_CACHE_DIR") {
+        if !dir.is_empty() {
+            return Ok(dir);
+        }
+    }
+    // Default: ~/.local/share/blazegraph/cache/
+    #[cfg(feature = "jni-backend")]
+    {
+        let data_dir = JreManager::get_data_dir()?;
+        Ok(data_dir.join("cache").to_string_lossy().to_string())
+    }
+    #[cfg(not(feature = "jni-backend"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        Ok(format!("{}/.local/share/blazegraph/cache", home))
+    }
+}
+
 /// Create DocumentProcessor with JNI backend (cross-platform, auto-downloads JRE)
 #[cfg(feature = "jni-backend")]
-fn create_processor(args: &Args) -> Result<DocumentProcessor> {
+fn create_processor(args: &Args, cache_dir: &str) -> Result<DocumentProcessor> {
     // Get JRE path - either from args, JAVA_HOME, or auto-download
     let jre_path = if let Some(path) = &args.jre_path {
-        // User specified JRE path
         println!("🔧 Using specified JRE: {}", path);
         std::path::PathBuf::from(path)
     } else if let Ok(java_home) = std::env::var("JAVA_HOME") {
-        // Use JAVA_HOME if set and non-empty
         if !java_home.is_empty() {
             println!("🔧 Using JAVA_HOME: {}", java_home);
             std::path::PathBuf::from(java_home)
         } else {
-            // JAVA_HOME is empty, auto-download
             let jre_manager = JreManager::new()?;
             jre_manager.ensure_jre()?
         }
     } else {
-        // Auto-download JRE if not available
         let jre_manager = JreManager::new()?;
         jre_manager.ensure_jre()?
     };
@@ -232,12 +303,12 @@ fn create_processor(args: &Args) -> Result<DocumentProcessor> {
     };
 
     println!("🚀 Using JNI backend");
-    DocumentProcessor::new_cli_jni(&jre_path, &jar_path)
+    DocumentProcessor::new_cli_jni_with_cache(&jre_path, &jar_path, cache_dir)
 }
 
 /// Fallback when no backend is compiled in
 #[cfg(not(feature = "jni-backend"))]
-fn create_processor(_args: &Args) -> Result<DocumentProcessor> {
+fn create_processor(_args: &Args, _cache_dir: &str) -> Result<DocumentProcessor> {
     Err(anyhow::anyhow!(
         "No PDF backend compiled in!\n\
          Compile with: --features jni-backend"
@@ -250,26 +321,33 @@ fn show_help() {
     println!("  --input <path>          PDF file to process");
     println!("  --output <path>         Output file path (auto-generated if not specified)");
     println!("  --output-format <fmt>   Output format: graph, sequential, or flat");
-    println!("  --include-raw-tika      Include raw Tika XML/HTML output in graph metadata for debugging");
     println!("  --minimal-parse         Enable minimal parse mode (bypass all rule processing)");
     println!("  --jre-path <path>       Path to JRE directory (default: auto-download)");
     println!("  --jar-path <path>       Path to Tika JAR file (default: bundled)");
-    
+
+    println!("\n🗄️  Cache Control:");
+    println!("  --cache-dir <path>      Override cache directory (default: ~/.local/share/blazegraph/cache/)");
+    println!("  --fresh-from <point>    Reprocess from cache point: c0, c1, c2, c3");
+    println!("  --clear-cache <point>   Clear cache (cascading): c0, c1, c2, c3, all");
+    println!("  --skip-cache            Alias for --fresh-from c0");
+
     println!("\n📄 Output Formats:");
     println!("  graph       - Full graph structure with nodes and relationships (default)");
     println!("  sequential  - Ordered segments with level info (good for RAG + hierarchy)");
     println!("  flat        - Simple array of text chunks (minimal format)");
-    
+
     println!("\n📁 Example config files in ./configs/:");
     println!("  generic-conservative.yaml  - Fewer, higher-confidence sections");
     println!("  generic-balanced.yaml      - Balanced section detection");
     println!("  generic-aggressive.yaml    - More sections, deeper hierarchy");
-    
+
     println!("\n📝 Usage Examples:");
     println!("  cargo run -- -i document.pdf");
     println!("  cargo run -- -i document.pdf -o /path/to/output.json");
     println!("  cargo run -- -i document.pdf -c config.yaml -f sequential");
-    
+    println!("  cargo run -- --fresh-from c2    # reparse from cached XHTML");
+    println!("  cargo run -- --clear-cache c1   # clear XHTML + downstream caches");
+
     #[cfg(feature = "jni-backend")]
     {
         println!("\n🔧 JNI Backend:");
@@ -304,9 +382,8 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
     stages.graph.save_with_format(&graph_path, "graph")?;
     println!("  💾 {} ({} nodes)", graph_path, stages.graph.nodes.len());
 
-    // Summary file: quick reference for validation scripts
+    // Summary file
     let summary = serde_json::json!({
-        "input_pdf": "claude_shannon_paper.pdf",
         "captured_at": chrono::Utc::now().to_rfc3339(),
         "stage_counts": {
             "xhtml_bytes": stages.xhtml.len(),
@@ -323,18 +400,20 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
 }
 
 fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<()> {
-    // Use the existing save_with_format method from DocumentGraph
     graph.save_with_format(output_path, format)?;
-    
+
     match format {
-        "sequential" => println!("💾 Sequential format results saved to: {}", output_path),
-        "flat" => println!("💾 Flat format results saved to: {}", output_path),
-        "graph" => println!("💾 Graph format results saved to: {}", output_path),
+        "sequential" => println!("💾 Sequential format saved to: {}", output_path),
+        "flat" => println!("💾 Flat format saved to: {}", output_path),
+        "graph" => println!("💾 Graph saved to: {}", output_path),
         _ => {
-            println!("⚠️  Unknown output format '{}', using default graph format", format);
-            println!("💾 Graph format results saved to: {}", output_path);
+            println!(
+                "⚠️  Unknown output format '{}', using default graph format",
+                format
+            );
+            println!("💾 Graph saved to: {}", output_path);
         }
     }
-    
+
     Ok(())
 }

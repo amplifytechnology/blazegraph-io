@@ -1,12 +1,13 @@
 use crate::cache::GraphCacheKey;
-// NOTE: GraphCacheValue unused while L2 cache is disabled (CR-07)
-// use crate::cache::GraphCacheValue;
 use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
 use crate::graphs::builder::GraphBuilder;
 use crate::preprocessors::{Preprocessor, TikaPreprocessor};
-use crate::rules::{engine::DebugConfig, RuleEngine};
-use crate::storage::{calculate_config_hash, calculate_pdf_hash, DocumentStorage, FileStorage};
+use crate::rules::RuleEngine;
+use crate::storage::{
+    calculate_config_hash, calculate_pdf_hash, CacheDefaults, CachePoint, DocumentStorage,
+    FileStorage, FreshFrom,
+};
 use crate::types::*;
 use anyhow::Result;
 use std::path::Path;
@@ -99,10 +100,6 @@ impl DocumentProcessor {
     }
 
     /// Convenience constructor for CLI usage with JNI backend (cross-platform)
-    ///
-    /// # Arguments
-    /// * `jre_path` - Path to JRE directory
-    /// * `jar_path` - Path to blazing-tika.jar
     #[cfg(feature = "jni-backend")]
     pub fn new_cli_jni(jre_path: &std::path::Path, jar_path: &std::path::Path) -> Result<Self> {
         let preprocessor = Box::new(TikaPreprocessor::new_with_jni(jre_path, jar_path)?);
@@ -122,443 +119,98 @@ impl DocumentProcessor {
         Self::new_with_dependencies(preprocessor, storage)
     }
 
-    // Future: Convenience constructor for API usage (server Tika + database storage)
-    // This will be implemented when server-based Tika preprocessor is available
-    // pub fn new_api(server_url: &str, db_config: &DatabaseConfig) -> Result<Self> {
-    //     let preprocessor = Box::new(TikaPreprocessor::new_with_server(server_url)?);
-    //     let storage = Box::new(DatabaseStorage::new(db_config)?);
-    //     Self::new_with_dependencies(preprocessor, storage)
-    // }
+    // =========================================================================
+    // Main entry points
+    // =========================================================================
 
-    /// Process document with specific config and profiling (pure function approach)
-    /// This is the main method implementing PDF + Config → Graph with Level 2 caching
-    pub fn process_document_with_config_and_profiling(
+    /// Process document with cache point awareness (CR-11).
+    /// This is the primary entry point for CLI usage.
+    pub fn process_document_with_cache(
         &mut self,
         input_path: &str,
         config: &ParsingConfig,
+        fresh_from: FreshFrom,
+        cache_defaults: &CacheDefaults,
         enable_profiling: bool,
-        skip_cache: bool,
     ) -> Result<DocumentGraph> {
-        if enable_profiling {
-            self.process_document_with_config_and_profiler(
-                input_path,
-                config,
-                StepProfiler::new(true),
-                skip_cache,
-            )
-        } else if skip_cache {
-            // Skip cache without profiling - use no-op profiler
-            self.process_document_with_config_and_profiler(
-                input_path,
-                config,
-                StepProfiler::new(false),
-                skip_cache,
-            )
-        } else {
-            self.process_document_with_config(input_path, config)
-        }
-    }
-
-    /// Process document with specific config (pure function approach)
-    /// This is the main method implementing PDF + Config → Graph with Level 2 caching
-    pub fn process_document_with_config(
-        &mut self,
-        input_path: &str,
-        config: &ParsingConfig,
-    ) -> Result<DocumentGraph> {
+        let mut profiler = StepProfiler::new(enable_profiling);
         let start_time = Instant::now();
 
         // Read PDF and calculate hash
         let pdf_bytes = std::fs::read(input_path)?;
         let pdf_hash = calculate_pdf_hash(&pdf_bytes);
 
-        // NOTE: Level 2 cache key computed but unused while L2 cache is disabled (CR-07)
-        let _config_hash = calculate_config_hash(config)?;
-        let _cache_key = GraphCacheKey::new(pdf_hash.clone(), _config_hash);
+        println!("📄 Processing: {}", input_path);
 
-        // NOTE: Level 2 graph cache disabled during config optimisation work (CR-07).
-        // We want every config variant to run through the rule engine fresh.
-        // Preprocessor cache (Level 1) remains active — Tika extraction is still cached.
-        // TODO: Re-enable for production use.
-        // if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
-        //     println!("🎯 Cache hit: Found graph for PDF + config combination");
-        //     println!(
-        //         "⏱️  Total processing time: {:.3}s (cached)",
-        //         start_time.elapsed().as_secs_f64()
-        //     );
-        //     return Ok(cached.graph);
-        // }
-
-        println!("📄 Processing document with config: {}", input_path);
-
-        // Process with config flow (pass pdf_hash for Level 1 preprocessor caching)
-        let graph = self.process_with_config_flow(input_path, config, &pdf_hash)?;
-
-        println!(
-            "⏱️  Total processing time: {:.3}s",
-            start_time.elapsed().as_secs_f64()
-        );
-        Ok(graph)
-    }
-
-    /// Process document with profiler for detailed timing
-    fn process_document_with_config_and_profiler(
-        &mut self,
-        input_path: &str,
-        config: &ParsingConfig,
-        mut profiler: StepProfiler,
-        _skip_cache: bool, // NOTE: unused while L2 cache is disabled (CR-07)
-    ) -> Result<DocumentGraph> {
-        let start_time = Instant::now();
-
-        // Check cache first (timed)
-        // NOTE: config_hash and cache_key computed but unused while L2 cache is disabled (CR-07)
-        let (pdf_hash, _cache_key) = profiler.time_step("Cache Key Generation", || {
-            let pdf_bytes = std::fs::read(input_path)?;
-            let pdf_hash = calculate_pdf_hash(&pdf_bytes);
+        // --- C3: Graph cache check ---
+        if fresh_from.should_use_cache(CachePoint::C3) && cache_defaults.should_write(CachePoint::C3) {
             let config_hash = calculate_config_hash(config)?;
             let cache_key = GraphCacheKey::new(pdf_hash.clone(), config_hash);
-            Ok::<(String, GraphCacheKey), anyhow::Error>((pdf_hash, cache_key))
-        })?;
+            if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
+                println!(
+                    "🎯 C3 graph cache hit ({:.3}s)",
+                    start_time.elapsed().as_secs_f64()
+                );
+                return Ok(cached.graph);
+            }
+        }
 
-        // NOTE: Level 2 graph cache disabled during config optimisation work (CR-07).
-        // Preprocessor cache (Level 1) remains active.
-        // TODO: Re-enable for production use.
+        // --- C2: Preprocessor cache check ---
+        let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {
+            if let Some(cached) = self.storage.get_preprocessor_output(&pdf_hash)? {
+                println!("🎯 C2 preprocessor cache hit — skipping extraction + parsing");
+                cached
+            } else {
+                self.extract_and_parse(input_path, &pdf_bytes, &pdf_hash, &fresh_from, cache_defaults, &mut profiler)?
+            }
+        } else {
+            self.extract_and_parse(input_path, &pdf_bytes, &pdf_hash, &fresh_from, cache_defaults, &mut profiler)?
+        };
 
-        println!("📄 Processing document with config: {}", input_path);
+        // --- Stages 2-5: Classification → Rules → Graph → Post-processing ---
+        let graph = self.rules_and_graph(&preprocessor_output, config, &mut profiler)?;
 
-        // Process with detailed profiling (pass pdf_hash for Level 1 preprocessor caching)
-        let graph =
-            self.process_with_config_flow_and_profiler(input_path, config, &mut profiler, &pdf_hash)?;
-
-        profiler.print_summary();
+        if enable_profiling {
+            profiler.print_summary();
+        }
         println!(
-            "⏱️  Total processing time: {:.0}ms",
+            "⏱️  Total: {:.0}ms",
             start_time.elapsed().as_millis()
         );
-        Ok(graph)
-    }
-
-    /// Internal processing with config flow through all pipeline stages
-    fn process_with_config_flow(
-        &mut self,
-        input_path: &str,
-        config: &ParsingConfig,
-        pdf_hash: &str,
-    ) -> Result<DocumentGraph> {
-        let stage1_start = Instant::now();
-
-        // Stage 1: Preprocessing (PDF → TextElements)
-        // Check Level 1 preprocessor cache first (keyed by PDF hash alone, config-independent)
-        let preprocessor_output =
-            if let Some(cached) = self.storage.get_preprocessor_output(pdf_hash)? {
-                println!(
-                    "🎯 Preprocessor cache hit — skipping Tika extraction ({:.3}s)",
-                    stage1_start.elapsed().as_secs_f64()
-                );
-                cached
-            } else {
-                let input_path = Path::new(input_path);
-                let output = self.preprocessor.process_file(input_path)?;
-                // Store in preprocessor cache for future config sweeps
-                self.storage
-                    .store_preprocessor_output(pdf_hash, &output)?;
-                println!(
-                    "⏱️  Preprocessing: {:.3}s (cached for future configs)",
-                    stage1_start.elapsed().as_secs_f64()
-                );
-                output
-            };
-
-        let stage2_start = Instant::now();
-
-        // Stage 2: Classification
-        let classification = self.classifier.classify(&preprocessor_output)?;
-        println!("📋 Document classified as: {:?}", classification);
-        println!(
-            "⏱️  Classification: {:.3}s",
-            stage2_start.elapsed().as_secs_f64()
-        );
-
-        let stage3_start = Instant::now();
-
-        // Compute document analysis once (used by rules and stored in DocumentInfo)
-        let document_analysis =
-            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
-
-        // Stage 3: Rule processing with config (TextElements + Config → ParsedElements)
-        let parsed_elements = if config.minimal_parse {
-            println!("🔄 Minimal parse mode - skipping rule processing");
-            self.rule_engine
-                .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
-        } else {
-            let font_size_analysis = self.rule_engine.analyze_font_sizes(
-                &preprocessor_output.text_elements,
-                &preprocessor_output.style_data,
-            );
-
-            // Apply rules with config guiding behavior
-            self.rule_engine.apply_rules_with_config(
-                &preprocessor_output.text_elements,
-                &classification,
-                &document_analysis,
-                &font_size_analysis,
-                &preprocessor_output.style_data,
-                config, // Config flows through rule engine
-            )?
-        };
-
-        println!(
-            "⏱️  Rule processing: {:.3}s",
-            stage3_start.elapsed().as_secs_f64()
-        );
-
-        let stage4_start = Instant::now();
-
-        // Infer title from content before elements are consumed by graph builder
-        let inferred_title = infer_title(&parsed_elements);
-
-        // Stage 4: Graph building (ParsedElements + Config → Graph)
-        let mut graph = self.graph_builder.build_graph(parsed_elements)?;
-        println!(
-            "⏱️  Graph construction: {:.3}s",
-            stage4_start.elapsed().as_secs_f64()
-        );
-
-        // Stage 5: Wire metadata and compute post-processing
-        if let Some(title) = inferred_title {
-            graph.document_info.document_metadata.title = Some(title);
-        }
-        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
-        graph.document_info.document_analysis = document_analysis;
-        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
-        graph.compute_structural_profile();
-        graph.compute_breadcrumbs();
 
         Ok(graph)
     }
 
-    /// Internal processing with detailed profiling
-    fn process_with_config_flow_and_profiler(
-        &mut self,
-        input_path: &str,
-        config: &ParsingConfig,
-        profiler: &mut StepProfiler,
-        pdf_hash: &str,
-    ) -> Result<DocumentGraph> {
-        // Stage 1: Preprocessing with sub-steps
-        // Check Level 1 preprocessor cache first (keyed by PDF hash alone, config-independent)
-        let preprocessor_output =
-            if let Some(cached) = self.storage.get_preprocessor_output(pdf_hash)? {
-                println!("🎯 Preprocessor cache hit — skipping Tika extraction");
-                cached
-            } else {
-                let input_path = Path::new(input_path);
-                let pdf_bytes = std::fs::read(input_path)?;
-                let markup = profiler.time_step("1. PDF → Markup", || {
-                    self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)
-                })?;
-
-                let output = profiler.time_step("2. Markup → TextElements", || {
-                    self.preprocessor
-                        .parse_markup_to_preprocessor_output(&markup)
-                })?;
-
-                // Store in preprocessor cache for future config sweeps
-                self.storage
-                    .store_preprocessor_output(pdf_hash, &output)?;
-                output
-            };
-
-        // Stage 2: Classification
-        let classification = profiler.time_step("3. Classification", || {
-            self.classifier.classify(&preprocessor_output)
-        })?;
-
-        // Compute document analysis once (used by rules and stored in DocumentInfo)
-        let document_analysis = profiler.time_step("4a. Document Analysis", || {
-            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements)
-        });
-
-        // Stage 3: Rule processing with detailed timing
-        let parsed_elements = if config.minimal_parse {
-            profiler.time_step("4. Minimal Parse", || {
-                self.rule_engine
-                    .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
-            })
-        } else {
-            let font_size_analysis = profiler.time_step("4b. Font Analysis", || {
-                self.rule_engine.analyze_font_sizes(
-                    &preprocessor_output.text_elements,
-                    &preprocessor_output.style_data,
-                )
-            });
-
-            profiler.time_step("4c. Rules Processing", || {
-                self.rule_engine.apply_rules_with_config(
-                    &preprocessor_output.text_elements,
-                    &classification,
-                    &document_analysis,
-                    &font_size_analysis,
-                    &preprocessor_output.style_data,
-                    config,
-                )
-            })?
-        };
-
-        // Infer title from content before elements are consumed by graph builder
-        let inferred_title = infer_title(&parsed_elements);
-
-        // Stage 4: Graph building
-        let mut graph = profiler.time_step("5. Graph Construction", || {
-            self.graph_builder.build_graph(parsed_elements)
-        })?;
-
-        // Stage 5: Wire metadata and compute post-processing
-        if let Some(title) = inferred_title {
-            graph.document_info.document_metadata.title = Some(title);
-        }
-        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
-        graph.document_info.document_analysis = document_analysis;
-        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
-        graph.compute_structural_profile();
-        graph.compute_breadcrumbs();
-
-        Ok(graph)
+    /// Simple document processing function using default config (no cache awareness)
+    pub fn process_document(&mut self, input_path: &str) -> Result<DocumentGraph> {
+        let default_config = ParsingConfig::default();
+        self.process_document_with_cache(
+            input_path,
+            &default_config,
+            FreshFrom::None,
+            &CacheDefaults::default(),
+            false,
+        )
     }
 
-    /// Main document processing function with all options
-    pub fn process_document_with_options(
+    /// Process document with config loaded from file
+    pub fn process_document_with_config_file(
         &mut self,
         input_path: &str,
-        include_raw_tika: bool,
-        output_dir: Option<&str>,
-        debug_output: bool,
-        debug_filters: &[String],
-        minimal_parse: Option<bool>,
+        config_path: &str,
     ) -> Result<DocumentGraph> {
-        let start_time = Instant::now();
-        println!("📄 Processing document: {}", input_path);
-
-        // Step 1: Use preprocessor to extract and parse document
-        let preprocessor_output = if include_raw_tika || output_dir.is_some() {
-            // For now, handle raw output options by doing two-step process manually
-            let input_path = Path::new(input_path);
-            let pdf_bytes = std::fs::read(input_path)?;
-            let markup = self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)?;
-
-            // Save raw markup if requested
-            if include_raw_tika {
-                if let Some(output_dir) = output_dir {
-                    use std::fs;
-                    let raw_path = format!("{}/raw_tika_output.html", output_dir);
-                    if let Err(e) = fs::write(&raw_path, &markup) {
-                        println!("⚠️  Failed to save raw markup to {}: {}", raw_path, e);
-                    } else {
-                        println!("💾 Saved raw markup to {}", raw_path);
-                    }
-                }
-            }
-
-            self.preprocessor
-                .parse_markup_to_preprocessor_output(&markup)?
-        } else {
-            // Standard processing - use the convenience method
-            let input_path = Path::new(input_path);
-            self.preprocessor.process_file(input_path)?
-        };
-
-        println!(
-            "⏱️  Preprocessing complete: {:.3}s",
-            start_time.elapsed().as_secs_f64()
-        );
-
-        let step2_start = Instant::now();
-
-        // Step 2: Document classification
-        let classification = self.classifier.classify(&preprocessor_output)?;
-        println!("📋 Document classified as: {:?}", classification);
-
-        // Step 3: Get text elements (already parsed by preprocessor)
-        println!(
-            "⏱️  Text parsing: {:.3}s",
-            step2_start.elapsed().as_secs_f64()
-        );
-
-        let step3_start = Instant::now();
-
-        // Compute document analysis once (used by rules and stored in DocumentInfo)
-        let document_analysis =
-            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
-
-        // Step 4: Apply rules (skip if minimal parse requested)
-        let parsed_elements = if minimal_parse.unwrap_or(false) {
-            println!("🔄 Minimal parse mode - skipping rule processing");
-            // Convert text elements to parsed elements without processing
-            self.rule_engine
-                .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
-        } else {
-            // Set up debug config
-            if debug_output {
-                let debug_config = DebugConfig {
-                    enabled: true,
-                    filter_patterns: debug_filters.to_vec(),
-                };
-                self.rule_engine.set_debug_config(debug_config);
-            }
-
-            let font_size_analysis = self.rule_engine.analyze_font_sizes(
-                &preprocessor_output.text_elements,
-                &preprocessor_output.style_data,
-            );
-
-            // Apply rules to get processed elements
-            self.rule_engine.apply_rules(
-                &preprocessor_output.text_elements,
-                &classification,
-                &document_analysis,
-                &font_size_analysis,
-                &preprocessor_output.style_data,
-            )?
-        };
-
-        println!(
-            "⏱️  Rule processing: {:.3}s",
-            step3_start.elapsed().as_secs_f64()
-        );
-
-        let step4_start = Instant::now();
-
-        // Infer title from content before elements are consumed by graph builder
-        let inferred_title = infer_title(&parsed_elements);
-
-        // Step 5: Build graph from processed elements
-        let mut graph = self.graph_builder.build_graph(parsed_elements)?;
-
-        // Step 6: Wire metadata and compute post-processing
-        if let Some(title) = inferred_title {
-            graph.document_info.document_metadata.title = Some(title);
-        }
-        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
-        graph.document_info.document_analysis = document_analysis;
-        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
-        graph.compute_structural_profile();
-        graph.compute_breadcrumbs();
-
-        println!(
-            "⏱️  Graph construction: {:.3}s",
-            step4_start.elapsed().as_secs_f64()
-        );
-        println!(
-            "⏱️  Total processing time: {:.3}s",
-            start_time.elapsed().as_secs_f64()
-        );
-
-        Ok(graph)
+        let config = ParsingConfig::load_from_file(config_path)?;
+        self.process_document_with_cache(
+            input_path,
+            &config,
+            FreshFrom::None,
+            &CacheDefaults::default(),
+            false,
+        )
     }
 
     /// Process document and capture all intermediate stage outputs
-    /// Used for pipeline diagnostics and testing stage boundaries
+    /// Used for pipeline diagnostics (--dump-stages). Always runs fresh.
     pub fn process_document_capture_stages(
         &mut self,
         input_path: &str,
@@ -567,7 +219,7 @@ impl DocumentProcessor {
         let input_path_ref = Path::new(input_path);
         let pdf_bytes = std::fs::read(input_path_ref)?;
 
-        // Stage 1a: PDF → XHTML
+        // Stage 1a: PDF → XHTML (always fresh for diagnostics)
         let xhtml = self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)?;
         println!("📋 Stage 1a: XHTML captured ({} bytes)", xhtml.len());
 
@@ -615,7 +267,10 @@ impl DocumentProcessor {
         if let Some(title) = inferred_title {
             graph.document_info.document_metadata.title = Some(title);
         }
-        graph.document_info.document_metadata.merge_extracted(preprocessor_output.metadata);
+        graph
+            .document_info
+            .document_metadata
+            .merge_extracted(preprocessor_output.metadata);
         graph.document_info.document_analysis = document_analysis;
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
@@ -634,19 +289,129 @@ impl DocumentProcessor {
         })
     }
 
-    /// Simple document processing function using default config
-    pub fn process_document(&mut self, input_path: &str) -> Result<DocumentGraph> {
-        let default_config = ParsingConfig::default();
-        self.process_document_with_config(input_path, &default_config)
+    // =========================================================================
+    // Internal: extraction + parsing with C1/C2 cache awareness
+    // =========================================================================
+
+    /// Extract XHTML and parse to PreprocessorOutput, respecting C1 and C2 caches.
+    fn extract_and_parse(
+        &mut self,
+        _input_path: &str,
+        pdf_bytes: &[u8],
+        pdf_hash: &str,
+        fresh_from: &FreshFrom,
+        cache_defaults: &CacheDefaults,
+        profiler: &mut StepProfiler,
+    ) -> Result<PreprocessorOutput> {
+        // --- C1: XHTML cache check ---
+        let xhtml = if fresh_from.should_use_cache(CachePoint::C1) {
+            if let Some(cached) = self.storage.get_xhtml(pdf_hash)? {
+                println!("🎯 C1 XHTML cache hit — skipping Tika extraction");
+                cached
+            } else {
+                let markup = profiler.time_step("C1: PDF → XHTML (Tika)", || {
+                    self.preprocessor.parse_pdf_to_markup_language(pdf_bytes)
+                })?;
+                if cache_defaults.should_write(CachePoint::C1) {
+                    self.storage.store_xhtml(pdf_hash, &markup)?;
+                    println!("💾 C1: XHTML cached ({} bytes)", markup.len());
+                }
+                markup
+            }
+        } else {
+            // Fresh extraction requested
+            let markup = profiler.time_step("C1: PDF → XHTML (Tika, fresh)", || {
+                self.preprocessor.parse_pdf_to_markup_language(pdf_bytes)
+            })?;
+            if cache_defaults.should_write(CachePoint::C1) {
+                self.storage.store_xhtml(pdf_hash, &markup)?;
+                println!("💾 C1: XHTML cached ({} bytes, refreshed)", markup.len());
+            }
+            markup
+        };
+
+        // --- C2: Parse XHTML → PreprocessorOutput ---
+        let output = profiler.time_step("C2: XHTML → PreprocessorOutput", || {
+            self.preprocessor
+                .parse_markup_to_preprocessor_output(&xhtml)
+        })?;
+
+        if cache_defaults.should_write(CachePoint::C2) {
+            self.storage
+                .store_preprocessor_output(pdf_hash, &output)?;
+            println!("💾 C2: PreprocessorOutput cached");
+        }
+
+        Ok(output)
     }
 
-    /// Process document with config loaded from file
-    pub fn process_document_with_config_file(
+    // =========================================================================
+    // Internal: classification → rules → graph (shared by all entry points)
+    // =========================================================================
+
+    /// Run classification, rules, and graph building on PreprocessorOutput.
+    fn rules_and_graph(
         &mut self,
-        input_path: &str,
-        config_path: &str,
+        preprocessor_output: &PreprocessorOutput,
+        config: &ParsingConfig,
+        profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
-        let config = ParsingConfig::load_from_file(config_path)?;
-        self.process_document_with_config(input_path, &config)
+        // Classification
+        let classification = profiler.time_step("Classification", || {
+            self.classifier.classify(preprocessor_output)
+        })?;
+
+        // Document analysis (used by rules + stored in DocumentInfo)
+        let document_analysis = profiler.time_step("Document Analysis", || {
+            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements)
+        });
+
+        // Rule processing
+        let parsed_elements = if config.minimal_parse {
+            println!("🔄 Minimal parse mode — skipping rule processing");
+            self.rule_engine
+                .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
+        } else {
+            let font_size_analysis = profiler.time_step("Font Analysis", || {
+                self.rule_engine.analyze_font_sizes(
+                    &preprocessor_output.text_elements,
+                    &preprocessor_output.style_data,
+                )
+            });
+
+            profiler.time_step("Rules Processing", || {
+                self.rule_engine.apply_rules_with_config(
+                    &preprocessor_output.text_elements,
+                    &classification,
+                    &document_analysis,
+                    &font_size_analysis,
+                    &preprocessor_output.style_data,
+                    config,
+                )
+            })?
+        };
+
+        // Infer title before graph build consumes elements
+        let inferred_title = infer_title(&parsed_elements);
+
+        // Graph construction
+        let mut graph = profiler.time_step("Graph Construction", || {
+            self.graph_builder.build_graph(parsed_elements)
+        })?;
+
+        // Post-processing: metadata, analysis, breadcrumbs
+        if let Some(title) = inferred_title {
+            graph.document_info.document_metadata.title = Some(title);
+        }
+        graph
+            .document_info
+            .document_metadata
+            .merge_extracted(preprocessor_output.metadata.clone());
+        graph.document_info.document_analysis = document_analysis;
+        graph.document_info.bookmark_data = preprocessor_output.bookmark_data.clone();
+        graph.compute_structural_profile();
+        graph.compute_breadcrumbs();
+
+        Ok(graph)
     }
 }
