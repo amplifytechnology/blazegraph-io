@@ -19,6 +19,7 @@ pub use preprocessors::{Preprocessor, PdfPreprocessor, TikaPreprocessor};
 pub use processor::{DocumentProcessor, PipelineStages};
 pub use config::ParsingConfig;
 pub use storage::{CachePoint, FreshFrom, CacheDefaults};
+pub use graphs::NodeIdGenerator;
 
 // Re-export backends for direct use
 #[cfg(feature = "jni-backend")]

@@ -97,9 +97,32 @@ pub struct DocumentNode {
 }
 
 impl DocumentNode {
+    /// Create a node with a random UUIDv4 ID (legacy, non-deterministic).
     pub fn new(node_type: &str, text: String) -> Self {
         Self {
             id: Uuid::new_v4(),
+            node_type: node_type.to_string(),
+            location: NodeLocation {
+                semantic: SemanticLocation {
+                    path: String::new(),
+                    depth: 0,
+                    breadcrumbs: Vec::new(),
+                },
+                physical: None,
+            },
+            text_order: Some(0),
+            content: NodeContent::new(text),
+            style_info: None,
+            token_count: 0,
+            parent: None,
+            children: Vec::new(),
+        }
+    }
+
+    /// Create a node with a specific ID (for deterministic UUIDv5 generation).
+    pub fn new_with_id(id: NodeId, node_type: &str, text: String) -> Self {
+        Self {
+            id,
             node_type: node_type.to_string(),
             location: NodeLocation {
                 semantic: SemanticLocation {

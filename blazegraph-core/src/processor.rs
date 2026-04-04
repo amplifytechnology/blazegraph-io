@@ -1,7 +1,8 @@
-use crate::cache::GraphCacheKey;
+use crate::cache::{self, GraphCacheKey};
 use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
 use crate::graphs::builder::GraphBuilder;
+use crate::graphs::NodeIdGenerator;
 use crate::preprocessors::{Preprocessor, TikaPreprocessor};
 use crate::rules::RuleEngine;
 use crate::storage::{
@@ -155,6 +156,14 @@ impl DocumentProcessor {
             }
         }
 
+        // Create deterministic ID generator: version + pdf_hash + config_hash
+        let config_hash = calculate_config_hash(config)?;
+        let id_gen = NodeIdGenerator::new(
+            cache::versions::BLAZEGRAPH_VERSION,
+            &pdf_hash,
+            &config_hash,
+        );
+
         // --- C2: Preprocessor cache check ---
         let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {
             if let Some(cached) = self.storage.get_preprocessor_output(&pdf_hash)? {
@@ -168,7 +177,7 @@ impl DocumentProcessor {
         };
 
         // --- Stages 2-5: Classification → Rules → Graph → Post-processing ---
-        let graph = self.rules_and_graph(&preprocessor_output, config, &mut profiler)?;
+        let graph = self.rules_and_graph(&preprocessor_output, config, &id_gen, &mut profiler)?;
 
         if enable_profiling {
             profiler.print_summary();
@@ -354,6 +363,7 @@ impl DocumentProcessor {
         &mut self,
         preprocessor_output: &PreprocessorOutput,
         config: &ParsingConfig,
+        id_gen: &NodeIdGenerator,
         profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
         // Classification
@@ -394,9 +404,9 @@ impl DocumentProcessor {
         // Infer title before graph build consumes elements
         let inferred_title = infer_title(&parsed_elements);
 
-        // Graph construction
+        // Graph construction (deterministic UUIDv5 node IDs)
         let mut graph = profiler.time_step("Graph Construction", || {
-            self.graph_builder.build_graph(parsed_elements)
+            self.graph_builder.build_graph_deterministic(parsed_elements, id_gen)
         })?;
 
         // Post-processing: metadata, analysis, breadcrumbs
