@@ -330,9 +330,15 @@ impl RuleEngine {
         text_elements: &[PdfTextElement],
         style_data: &StyleData,
     ) -> FontSizeAnalysis {
-        // STEP 1: Count frequency of each font class used in text elements (single pass)
+        // STEP 1: Count frequency of each font class used in text elements (single pass).
+        // Rotated elements (rotation != 0) are excluded from all statistics — they represent
+        // non-body-flow content such as arxiv sidebars (rotation=90) that would otherwise
+        // corrupt most_common_size and potential_header_sizes. CR-10 / Block 02.
         let mut class_usage_counts = std::collections::HashMap::new();
         for element in text_elements {
+            if element.rotation != 0 {
+                continue;
+            }
             *class_usage_counts
                 .entry(element.style_info.class_name.clone())
                 .or_insert(0) += 1;

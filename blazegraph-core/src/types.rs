@@ -520,6 +520,13 @@ impl DocumentAnalysis {
         let mut font_sizes = Vec::new();
 
         for element in text_elements {
+            // Exclude rotated elements (rotation != 0) from font hierarchy statistics.
+            // Rotated content (e.g. arxiv sidebar at rotation=90) corrupts most_common_font_size
+            // and potential_header_sizes with non-body-flow sizes. CR-10 / Block 02.
+            if element.rotation != 0 {
+                continue;
+            }
+
             let style = &element.style_info;
 
             // Count font sizes

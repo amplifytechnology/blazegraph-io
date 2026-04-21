@@ -13,6 +13,10 @@
 //! No JVM required to run these tests.
 
 use blazegraph_io_core::preprocessors::pdf::xhtml_parser;
+use blazegraph_io_core::{
+    BoundingBox, DocumentAnalysis, FontClass, PdfTextElement, StyleData,
+};
+use blazegraph_io_core::rules::engine::RuleEngine;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -502,4 +506,166 @@ fn test_integration_attention_rotation() {
     assert!(e.iter().any(|el| el.rotation != 0), "attention has rotated sidebar (aside data-rotation=90)");
     assert!(e.iter().any(|el| el.rotation == 0), "attention has non-rotated body text");
     assert!(e.iter().any(|el| el.band > 0), "attention has multiple bands");
+}
+
+// ============================================================================
+// Block 02: Font hierarchy rotation filtering (CR-10)
+// ============================================================================
+
+/// Build a minimal PdfTextElement for unit tests.
+fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextElement {
+    PdfTextElement {
+        text: format!("text at {}pt rotation={}", font_size, rotation),
+        style_info: FontClass {
+            class_name: class_name.to_string(),
+            font_family: "TestFamily".to_string(),
+            font_size,
+            font_style: "normal".to_string(),
+            font_weight: "normal".to_string(),
+            color: "#000000".to_string(),
+        },
+        bounding_box: BoundingBox { x: 0.0, y: 0.0, width: 100.0, height: font_size },
+        page_number: 0,
+        paragraph_number: 0,
+        line_number: 0,
+        segment_number: 0,
+        reading_order: 0,
+        bookmark_match: None,
+        token_count: 1,
+        rotation,
+        column: 0,
+        band: 0,
+        nr_band_columns: 1,
+        raw_tags: vec![],
+    }
+}
+
+/// Build a minimal StyleData with the given (class_name, font_size) pairs.
+fn make_style_data(classes: &[(&str, f32)]) -> StyleData {
+    let mut font_classes = HashMap::new();
+    for (class_name, font_size) in classes {
+        font_classes.insert(class_name.to_string(), FontClass {
+            class_name: class_name.to_string(),
+            font_family: "TestFamily".to_string(),
+            font_size: *font_size,
+            font_style: "normal".to_string(),
+            font_weight: "normal".to_string(),
+            color: "#000000".to_string(),
+        });
+    }
+    StyleData { font_classes }
+}
+
+/// Test 1: DocumentAnalysis::analyze_text_elements excludes rotated elements.
+/// 10 elements at 10pt (rotation=0), 1 element at 20pt (rotation=90).
+/// After analysis, most_common_font_size should be 10.0 and 20pt should be absent.
+#[test]
+fn document_analysis_excludes_rotated() {
+    let mut elements: Vec<PdfTextElement> = (0..10)
+        .map(|_| make_element("f1", 10.0, 0))
+        .collect();
+    elements.push(make_element("f2", 20.0, 90));
+
+    let analysis = DocumentAnalysis::analyze_text_elements(&elements);
+
+    assert_eq!(
+        analysis.most_common_font_size, 10.0,
+        "most_common_font_size should be 10.0 (body), not 20.0 (rotated sidebar)"
+    );
+    assert_eq!(
+        analysis.font_size_counts.get("20.0"),
+        None,
+        "rotated 20pt element should not appear in font_size_counts"
+    );
+    assert_eq!(
+        analysis.font_size_counts.get("10.0"),
+        Some(&10),
+        "10pt should have count 10"
+    );
+    assert_eq!(
+        analysis.all_font_sizes.len(),
+        1,
+        // all_font_sizes is deduped, so only one unique size: 10.0
+        "all_font_sizes should contain only the non-rotated size (10.0, deduplicated)"
+    );
+    assert!(
+        !analysis.all_font_sizes.contains(&20.0),
+        "rotated 20pt should not appear in all_font_sizes"
+    );
+}
+
+/// Test 2: analyze_font_sizes excludes rotated elements from FontSizeAnalysis.
+/// 10 elements at class f1 (10pt, rotation=0), 1 at class f2 (20pt, rotation=90).
+#[test]
+fn analyze_font_sizes_excludes_rotated() {
+    let mut elements: Vec<PdfTextElement> = (0..10)
+        .map(|_| make_element("f1", 10.0, 0))
+        .collect();
+    elements.push(make_element("f2", 20.0, 90));
+
+    let style_data = make_style_data(&[("f1", 10.0), ("f2", 20.0)]);
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+    let font_analysis = engine.analyze_font_sizes(&elements, &style_data);
+
+    assert_eq!(
+        font_analysis.body_text_size, 10.0,
+        "body_text_size should be 10.0 (body), not 20.0 (rotated sidebar)"
+    );
+    assert!(
+        !font_analysis.potential_header_sizes.contains(&20.0),
+        "potential_header_sizes should not contain rotated 20pt"
+    );
+    // The rotated class f2 should not be counted — it's either absent or zero.
+    let f2_count = font_analysis.class_usage_counts.get("f2").copied().unwrap_or(0);
+    assert_eq!(
+        f2_count, 0,
+        "rotated class f2 should have usage count 0"
+    );
+}
+
+/// Test 3: Elements are NOT removed from the input slice.
+/// analyze_text_elements takes &[PdfTextElement], so the original Vec is unchanged.
+/// This test makes the "non-removal" contract explicit.
+#[test]
+fn rotated_elements_not_removed_from_input() {
+    let mut elements: Vec<PdfTextElement> = (0..10)
+        .map(|_| make_element("f1", 10.0, 0))
+        .collect();
+    elements.push(make_element("f2", 20.0, 90));
+
+    // Call analyze — this must not consume or modify the input vec
+    let _analysis = DocumentAnalysis::analyze_text_elements(&elements);
+
+    assert_eq!(elements.len(), 11, "input slice length must not change");
+    let rotated_count = elements.iter().filter(|e| e.rotation != 0).count();
+    assert_eq!(rotated_count, 1, "rotated element must still be present in input");
+}
+
+/// Test 4: All-rotated edge case — must not panic.
+/// When all elements have rotation != 0, analyze_text_elements should degrade
+/// gracefully: no divide-by-zero, no panic. most_common_font_size falls back to 12.0.
+#[test]
+fn all_rotated_does_not_panic() {
+    let elements: Vec<PdfTextElement> = vec![
+        make_element("f1", 10.0, 90),
+        make_element("f2", 20.0, 90),
+        make_element("f3", 15.0, 180),
+    ];
+
+    // Should not panic
+    let analysis = DocumentAnalysis::analyze_text_elements(&elements);
+
+    // No non-rotated elements means no counts — fallback to 12.0
+    assert_eq!(
+        analysis.most_common_font_size, 12.0,
+        "fallback most_common_font_size should be 12.0 when all elements are rotated"
+    );
+    assert!(
+        analysis.font_size_counts.is_empty(),
+        "font_size_counts should be empty when all elements are rotated"
+    );
+    assert!(
+        analysis.all_font_sizes.is_empty(),
+        "all_font_sizes should be empty when all elements are rotated"
+    );
 }
