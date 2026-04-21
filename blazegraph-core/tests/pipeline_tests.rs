@@ -12,6 +12,7 @@
 //! To regenerate fixtures: `make test-generate-fixtures`
 //! No JVM required to run these tests.
 
+use blazegraph_io_core::preprocessors::pdf::xhtml_parser;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -380,4 +381,106 @@ mod breadcrumbs {
             );
         }
     }
+}
+
+// ============================================================================
+// XHTML parser enrichment tests — Block 01 (CR-10, CR-15, CR-16, CR-17)
+// ============================================================================
+
+#[test]
+fn test_parser_band_and_column_propagation() {
+    let xhtml = r#"<html><head>
+<style>.f1 { font-family: Helvetica; font-size: 12.0px; font-style: normal; font-weight: normal; color: #000000; }</style>
+</head><body>
+<div class="page" data-page="0">
+  <div class="band" data-band="0" data-columns="2">
+    <p><span class="f1" data-bbox="10.0,100.0,100.0,12.0" data-line="0" data-segment="0" data-column="0">Left column</span></p>
+    <p><span class="f1" data-bbox="210.0,100.0,100.0,12.0" data-line="0" data-segment="0" data-column="1">Right column</span></p>
+  </div>
+  <div class="band" data-band="1" data-columns="1">
+    <p><span class="f1" data-bbox="10.0,200.0,300.0,12.0" data-line="0" data-segment="0" data-column="0">Single column</span></p>
+  </div>
+</div>
+</body></html>"#;
+    let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
+    let e = &output.text_elements;
+    assert_eq!(e.len(), 3);
+    assert_eq!(e[0].band, 0); assert_eq!(e[0].nr_band_columns, 2); assert_eq!(e[0].column, 0);
+    assert_eq!(e[1].band, 0); assert_eq!(e[1].nr_band_columns, 2); assert_eq!(e[1].column, 1);
+    assert_eq!(e[2].band, 1); assert_eq!(e[2].nr_band_columns, 1); assert_eq!(e[2].column, 0);
+    assert!(e.iter().all(|el| el.rotation == 0));
+    assert!(e.iter().all(|el| el.raw_tags.is_empty()));
+}
+
+#[test]
+fn test_parser_rotation_from_aside() {
+    let xhtml = r#"<html><head>
+<style>.f1 { font-family: Helvetica; font-size: 20.0px; font-style: normal; font-weight: normal; color: #000000; }</style>
+</head><body>
+<div class="page" data-page="0">
+  <aside data-rotation="90">
+    <p><span class="f1" data-bbox="10.0,100.0,100.0,20.0" data-line="0" data-segment="0" data-column="0">Rotated sidebar</span></p>
+  </aside>
+  <div class="band" data-band="0" data-columns="1">
+    <p><span class="f1" data-bbox="10.0,200.0,300.0,12.0" data-line="0" data-segment="0" data-column="0">Body text</span></p>
+  </div>
+</div>
+</body></html>"#;
+    let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
+    let e = &output.text_elements;
+    let rotated: Vec<_> = e.iter().filter(|el| el.rotation != 0).collect();
+    let body: Vec<_> = e.iter().filter(|el| el.rotation == 0).collect();
+    assert_eq!(rotated.len(), 1);
+    assert_eq!(rotated[0].rotation, 90);
+    assert!(!body.is_empty());
+}
+
+#[test]
+fn test_parser_old_format_defaults() {
+    let xhtml = r#"<html><head>
+<style>.f1 { font-family: Helvetica; font-size: 12.0px; font-style: normal; font-weight: normal; color: #000000; }</style>
+</head><body>
+<div class="page" data-page="0">
+  <p><span class="f1" data-bbox="10.0,100.0,100.0,12.0" data-line="0" data-segment="0">Old format text</span></p>
+</div>
+</body></html>"#;
+    let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
+    assert!(!output.text_elements.is_empty());
+    for el in &output.text_elements {
+        assert_eq!(el.rotation, 0, "default rotation");
+        assert_eq!(el.column, 0, "default column");
+        assert_eq!(el.band, 0, "default band");
+        assert_eq!(el.nr_band_columns, 1, "default nr_band_columns");
+        assert!(el.raw_tags.is_empty(), "default raw_tags");
+    }
+}
+
+#[test]
+fn test_integration_rfc_quic_bands_and_columns() {
+    let path = format!(
+        "{}/../../cache/c1-xhtml/7b1ea3317b5bea95f28cb546fdb925e2dcd66eb0cee2c02ceb66d9772ec927f2.xhtml",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let xhtml = std::fs::read_to_string(&path)
+        .expect("Pre-populated XHTML not found — see worktree setup in handoff (rfc-quic)");
+    let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
+    let e = &output.text_elements;
+    assert!(e.iter().any(|el| el.band > 0), "expected multiple bands");
+    assert!(e.iter().any(|el| el.nr_band_columns > 1), "expected at least one multi-col band");
+    assert!(e.iter().all(|el| el.rotation == 0), "rfc-quic has no rotated content");
+}
+
+#[test]
+fn test_integration_attention_rotation() {
+    let path = format!(
+        "{}/../../cache/c1-xhtml/e1feb60eb4fd74de2432c67eff97517f59fdb3364751f38aa636fdc1b82dc9ea.xhtml",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let xhtml = std::fs::read_to_string(&path)
+        .expect("Pre-populated XHTML not found — see worktree setup in handoff (attention)");
+    let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
+    let e = &output.text_elements;
+    assert!(e.iter().any(|el| el.rotation != 0), "attention has rotated sidebar (aside data-rotation=90)");
+    assert!(e.iter().any(|el| el.rotation == 0), "attention has non-rotated body text");
+    assert!(e.iter().any(|el| el.band > 0), "attention has multiple bands");
 }

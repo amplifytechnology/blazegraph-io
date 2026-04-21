@@ -336,6 +336,22 @@ pub struct PdfTextElement {
     pub reading_order: u32,    // computed from line + segment
     pub bookmark_match: Option<BookmarkSection>, // Full bookmark section if this span matches
     pub token_count: usize,    // Pre-calculated token count for performance
+    // --- Enriched XHTML fields (CR-10, CR-15, CR-16, CR-17) ---
+    /// Rotation degrees from enclosing `<aside data-rotation="N">`. 0 when not inside an aside.
+    /// i32 to match Tika-side computeRotationDegrees and allow future negative values.
+    pub rotation: i32,
+    /// Column index from `data-column="K"` on the span itself. 0 when not present.
+    pub column: u32,
+    /// Band index from enclosing `<div class="band" data-band="N">`. 0 when not inside a band.
+    pub band: u32,
+    /// Number of columns in the enclosing band (`data-columns="K"`). 1 when not inside a band.
+    /// nr_ prefix signals this is a replicated band-level attribute, not a per-element identifier.
+    pub nr_band_columns: u32,
+    /// Unrecognized XHTML tag fragments that are descendants of this span (any depth).
+    /// Each entry is the full unparsed fragment including content text.
+    /// Empty for all spans in current core Tika output. A future corpus-tier Tika JAR
+    /// will emit <a href>, <annotation>, etc. here.
+    pub raw_tags: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundingBox {
