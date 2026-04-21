@@ -30,8 +30,14 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-// Pre-compiled regexes — retained for metadata, style, and bookmark extraction
-// which operate on well-delimited XHTML regions and remain simple with regex.
+// Pre-compiled regexes
+
+/// Extracts raw tag fragments from a span's inner content.
+/// Matches self-closing tags (`<br/>`) and paired open/close tags (`<a href="...">text</a>`).
+/// Valid XHTML guarantees text content is entity-escaped, so any literal `<` is a real tag.
+static RAW_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)(?:<[^>]+/>|<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>)").unwrap()
+});
 
 static META_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<meta\s+name="([^"]*)"[^>]*content="([^"]*)"[^>]*/?>"#).unwrap()
@@ -113,7 +119,8 @@ struct ParseContext {
 
     // Span state
     in_span: bool,
-    span_depth: usize, // nesting depth counter inside a span (for raw_tags)
+    span_nesting: u32,    // nested <span> depth inside the primary span (0 when in primary)
+    span_start_pos: usize, // byte offset in the source XHTML right after the primary span's `>`
     span_class: String,
     span_bbox: String,
     span_line: u32,
@@ -121,8 +128,6 @@ struct ParseContext {
     span_column: u32,
     span_text: String,
     span_raw_tags: Vec<String>,
-    // Buffer for capturing a raw_tag fragment while inside a nested element
-    raw_tag_buf: Option<String>,
 }
 
 impl ParseContext {
@@ -139,7 +144,8 @@ impl ParseContext {
             in_paragraph: false,
             paragraph_number: 0,
             in_span: false,
-            span_depth: 0,
+            span_nesting: 0,
+            span_start_pos: 0,
             span_class: String::new(),
             span_bbox: String::new(),
             span_line: 0,
@@ -147,13 +153,13 @@ impl ParseContext {
             span_column: 0,
             span_text: String::new(),
             span_raw_tags: vec![],
-            raw_tag_buf: None,
         }
     }
 
     fn reset_span(&mut self) {
         self.in_span = false;
-        self.span_depth = 0;
+        self.span_nesting = 0;
+        self.span_start_pos = 0;
         self.span_class.clear();
         self.span_bbox.clear();
         self.span_line = 0;
@@ -161,7 +167,6 @@ impl ParseContext {
         self.span_column = 0;
         self.span_text.clear();
         self.span_raw_tags.clear();
-        self.raw_tag_buf = None;
     }
 }
 
@@ -243,11 +248,6 @@ fn extract_text_elements(
                                     .unwrap_or(1);
                             // Rotation resets when we enter a band (aside is sibling, not ancestor)
                             ctx.current_rotation = 0;
-                        } else if ctx.in_span {
-                            // A <div> inside a span: capture as raw_tag
-                            let raw = serialize_start_tag(tag_str, &e.attributes());
-                            ctx.span_depth += 1;
-                            ctx.raw_tag_buf = Some(raw);
                         }
                         // other divs (e.g., inside a band) are tracked by div_depth but
                         // do not change container state.
@@ -266,14 +266,14 @@ fn extract_text_elements(
                     }
                     "span" if ctx.in_page && ctx.in_paragraph => {
                         if ctx.in_span {
-                            // Nested span: treat as raw_tag fragment, track depth
-                            let raw = serialize_start_tag(tag_str, &e.attributes());
-                            ctx.span_depth += 1;
-                            ctx.raw_tag_buf = Some(raw);
+                            // Nested span inside the primary span: track depth only.
+                            // Its bytes are captured via buffer_position slicing at close.
+                            ctx.span_nesting += 1;
                         } else {
                             // Opening the primary span
                             ctx.in_span = true;
-                            ctx.span_depth = 1;
+                            ctx.span_nesting = 0;
+                            ctx.span_start_pos = reader.buffer_position();
                             ctx.span_class =
                                 get_attr(&e.attributes(), b"class").unwrap_or_default();
                             ctx.span_bbox =
@@ -289,40 +289,19 @@ fn extract_text_elements(
                                 .unwrap_or(0);
                             ctx.span_text.clear();
                             ctx.span_raw_tags.clear();
-                            ctx.raw_tag_buf = None;
                         }
-                    }
-                    _ if ctx.in_span && ctx.span_depth > 1 => {
-                        // Any other opening tag inside a span (beyond the span itself)
-                        let raw = serialize_start_tag(tag_str, &e.attributes());
-                        ctx.raw_tag_buf = Some(raw);
                     }
                     _ => {}
                 }
             }
 
-            Ok(Event::Empty(ref e)) => {
-                // Self-closing tags (e.g., <br/>, <img/>) inside a span → raw_tags
-                if ctx.in_span && ctx.span_depth >= 1 {
-                    let name = e.name();
-                    let tag_str = std::str::from_utf8(name.as_ref()).unwrap_or("");
-                    let raw = serialize_empty_tag(tag_str, &e.attributes());
-                    ctx.span_raw_tags.push(raw);
-                }
-            }
+            Ok(Event::Empty(_)) => {}
 
             Ok(Event::Text(ref e)) => {
-                if ctx.in_span {
-                    if ctx.span_depth == 1 {
-                        // Direct text of the span
-                        if let Ok(text) = e.unescape() {
-                            ctx.span_text.push_str(&text);
-                        }
-                    } else if let Some(ref mut buf) = ctx.raw_tag_buf {
-                        // Text inside a nested element inside the span
-                        if let Ok(text) = e.unescape() {
-                            buf.push_str(&text);
-                        }
+                // Capture direct text of the primary span (not text inside nested tags).
+                if ctx.in_span && ctx.span_nesting == 0 {
+                    if let Ok(text) = e.unescape() {
+                        ctx.span_text.push_str(&text);
                     }
                 }
             }
@@ -333,15 +312,13 @@ fn extract_text_elements(
 
                 match tag_str {
                     "span" if ctx.in_span => {
-                        if ctx.span_depth > 1 {
-                            // Closing a nested element inside the span
-                            ctx.span_depth -= 1;
-                            if let Some(buf) = ctx.raw_tag_buf.take() {
-                                ctx.span_raw_tags.push(format!("{}</{}>", buf, tag_str));
-                            }
+                        if ctx.span_nesting > 0 {
+                            ctx.span_nesting -= 1;
                         } else {
-                            // Closing the primary span: emit the element
-                            ctx.span_depth = 0;
+                            // Closing the primary span: slice inner content, extract raw_tags, emit
+                            let end_pos = reader.buffer_position() - 7; // len("</span>") == 7
+                            ctx.span_raw_tags =
+                                extract_raw_tags(xhtml.get(ctx.span_start_pos..end_pos).unwrap_or(""));
                             let text_content = ctx.span_text.trim().to_string();
                             if !text_content.is_empty() {
                                 if let Some(element) = build_element(
@@ -354,16 +331,6 @@ fn extract_text_elements(
                                 }
                             }
                             ctx.reset_span();
-                            // Paragraph counter advances per-span to maintain existing semantics
-                            // (the old parser incremented paragraph_number per <p> block).
-                            // We leave paragraph_number management to the <p> close event below.
-                        }
-                    }
-                    _ if ctx.in_span && ctx.span_depth > 1 => {
-                        // Closing a non-span tag inside a span
-                        ctx.span_depth -= 1;
-                        if let Some(buf) = ctx.raw_tag_buf.take() {
-                            ctx.span_raw_tags.push(format!("{}</{}>", buf, tag_str));
                         }
                     }
                     "p" if ctx.in_paragraph => {
@@ -500,41 +467,19 @@ fn build_element(
 }
 
 // ============================================================================
-// Serialization helpers for raw_tags capture
+// raw_tags extraction
 // ============================================================================
 
-/// Serialize an opening tag (with attributes) to a string for raw_tags capture.
-fn serialize_start_tag(
-    tag: &str,
-    attrs: &quick_xml::events::attributes::Attributes,
-) -> String {
-    let mut s = format!("<{}", tag);
-    for attr in attrs.clone() {
-        if let Ok(a) = attr {
-            let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
-            let val = std::str::from_utf8(a.value.as_ref()).unwrap_or("");
-            s.push_str(&format!(" {}=\"{}\"", key, val));
-        }
-    }
-    s.push('>');
-    s
-}
-
-/// Serialize a self-closing tag to a string for raw_tags capture.
-fn serialize_empty_tag(
-    tag: &str,
-    attrs: &quick_xml::events::attributes::Attributes,
-) -> String {
-    let mut s = format!("<{}", tag);
-    for attr in attrs.clone() {
-        if let Ok(a) = attr {
-            let key = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
-            let val = std::str::from_utf8(a.value.as_ref()).unwrap_or("");
-            s.push_str(&format!(" {}=\"{}\"", key, val));
-        }
-    }
-    s.push_str("/>");
-    s
+/// Extract raw tag fragments from the inner content of a primary `<span>`.
+///
+/// XHTML guarantees text content is entity-escaped (`<` → `&lt;`), so any
+/// literal `<...>` in the inner slice is definitionally a real tag — not user
+/// text masquerading as markup. The regex is therefore unambiguous.
+fn extract_raw_tags(inner: &str) -> Vec<String> {
+    RAW_TAG_REGEX
+        .find_iter(inner)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 // ============================================================================

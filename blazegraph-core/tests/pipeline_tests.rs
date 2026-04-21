@@ -456,6 +456,25 @@ fn test_parser_old_format_defaults() {
 }
 
 #[test]
+fn test_parser_raw_tags_anchor() {
+    let xhtml = r#"<html><head>
+<style>.f1 { font-family: Helvetica; font-size: 12.0px; font-style: normal; font-weight: normal; color: #000000; }</style>
+</head><body>
+<div class="page" data-page="1">
+  <p><span class="f1" data-bbox="10.0,100.0,100.0,12.0" data-line="0" data-segment="0" data-column="0">hello <a href="https://example.com">link text</a> world</span></p>
+</div>
+</body></html>"#;
+    let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
+    let el = output.text_elements.first().expect("no elements");
+    assert_eq!(el.raw_tags.len(), 1, "expected one raw_tag entry");
+    assert_eq!(
+        el.raw_tags[0],
+        r#"<a href="https://example.com">link text</a>"#,
+        "raw_tag must include attributes and inner text verbatim"
+    );
+}
+
+#[test]
 fn test_integration_rfc_quic_bands_and_columns() {
     let path = format!(
         "{}/../../cache/c1-xhtml/7b1ea3317b5bea95f28cb546fdb925e2dcd66eb0cee2c02ceb66d9772ec927f2.xhtml",
