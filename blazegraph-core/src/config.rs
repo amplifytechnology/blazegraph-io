@@ -35,6 +35,10 @@ pub struct ParsingConfig {
     /// Minimal parse mode - bypasses all rule processing and returns only base conversion
     #[serde(default)]
     pub minimal_parse: bool,
+    /// Configuration for the V2 section detection rule (Block 03).
+    /// Uses `#[serde(default)]` so existing YAML configs without this key still deserialize.
+    #[serde(default)]
+    pub section_detection_v2: SectionDetectionV2Config,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +60,10 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             rules: vec![
+                RuleConfig {
+                    name: "SectionDetectionV2".to_string(),
+                    enabled: true,
+                },
                 RuleConfig {
                     name: "SpatialClustering+StyleAnalysis".to_string(),
                     enabled: true,
@@ -553,6 +561,69 @@ impl Default for SizeEnforcerConfig {
     }
 }
 
+/// Configuration for the V2 section detection rule.
+/// V2 uses a candidate-then-refine pipeline that composes size, bold, isolation,
+/// and font-rarity signals rather than gating them sequentially.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionDetectionV2Config {
+    /// Column-width ratio below which a line's text is considered isolated
+    /// (fallback for when segment information is unavailable).
+    pub isolation_threshold: f32,
+
+    /// X-gap in points. If a candidate's nearest same-line neighbor segment
+    /// is closer than this, the candidate is NOT isolated.
+    pub isolation_neighbor_gap: f32,
+
+    /// Frequency ratio (0.0–1.0) below which a font class is "rare".
+    /// class_usage / total_non_rotated_elements < this → rare.
+    pub font_rarity_threshold: f32,
+
+    /// Font-size tolerance (points) for "same size as body".
+    pub font_size_tolerance: f32,
+
+    /// Minimum alphabetic character ratio for a candidate to survive
+    /// (inherits semantics from old rule's min_alpha_ratio).
+    pub min_alpha_ratio: f32,
+
+    /// Max hierarchy depth (inherits from old rule).
+    pub max_depth: u32,
+    pub enforce_max_depth: bool,
+    pub starting_section_level: u32,
+
+    /// Regex patterns that promote a weak/rejected candidate to a section
+    /// (escape hatch — e.g., "^\\d+\\.\\d+" for numbered subsections).
+    pub inclusion_patterns: Vec<String>,
+
+    /// Regex patterns that demote a promoted candidate back to non-section
+    /// (escape hatch — e.g., "^Figure\\s" for figure captions).
+    pub exclusion_patterns: Vec<String>,
+}
+
+impl Default for SectionDetectionV2Config {
+    fn default() -> Self {
+        Self {
+            isolation_threshold: 0.5,
+            isolation_neighbor_gap: 20.0,
+            font_rarity_threshold: 0.05,
+            font_size_tolerance: 0.1,
+            min_alpha_ratio: 0.5,
+            max_depth: 6,
+            enforce_max_depth: true,
+            starting_section_level: 1,
+            inclusion_patterns: vec![
+                r"^\d+\.".to_string(),          // "1.", "2.", ...
+                r"^\d+\.\d+".to_string(),       // "1.1", "3.2", ...
+                r"^Chapter\s+\d+".to_string(),
+                r"^Appendix\s+[A-Z]".to_string(),
+            ],
+            exclusion_patterns: vec![
+                r"^Figure\s".to_string(),
+                r"^Table\s".to_string(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigManager {
     configs: HashMap<DocumentType, ParsingConfig>,
@@ -636,6 +707,7 @@ impl ConfigManager {
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase - document type specific tuning
             minimal_parse: false,
+            section_detection_v2: SectionDetectionV2Config::default(),
         };
         self.configs
             .insert(DocumentType::AcademicPaper, academic_config);
@@ -687,6 +759,7 @@ impl ConfigManager {
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
+            section_detection_v2: SectionDetectionV2Config::default(),
         };
         self.configs
             .insert(DocumentType::LegalContract, legal_config);
@@ -731,6 +804,7 @@ impl ConfigManager {
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
+            section_detection_v2: SectionDetectionV2Config::default(),
         }
     }
 }
@@ -790,6 +864,7 @@ impl Default for ParsingConfig {
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(),
             minimal_parse: false,
+            section_detection_v2: SectionDetectionV2Config::default(),
         }
     }
 }

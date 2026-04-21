@@ -5,6 +5,7 @@ use regex::Regex;
 
 // Import rule types (only active rules)
 use super::section_detection::SectionAndHierarchyDetectionRule;
+use super::section_detection_v2::SectionDetectionV2Rule;
 use super::spatial_clustering::SpatialClusteringRule;
 use super::validation::ValidationRule;
 
@@ -284,6 +285,20 @@ impl RuleEngine {
                 );
                 let result = section_rule.apply(elements)?;
                 debug_pipeline_elements("SectionDetection", &result, &self.debug_config);
+                Ok(result)
+            }
+            "SectionDetectionV2" => {
+                println!("📝 DETECTING SECTIONS (V2 — candidate-then-refine)...");
+                let rule = SectionDetectionV2Rule::new(
+                    self,
+                    text_elements,
+                    config,
+                    document_analysis,
+                    font_size_analysis,
+                    style_data,
+                );
+                let result = rule.apply(elements)?;
+                debug_pipeline_elements("SectionDetectionV2", &result, &self.debug_config);
                 Ok(result)
             }
             "PatternBasedSectionDetection" => {

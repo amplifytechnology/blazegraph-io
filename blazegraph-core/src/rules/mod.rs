@@ -9,6 +9,7 @@
 // Import sub-modules directly - they are in the rules/ directory
 pub mod engine;
 pub mod section_detection;
+pub mod section_detection_v2;
 pub mod spatial_clustering;
 pub mod validation;
 

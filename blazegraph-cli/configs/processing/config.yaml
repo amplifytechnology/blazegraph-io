@@ -4,7 +4,7 @@ document_type: Generic
 # NEW APPROACH: Section detection FIRST, then spatial clustering
 pipeline:
   rules:
-    - name: "SectionDetection"
+    - name: "SectionDetectionV2"
       enabled: true
     - name: "PatternBasedSectionDetection"
       enabled: false

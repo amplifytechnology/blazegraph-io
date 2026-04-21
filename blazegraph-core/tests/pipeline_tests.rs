@@ -16,7 +16,12 @@ use blazegraph_io_core::preprocessors::pdf::xhtml_parser;
 use blazegraph_io_core::{
     BoundingBox, DocumentAnalysis, FontClass, PdfTextElement, StyleData,
 };
-use blazegraph_io_core::rules::engine::RuleEngine;
+use blazegraph_io_core::rules::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
+use blazegraph_io_core::rules::section_detection_v2::SectionDetectionV2Rule;
+use blazegraph_io_core::config::{
+    ParsingConfig, PipelineConfig, RuleConfig, SectionDetectionV2Config,
+};
+use blazegraph_io_core::ParsedElementType;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -668,4 +673,367 @@ fn all_rotated_does_not_panic() {
         analysis.all_font_sizes.is_empty(),
         "all_font_sizes should be empty when all elements are rotated"
     );
+}
+
+// ============================================================================
+// Block 03: Section Detection V2 (CR-10, Block 03)
+// ============================================================================
+
+/// Build a PdfTextElement with full control over all fields relevant to V2.
+/// `text`, `font_size`, `font_weight` ("bold" or "normal"), `rotation`, `line_number`,
+/// `band`, `column`, `x`, `width` (bbox), and `class_name`.
+fn make_v2_element(
+    class_name: &str,
+    text: &str,
+    font_size: f32,
+    font_weight: &str, // "bold" or "normal"
+    rotation: i32,
+    line_number: u32,
+    band: u32,
+    column: u32,
+    x: f32,
+    width: f32,
+) -> PdfTextElement {
+    PdfTextElement {
+        text: text.to_string(),
+        style_info: FontClass {
+            class_name: class_name.to_string(),
+            font_family: "TestFamily".to_string(),
+            font_size,
+            font_style: "normal".to_string(),
+            font_weight: font_weight.to_string(),
+            color: "#000000".to_string(),
+        },
+        bounding_box: BoundingBox { x, y: 0.0, width, height: font_size },
+        page_number: 0,
+        paragraph_number: 0,
+        line_number,
+        segment_number: 0,
+        reading_order: 0,
+        bookmark_match: None,
+        token_count: 1,
+        rotation,
+        column,
+        band,
+        nr_band_columns: 1,
+        raw_tags: vec![],
+    }
+}
+
+/// Build a FontSizeAnalysis where `body_size` is the most common size,
+/// `class_counts` provides per-class usage counts.
+fn make_font_analysis(body_size: f32, class_counts: &[(&str, usize)]) -> FontSizeAnalysis {
+    let mut class_usage_counts = HashMap::new();
+    for (class, count) in class_counts {
+        class_usage_counts.insert(class.to_string(), *count);
+    }
+    FontSizeAnalysis {
+        median_size: body_size,
+        min_size: body_size,
+        max_size: body_size,
+        most_common_size: body_size,
+        most_common_class: "body".to_string(),
+        rare_large_sizes: vec![],
+        size_frequency_map: HashMap::new(),
+        class_usage_counts,
+        potential_header_sizes: vec![],
+        body_text_size: body_size,
+        hierarchy_levels: vec![],
+        size_usage_ratio: 1.0,
+    }
+}
+
+/// Build a minimal ParsingConfig wired to SectionDetectionV2 with given config.
+fn make_v2_config(v2: SectionDetectionV2Config) -> ParsingConfig {
+    ParsingConfig {
+        pipeline: PipelineConfig {
+            rules: vec![RuleConfig {
+                name: "SectionDetectionV2".to_string(),
+                enabled: true,
+            }],
+        },
+        section_detection_v2: v2,
+        ..ParsingConfig::default()
+    }
+}
+
+/// Build a minimal DocumentAnalysis (all defaults, nothing interesting).
+fn make_doc_analysis() -> DocumentAnalysis {
+    DocumentAnalysis {
+        font_size_counts: HashMap::new(),
+        font_family_counts: HashMap::new(),
+        bold_counts: (0, 0),
+        italic_counts: (0, 0),
+        most_common_font_size: 10.0,
+        most_common_font_family: "TestFamily".to_string(),
+        all_font_sizes: vec![],
+    }
+}
+
+// ── Test 1 ─────────────────────────────────────────────────────────────────
+/// V2 is dispatched when configured, produces 1 section from a small input set.
+#[test]
+fn v2_test1_dispatched_and_detects_section() {
+    // 1 section-quality element (18pt bold, isolated) + 5 body paragraphs (10pt)
+    let mut text_elements = vec![
+        make_v2_element("header", "Introduction", 18.0, "bold", 0, 1, 0, 0, 10.0, 100.0),
+    ];
+    for i in 0..5usize {
+        text_elements.push(make_v2_element(
+            "body", "Body paragraph text here.", 10.0, "normal", 0,
+            (i as u32) + 2, 0, 0, 10.0, 300.0,
+        ));
+    }
+
+    // body class: 5 elements; header class: 1 element — so header is rare (1/6 ≈ 17% > 5% threshold)
+    // but size 18 > body 10 → strong candidate → always a section regardless of rarity
+    let font_analysis = make_font_analysis(10.0, &[("body", 5), ("header", 1)]);
+    let config = make_v2_config(SectionDetectionV2Config::default());
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    let sections: Vec<_> = result.iter().filter(|e| e.element_type == ParsedElementType::Section).collect();
+    let paragraphs: Vec<_> = result.iter().filter(|e| e.element_type == ParsedElementType::Paragraph).collect();
+
+    assert_eq!(sections.len(), 1, "should detect exactly 1 section");
+    assert_eq!(paragraphs.len(), 5, "should have 5 body paragraphs");
+    assert_eq!(sections[0].text, "Introduction");
+}
+
+// ── Test 2 ─────────────────────────────────────────────────────────────────
+/// Size-only strong candidate (18pt, non-bold) becomes a section.
+#[test]
+fn v2_test2_size_only_strong_candidate_is_section() {
+    // header class is rare: 1 out of total 101 elements (< 5% threshold)
+    let mut text_elements = vec![
+        make_v2_element("h_rare", "Abstract", 18.0, "normal", 0, 1, 0, 0, 10.0, 80.0),
+    ];
+    for i in 0..100usize {
+        text_elements.push(make_v2_element(
+            "body", "Body text.", 10.0, "normal", 0,
+            (i as u32) + 2, 0, 0, 10.0, 300.0,
+        ));
+    }
+
+    // Even though h_rare is rare, the size signal alone (strong) is sufficient
+    let font_analysis = make_font_analysis(10.0, &[("body", 100), ("h_rare", 1)]);
+    let config = make_v2_config(SectionDetectionV2Config::default());
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    // Only classify the first element
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    let elem = &result[0];
+    assert_eq!(
+        elem.element_type, ParsedElementType::Section,
+        "18pt non-bold strong candidate should be a section"
+    );
+}
+
+// ── Test 3 ─────────────────────────────────────────────────────────────────
+/// Bold inline emphasis does NOT become a section — near neighbor in X.
+#[test]
+fn v2_test3_bold_inline_emphasis_is_not_section() {
+    // Three elements on the same line, all close in X:
+    // seg 0: 10pt normal  | seg 1: 10pt bold "Note:"  | seg 2: 10pt normal
+    // Bboxes: x=10,w=100 | x=115,w=40               | x=160,w=200
+    // Gap between seg0 and seg1: 115 - (10+100) = 5  → < isolation_neighbor_gap (20)
+    let text_elements = vec![
+        make_v2_element("body", "Some leading text.", 10.0, "normal", 0, 5, 0, 0, 10.0, 100.0),
+        make_v2_element("body_bold", "Note:", 10.0, "bold", 0, 5, 0, 0, 115.0, 40.0),
+        make_v2_element("body", "this is inline emphasis.", 10.0, "normal", 0, 5, 0, 0, 160.0, 200.0),
+    ];
+
+    let font_analysis = make_font_analysis(10.0, &[("body", 2), ("body_bold", 1)]);
+    let config = make_v2_config(SectionDetectionV2Config::default());
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    for (i, elem) in result.iter().enumerate() {
+        assert_eq!(
+            elem.element_type, ParsedElementType::Paragraph,
+            "element {} (text='{}') should be Paragraph, not Section (inline emphasis)",
+            i, elem.text
+        );
+    }
+}
+
+// ── Test 4 ─────────────────────────────────────────────────────────────────
+/// Bold isolated at body size becomes a section (weak + bold + isolated).
+#[test]
+fn v2_test4_bold_isolated_at_body_size_is_section() {
+    // The bold element is alone on its line — no same-line neighbors
+    // It's also the only element with its class ("bold_class"): 1 out of 11 → 9% > 5%
+    // So rarity doesn't confirm. But bold + isolated (weak) → section.
+    let mut text_elements = vec![
+        make_v2_element("bold_class", "Results", 10.0, "bold", 0, 3, 0, 0, 10.0, 60.0),
+    ];
+    for i in 0..10usize {
+        text_elements.push(make_v2_element(
+            "body", "Body paragraph text.", 10.0, "normal", 0,
+            (i as u32) + 4, 0, 0, 10.0, 300.0,
+        ));
+    }
+
+    // bold_class: 1, body: 10 → bold_class count/total = 1/11 ≈ 9.1% > 5% (not rare)
+    // isolation: bold element is alone on line 3 → isolated = true
+    // → weak + (bold AND isolated) → section
+    let font_analysis = make_font_analysis(10.0, &[("bold_class", 1), ("body", 10)]);
+    let config = make_v2_config(SectionDetectionV2Config::default());
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    assert_eq!(
+        result[0].element_type, ParsedElementType::Section,
+        "10pt bold isolated element should be a section via weak+(bold AND isolated)"
+    );
+}
+
+// ── Test 5 ─────────────────────────────────────────────────────────────────
+/// Numbered subsection pattern promotes weak candidate to section.
+#[test]
+fn v2_test5_numbered_subsection_pattern_promotes_weak() {
+    // 11pt non-bold, body is 10pt → weak by size (11 > 10 + 0.1 threshold? 11 > 10.1 → actually strong!)
+    // Use exactly 10.05pt to be within the weak zone (body=10.0, tol=0.1 → weak = [9.9, 10.1])
+    // Wait: weak = font_size >= body - tol → 10.05 >= 9.9 (yes) AND NOT font_size > body + tol
+    // font_size > body + tol → 10.05 > 10.1 → false → weak. Correct.
+    let text_elements = vec![
+        make_v2_element("body", "3.2 Model Architecture", 10.05, "normal", 0, 1, 0, 0, 10.0, 150.0),
+    ];
+
+    // No same-line neighbors → isolated = true. But weak + (bold AND isolated) → bold is false.
+    // weak + (isolated AND rare): count/total = 1/1 = 100% → not rare.
+    // So Pass 1 would NOT classify as section. Pass 2 inclusion pattern "^\\d+\\.\\d+" matches → promote.
+    let font_analysis = make_font_analysis(10.0, &[("body", 1)]);
+    let config = make_v2_config(SectionDetectionV2Config::default());
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    assert_eq!(
+        result[0].element_type, ParsedElementType::Section,
+        "\"3.2 Model Architecture\" at weak size should be promoted to section by inclusion pattern"
+    );
+}
+
+// ── Test 6 ─────────────────────────────────────────────────────────────────
+/// Figure caption is demoted even if visually strong (exclusion pattern).
+#[test]
+fn v2_test6_figure_caption_is_demoted() {
+    // 11pt bold isolated — Pass 1 would make this a strong candidate (11 > 10.1) → section.
+    // Text matches "^Figure\s" exclusion pattern → demoted.
+    // Inclusion: "^\\d+\\." matches "Figure 3:" — no. "^\\d+" doesn't match "Figure".
+    // So final result is non-section.
+    let text_elements = vec![
+        make_v2_element("caption", "Figure 3: The Transformer architecture.", 11.0, "bold", 0, 1, 0, 0, 10.0, 200.0),
+    ];
+
+    let font_analysis = make_font_analysis(10.0, &[("caption", 1)]);
+    let config = make_v2_config(SectionDetectionV2Config::default());
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    assert_eq!(
+        result[0].element_type, ParsedElementType::Paragraph,
+        "Figure caption should be demoted to non-section by exclusion pattern even though visually strong"
+    );
+}
+
+// ── Test 7 ─────────────────────────────────────────────────────────────────
+/// Rotated element (rotation=90) is never a section, regardless of visual properties.
+#[test]
+fn v2_test7_rotated_element_is_never_section() {
+    // 20pt bold — rotation=90 → must be Paragraph
+    let text_elements = vec![
+        make_v2_element("sidebar", "arxiv 2017.09", 20.0, "bold", 90, 1, 0, 0, 10.0, 200.0),
+    ];
+
+    let font_analysis = make_font_analysis(10.0, &[("sidebar", 1)]);
+    let config = make_v2_config(SectionDetectionV2Config::default());
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    assert_eq!(
+        result[0].element_type, ParsedElementType::Paragraph,
+        "Rotated element (rotation=90) must never be classified as Section"
+    );
+}
+
+// ── Test 8 ─────────────────────────────────────────────────────────────────
+/// Hierarchy levels are assigned consistently (1, 2, 3 descending sizes; then back to 1).
+#[test]
+fn v2_test8_hierarchy_levels_assigned_correctly() {
+    // Three sections at decreasing font sizes: 16pt, 13pt, 11pt
+    // Then one more at 16pt — should step back up to level 1.
+    // All are well above body (10pt) → strong candidates → sections.
+    // Each is alone on its line → isolated.
+    let text_elements = vec![
+        make_v2_element("h1", "Chapter One", 16.0, "bold", 0, 1, 0, 0, 10.0, 100.0),
+        make_v2_element("h2", "Section 1.1", 13.0, "bold", 0, 2, 0, 0, 10.0, 80.0),
+        make_v2_element("h3", "Subsection 1.1.1", 11.0, "bold", 0, 3, 0, 0, 10.0, 120.0),
+        make_v2_element("h1", "Chapter Two", 16.0, "bold", 0, 4, 0, 0, 10.0, 100.0),
+    ];
+
+    let font_analysis = make_font_analysis(10.0, &[("h1", 2), ("h2", 1), ("h3", 1)]);
+    let config = make_v2_config(SectionDetectionV2Config {
+        starting_section_level: 1,
+        font_size_tolerance: 0.1,
+        ..SectionDetectionV2Config::default()
+    });
+    let doc_analysis = make_doc_analysis();
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+
+    let rule = SectionDetectionV2Rule::new(
+        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+    );
+    let result = rule.apply(vec![]).expect("apply should succeed");
+
+    let sections: Vec<_> = result.iter().filter(|e| e.element_type == ParsedElementType::Section).collect();
+    assert_eq!(sections.len(), 4, "should detect all 4 sections");
+
+    assert_eq!(sections[0].hierarchy_level, 1, "Chapter One (16pt) should be level 1");
+    assert_eq!(sections[1].hierarchy_level, 2, "Section 1.1 (13pt) should be level 2");
+    assert_eq!(sections[2].hierarchy_level, 3, "Subsection 1.1.1 (11pt) should be level 3");
+    assert_eq!(sections[3].hierarchy_level, 1, "Chapter Two (16pt) should step back to level 1");
 }
