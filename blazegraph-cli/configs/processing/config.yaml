@@ -16,6 +16,42 @@ pipeline:
       enabled: false
     - name: "Validation"
       enabled: false
+section_detection_v2:
+  # Font size tolerance (points). A candidate is "strong" if font_size > body_size + this.
+  # At 0.1 everything above body auto-promotes. 1.5 requires a genuine size jump.
+  font_size_tolerance: 3.0
+
+  # X-gap (points) to nearest same-line neighbor. Below this = NOT isolated (inline emphasis).
+  isolation_neighbor_gap: 10.0
+
+  # Column-width ratio fallback for isolation when segment info is unavailable.
+  isolation_threshold: 0.33
+
+  # Font class frequency below this ratio is considered "rare" (structural).
+  font_rarity_threshold: 0.00
+
+  # Minimum alphabetic character ratio — filters math symbols and noise.
+  min_alpha_ratio: 0.8
+
+  # Hierarchy depth limits.
+  max_depth: 6
+  enforce_max_depth: true
+  starting_section_level: 1
+
+  # Inclusion patterns: promote a weak/rejected candidate to section (e.g. numbered subsections).
+  inclusion_patterns:
+    - "^\\d+\\.\\s+[A-Z]" # "1. Introduction", "3. Model..." — number + space + capital word
+    - "^\\d+\\.\\d+\\.?\\s+[A-Z]" # "3.1 Encoder", "3.2.1 Scaled..." — subsection + capital
+    - "^Chapter\\s+\\d+"
+    - "^Appendix\\s+[A-Z]"
+
+  # Exclusion patterns: demote a promoted candidate (applied before inclusion).
+  exclusion_patterns:
+    - "^Figure\\s"
+    - "^Table\\s"
+    - "^\\d+\\.?\\d*$" # bare numbers / decimals like "0.1", "4.92"
+    - "^[\\d\\s\\.]+$" # rows of numbers (table data)
+
 section_and_hierarchy:
   # Font size analysis parameters
   large_header_threshold: 0.7
