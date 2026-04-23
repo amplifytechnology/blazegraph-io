@@ -39,6 +39,54 @@ pub struct ParsingConfig {
     /// Uses `#[serde(default)]` so existing YAML configs without this key still deserialize.
     #[serde(default)]
     pub section_detection_v2: SectionDetectionV2Config,
+    /// Configuration for the ParagraphClustering rule (Block 05b).
+    /// Uses `#[serde(default)]` so existing YAML configs without this key still deserialize.
+    #[serde(default)]
+    pub paragraph_clustering: ParagraphClusteringConfig,
+}
+
+// ─── ParagraphClustering config (Block 05b) ───────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParagraphClusteringConfig {
+    /// Merge segments within the same (band, column, line_number, element_type).
+    /// Tika splits lines into segments by font class; segments on the same line
+    /// almost always read as one continuous text.
+    pub merge_segments: bool,              // default: true
+
+    /// Merge lines within the same (band, column, paragraph_number, element_type).
+    /// Uses Tika's Y-gap-based paragraph detection. Reliable for prose.
+    /// Implies merge_segments (auto-promote with warn if inconsistent).
+    pub merge_lines: bool,                 // default: true
+
+    /// Merge across columns within the same (band, element_type).
+    /// Ignores paragraph_number. DANGEROUS for prose — scrambles reading order
+    /// across column boundaries. Intended for table-like bands (nr_band_columns > 2).
+    /// Implies merge_lines.
+    pub merge_columns: bool,               // default: false
+
+    /// Merge across bands within the same (page, element_type). Rarely desirable.
+    /// Implies merge_columns.
+    pub merge_bands: bool,                 // default: false
+
+    /// Separator inserted between merged lines when nr_band_columns <= 2 (prose).
+    pub prose_line_separator: String,      // default: " "
+
+    /// Separator inserted between merged lines when nr_band_columns > 2 (table-like).
+    pub table_line_separator: String,      // default: "\n"
+}
+
+impl Default for ParagraphClusteringConfig {
+    fn default() -> Self {
+        Self {
+            merge_segments: true,
+            merge_lines: true,
+            merge_columns: false,
+            merge_bands: false,
+            prose_line_separator: " ".to_string(),
+            table_line_separator: "\n".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +113,7 @@ impl Default for PipelineConfig {
                     enabled: true,
                 },
                 RuleConfig {
-                    name: "SpatialClustering+StyleAnalysis".to_string(),
+                    name: "ParagraphClustering".to_string(),
                     enabled: true,
                 },
                 RuleConfig {
@@ -708,6 +756,7 @@ impl ConfigManager {
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase - document type specific tuning
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            paragraph_clustering: ParagraphClusteringConfig::default(),
         };
         self.configs
             .insert(DocumentType::AcademicPaper, academic_config);
@@ -760,6 +809,7 @@ impl ConfigManager {
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            paragraph_clustering: ParagraphClusteringConfig::default(),
         };
         self.configs
             .insert(DocumentType::LegalContract, legal_config);
@@ -805,6 +855,7 @@ impl ConfigManager {
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            paragraph_clustering: ParagraphClusteringConfig::default(),
         }
     }
 }
@@ -865,6 +916,7 @@ impl Default for ParsingConfig {
             size_enforcer: SizeEnforcerConfig::default(),
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            paragraph_clustering: ParagraphClusteringConfig::default(),
         }
     }
 }

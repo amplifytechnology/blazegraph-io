@@ -1069,3 +1069,348 @@ fn v2_test8_hierarchy_levels_assigned_correctly() {
     assert_eq!(sections[2].hierarchy_level, 3, "Subsection 1.1.1 (11pt) should be level 3");
     assert_eq!(sections[3].hierarchy_level, 1, "Chapter Two (16pt) should step back to level 1");
 }
+
+// ============================================================================
+// Block 05b: ParagraphClustering rule tests
+// ============================================================================
+
+use blazegraph_io_core::config::ParagraphClusteringConfig;
+use blazegraph_io_core::rules::paragraph_clustering::ParagraphClusteringRule;
+use blazegraph_io_core::types::{BookmarkSection, ParsedPdfElement};
+
+/// Build a minimal ParsedPdfElement for ParagraphClustering tests.
+/// All spatial fields are explicit; reading_order is the sort key for merging.
+#[allow(clippy::too_many_arguments)]
+fn make_parsed_element(
+    element_type: ParsedElementType,
+    text: &str,
+    class_name: &str,
+    page: u32,
+    band: u32,
+    column: u32,
+    nr_band_columns: u32,
+    line_number: u32,
+    segment_number: u32,
+    paragraph_number: u32,
+    rotation: i32,
+    reading_order: u32,
+    token_count: usize,
+) -> ParsedPdfElement {
+    ParsedPdfElement {
+        element_type,
+        text: text.to_string(),
+        hierarchy_level: 1,
+        position: reading_order as usize,
+        style_info: FontClass {
+            class_name: class_name.to_string(),
+            font_family: "TestFamily".to_string(),
+            font_size: 10.0,
+            font_style: "normal".to_string(),
+            font_weight: "normal".to_string(),
+            color: "#000000".to_string(),
+        },
+        placement: Some(Placement {
+            page_number: page,
+            bounding_box: BoundingBox {
+                x: (reading_order as f32) * 10.0,
+                y: (line_number as f32) * 12.0,
+                width: 80.0,
+                height: 10.0,
+            },
+            band,
+            column,
+            nr_band_columns,
+            line_number,
+            segment_number,
+            rotation,
+            paragraph_number,
+        }),
+        reading_order,
+        bookmark_match: None,
+        token_count,
+    }
+}
+
+/// Build a ParsingConfig wired to run ParagraphClustering with the given config.
+fn make_clustering_config(pc: ParagraphClusteringConfig) -> ParsingConfig {
+    ParsingConfig {
+        pipeline: PipelineConfig {
+            rules: vec![RuleConfig {
+                name: "ParagraphClustering".to_string(),
+                enabled: true,
+            }],
+        },
+        paragraph_clustering: pc,
+        ..ParsingConfig::default()
+    }
+}
+
+/// Run ParagraphClusteringRule with the given config and input elements.
+fn run_clustering(
+    cfg: ParagraphClusteringConfig,
+    elements: Vec<ParsedPdfElement>,
+) -> Vec<ParsedPdfElement> {
+    let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+    let text_elements: Vec<blazegraph_io_core::PdfTextElement> = vec![];
+    let doc_analysis = make_doc_analysis();
+    let font_analysis = make_font_analysis(10.0, &[]);
+    let style_data = StyleData { font_classes: HashMap::new() };
+    let parsing_config = make_clustering_config(cfg);
+
+    let rule = ParagraphClusteringRule::new(
+        &engine,
+        &text_elements,
+        &parsing_config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
+    );
+    rule.apply(elements).expect("ParagraphClustering::apply should not fail")
+}
+
+// ── Block 05b Test 1 ─────────────────────────────────────────────────────────
+/// Segments on same line merge into one element (no separator).
+#[test]
+fn pc_test1_segments_on_same_line_merge() {
+    // 3 segments: same band/column/line/paragraph/element_type, different segments.
+    // Different styles (token counts differ) to also exercise style-majority logic.
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "Hello", "f_bold",  0, 0, 0, 1, 0, 0, 0, 0, 0, 1),
+        make_parsed_element(ParsedElementType::Paragraph, " ",     "f_norm",  0, 0, 0, 1, 0, 1, 0, 0, 1, 1),
+        make_parsed_element(ParsedElementType::Paragraph, "world", "f_norm",  0, 0, 0, 1, 0, 2, 0, 0, 2, 3),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 1, "3 same-line segments should merge into 1 element");
+    assert_eq!(result[0].text, "Hello world", "merged text should be concatenated without extra separator");
+
+    // Bbox union: x = min(0, 10, 20) = 0, width extends to max(0+80, 10+80, 20+80) = 100, so width=100
+    let bbox = &result[0].pdf_placement().bounding_box;
+    assert_eq!(bbox.x, 0.0, "union bbox x should be min(0, 10, 20) = 0");
+    let right = bbox.x + bbox.width;
+    assert!(right >= 100.0, "union bbox right edge should cover all segments");
+}
+
+// ── Block 05b Test 2 ─────────────────────────────────────────────────────────
+/// Lines in same paragraph merge with prose separator (nr_band_columns=1).
+#[test]
+fn pc_test2_lines_in_same_paragraph_merge_prose() {
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "Line one",   "f1", 0, 0, 0, 1, 0, 0, 0, 0, 0, 3),
+        make_parsed_element(ParsedElementType::Paragraph, "Line two",   "f1", 0, 0, 0, 1, 1, 0, 0, 0, 1, 3),
+        make_parsed_element(ParsedElementType::Paragraph, "Line three", "f1", 0, 0, 0, 1, 2, 0, 0, 0, 2, 3),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 1, "3 lines in same paragraph should merge into 1");
+    assert_eq!(
+        result[0].text,
+        "Line one Line two Line three",
+        "prose separator ' ' should be inserted between lines"
+    );
+}
+
+// ── Block 05b Test 3 ─────────────────────────────────────────────────────────
+/// Different paragraphs do NOT merge.
+#[test]
+fn pc_test3_different_paragraphs_do_not_merge() {
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "Para A", "f1", 0, 0, 0, 1, 0, 0, 0, 0, 0, 4),
+        make_parsed_element(ParsedElementType::Paragraph, "Para B", "f1", 0, 0, 0, 1, 2, 0, 1, 0, 1, 4),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 2, "elements in different paragraphs must NOT merge");
+    // Check text contents are preserved separately
+    let texts: Vec<&str> = result.iter().map(|e| e.text.as_str()).collect();
+    assert!(texts.contains(&"Para A"), "Para A should be present");
+    assert!(texts.contains(&"Para B"), "Para B should be present");
+}
+
+// ── Block 05b Test 4 ─────────────────────────────────────────────────────────
+/// Section + Section in same paragraph (2-line title) merge.
+#[test]
+fn pc_test4_section_plus_section_same_paragraph_merges() {
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Section, "Attention Is All", "f_title", 0, 0, 0, 1, 0, 0, 0, 0, 0, 4),
+        make_parsed_element(ParsedElementType::Section, "You Need",         "f_title", 0, 0, 0, 1, 1, 0, 0, 0, 1, 4),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 1, "two Section elements in same paragraph should merge");
+    assert_eq!(result[0].element_type, ParsedElementType::Section, "merged type should be Section");
+    assert_eq!(result[0].text, "Attention Is All You Need");
+}
+
+// ── Block 05b Test 5 ─────────────────────────────────────────────────────────
+/// Section + Paragraph in same paragraph do NOT merge (different element_types).
+#[test]
+fn pc_test5_section_and_paragraph_do_not_merge() {
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Section,   "Introduction", "f_hdr", 0, 0, 0, 1, 0, 0, 0, 0, 0, 4),
+        make_parsed_element(ParsedElementType::Paragraph, "Body text.",   "f_body", 0, 0, 0, 1, 1, 0, 0, 0, 1, 3),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 2, "Section and Paragraph in same paragraph must NOT merge");
+    let section_count = result.iter().filter(|e| e.element_type == ParsedElementType::Section).count();
+    let para_count = result.iter().filter(|e| e.element_type == ParsedElementType::Paragraph).count();
+    assert_eq!(section_count, 1, "should have 1 Section");
+    assert_eq!(para_count, 1, "should have 1 Paragraph");
+}
+
+// ── Block 05b Test 6 ─────────────────────────────────────────────────────────
+/// Table-like band (nr_band_columns=4) uses table_line_separator (\n).
+#[test]
+fn pc_test6_table_band_uses_table_separator() {
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "Row A", "f1", 0, 0, 0, 4, 0, 0, 0, 0, 0, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "Row B", "f1", 0, 0, 0, 4, 1, 0, 0, 0, 1, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "Row C", "f1", 0, 0, 0, 4, 2, 0, 0, 0, 2, 2),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 1, "3 table lines should merge into 1");
+    assert_eq!(
+        result[0].text,
+        "Row A\nRow B\nRow C",
+        "table separator '\\n' should be used when nr_band_columns > 2"
+    );
+}
+
+// ── Block 05b Test 7 ─────────────────────────────────────────────────────────
+/// Reading order is preserved across columns: column 0 before column 1.
+#[test]
+fn pc_test7_reading_order_preserved_across_columns() {
+    // 2 elements in (band=0, column=0) with reading_order 0,1
+    // 2 elements in (band=0, column=1) with reading_order 2,3
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "Col0 line1", "f1", 0, 0, 0, 2, 0, 0, 0, 0, 0, 3),
+        make_parsed_element(ParsedElementType::Paragraph, "Col0 line2", "f1", 0, 0, 0, 2, 1, 0, 0, 0, 1, 3),
+        make_parsed_element(ParsedElementType::Paragraph, "Col1 line1", "f1", 0, 0, 1, 2, 0, 0, 0, 0, 2, 3),
+        make_parsed_element(ParsedElementType::Paragraph, "Col1 line2", "f1", 0, 0, 1, 2, 1, 0, 0, 0, 3, 3),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 2, "should produce 2 elements (one per column)");
+    // Result should be sorted by reading_order: col0 (ro=0) before col1 (ro=2)
+    assert!(
+        result[0].reading_order < result[1].reading_order,
+        "column 0 element (reading_order {}) should come before column 1 (reading_order {})",
+        result[0].reading_order, result[1].reading_order
+    );
+    assert_eq!(result[0].reading_order, 0, "col0 merged element reading_order = min(0,1) = 0");
+    assert_eq!(result[1].reading_order, 2, "col1 merged element reading_order = min(2,3) = 2");
+}
+
+// ── Block 05b Test 8 ─────────────────────────────────────────────────────────
+/// Whitespace-only text is dropped.
+#[test]
+fn pc_test8_empty_merged_text_is_dropped() {
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "   ", "f1", 0, 0, 0, 1, 0, 0, 0, 0, 0, 1),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(result.len(), 0, "whitespace-only element should be dropped");
+}
+
+// ── Block 05b Test 9 ─────────────────────────────────────────────────────────
+/// Rotated element (rotation=90) produces its own node because it lives in a
+/// different band than the body flow (Tika's <aside> emits a distinct band).
+#[test]
+fn pc_test9_rotated_element_produces_own_node() {
+    // Body element: band=0, column=0, paragraph_number=0, rotation=0
+    // Rotated aside: band=99, column=0, paragraph_number=0, rotation=90
+    // They have the same paragraph_number and column but DIFFERENT bands, so they
+    // won't be in the same partition.
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "Body content",   "f_body",  0, 0,  0, 1, 0, 0, 0, 0,  0, 5),
+        make_parsed_element(ParsedElementType::Paragraph, "arxiv 2017.09",  "f_aside", 0, 99, 0, 1, 0, 0, 0, 90, 1, 2),
+    ];
+
+    let result = run_clustering(ParagraphClusteringConfig::default(), elements);
+
+    assert_eq!(
+        result.len(), 2,
+        "body and rotated aside must produce 2 separate nodes (different bands)"
+    );
+}
+
+// ── Block 05b Test 10 ────────────────────────────────────────────────────────
+/// merge_columns=true enables cross-column merging.
+#[test]
+fn pc_test10_merge_columns_enables_cross_column_merge() {
+    // 4 elements: 2 in column=0, 2 in column=1, same band and element_type.
+    // column 0 has reading_orders 0,1; column 1 has reading_orders 2,3.
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "A", "f1", 0, 0, 0, 1, 0, 0, 0, 0, 0, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "B", "f1", 0, 0, 0, 1, 1, 0, 1, 0, 1, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "C", "f1", 0, 0, 1, 1, 0, 0, 0, 0, 2, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "D", "f1", 0, 0, 1, 1, 1, 0, 1, 0, 3, 2),
+    ];
+
+    let cfg = ParagraphClusteringConfig {
+        merge_segments: true,
+        merge_lines: true,
+        merge_columns: true,
+        merge_bands: false,
+        prose_line_separator: " ".to_string(),
+        table_line_separator: "\n".to_string(),
+    };
+
+    let result = run_clustering(cfg, elements);
+
+    assert_eq!(result.len(), 1, "merge_columns=true should collapse all 4 elements into 1");
+    // Text should contain all four segments, column 0 first (reading_order 0,1 < 2,3)
+    assert!(result[0].text.contains('A'), "merged text should contain A");
+    assert!(result[0].text.contains('B'), "merged text should contain B");
+    assert!(result[0].text.contains('C'), "merged text should contain C");
+    assert!(result[0].text.contains('D'), "merged text should contain D");
+    // Verify column 0 text comes before column 1 text in the merged string
+    let pos_a = result[0].text.find('A').unwrap();
+    let pos_c = result[0].text.find('C').unwrap();
+    assert!(pos_a < pos_c, "column 0 content (A) should appear before column 1 content (C)");
+}
+
+// ── Block 05b Test 11 ────────────────────────────────────────────────────────
+/// Cascade auto-promotion: merge_bands=true with all others false acts as all-true.
+#[test]
+fn pc_test11_cascade_auto_promotion() {
+    // Config with merge_bands=true but lower levels explicitly false.
+    // After auto-promotion the effective level should be Bands, merging everything.
+    let cfg = ParagraphClusteringConfig {
+        merge_segments: false,
+        merge_lines: false,
+        merge_columns: false,
+        merge_bands: true,
+        prose_line_separator: " ".to_string(),
+        table_line_separator: "\n".to_string(),
+    };
+
+    // 4 elements across different bands, columns, paragraphs — all same element_type.
+    // With effective Bands merge they should all collapse into 1 per (page, element_type).
+    let elements = vec![
+        make_parsed_element(ParsedElementType::Paragraph, "Seg1", "f1", 0, 0, 0, 1, 0, 0, 0, 0, 0, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "Seg2", "f1", 0, 0, 0, 1, 1, 0, 1, 0, 1, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "Seg3", "f1", 0, 1, 0, 1, 0, 0, 0, 0, 2, 2),
+        make_parsed_element(ParsedElementType::Paragraph, "Seg4", "f1", 0, 1, 1, 1, 0, 0, 0, 0, 3, 2),
+    ];
+
+    let result = run_clustering(cfg, elements);
+
+    assert_eq!(
+        result.len(), 1,
+        "with merge_bands=true (and cascade promotion) all same-page same-type elements should merge"
+    );
+    assert!(result[0].text.contains("Seg1"), "merged text should contain Seg1");
+    assert!(result[0].text.contains("Seg4"), "merged text should contain Seg4");
+}

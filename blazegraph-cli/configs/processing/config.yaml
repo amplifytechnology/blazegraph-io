@@ -10,7 +10,7 @@ pipeline:
       enabled: false
     - name: "ListDetection"
       enabled: false
-    - name: "SpatialClustering"
+    - name: "ParagraphClustering"
       enabled: true
     - name: "SizeEnforcer"
       enabled: false
