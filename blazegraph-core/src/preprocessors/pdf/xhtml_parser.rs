@@ -397,10 +397,10 @@ fn finalize_page_elements(
     global_reading_order: &mut u32,
 ) {
     page_elements.sort_unstable_by(|a, b| {
-        a.bounding_box
+        a.placement.bounding_box
             .y
-            .total_cmp(&b.bounding_box.y)
-            .then_with(|| a.bounding_box.x.total_cmp(&b.bounding_box.x))
+            .total_cmp(&b.placement.bounding_box.y)
+            .then_with(|| a.placement.bounding_box.x.total_cmp(&b.placement.bounding_box.x))
     });
     for el in page_elements.iter_mut() {
         el.reading_order = *global_reading_order;
@@ -449,19 +449,20 @@ fn build_element(
     Some(PdfTextElement {
         text: text_content.clone(),
         style_info: font_class,
-        bounding_box: BoundingBox { x, y, width, height },
-        page_number: ctx.page_number,
-        paragraph_number: ctx.paragraph_number,
-        line_number: ctx.span_line,
-        segment_number: ctx.span_segment,
+        placement: Placement {
+            page_number: ctx.page_number,
+            bounding_box: BoundingBox { x, y, width, height },
+            band: ctx.current_band,
+            column: ctx.span_column,
+            nr_band_columns: ctx.current_nr_band_columns,
+            line_number: ctx.span_line,
+            segment_number: ctx.span_segment,
+            rotation: ctx.current_rotation,
+            paragraph_number: ctx.paragraph_number,
+        },
         reading_order: 0, // Assigned later in finalize_page_elements
         bookmark_match,
         token_count: estimate_token_count(&text_content),
-        // Enriched fields
-        rotation: ctx.current_rotation,
-        column: ctx.span_column,
-        band: ctx.current_band,
-        nr_band_columns: ctx.current_nr_band_columns,
         raw_tags: ctx.span_raw_tags.clone(),
     })
 }

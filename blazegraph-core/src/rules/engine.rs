@@ -351,7 +351,7 @@ impl RuleEngine {
         // corrupt most_common_size and potential_header_sizes. CR-10 / Block 02.
         let mut class_usage_counts = std::collections::HashMap::new();
         for element in text_elements {
-            if element.rotation != 0 {
+            if element.rotation() != 0 {
                 continue;
             }
             *class_usage_counts
@@ -507,13 +507,11 @@ impl RuleEngine {
                 text: text_element.text.trim().to_string(),
                 hierarchy_level: 1, // All elements start at level 1 for base conversion
                 position,
-                style_info: text_element.style_info.clone(), // Rich FontClass data
-                bounding_box: text_element.bounding_box.clone(), // Always present
-                page_number: text_element.page_number,
-                paragraph_number: text_element.paragraph_number, // New semantic data
-                reading_order: text_element.reading_order,       // Spatial ordering
-                bookmark_match: text_element.bookmark_match.clone(), // Section context
-                token_count: text_element.token_count,           // Use pre-calculated token count
+                style_info: text_element.style_info.clone(),
+                placement: Some(text_element.placement.clone()),
+                reading_order: text_element.reading_order,
+                bookmark_match: text_element.bookmark_match.clone(),
+                token_count: text_element.token_count,
             };
 
             elements.push(paragraph_element);

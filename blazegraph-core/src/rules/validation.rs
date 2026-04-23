@@ -180,7 +180,7 @@ impl<'a> ValidationRule<'a> {
         issues: &mut Vec<ValidationIssue>,
     ) {
         for (i, element) in elements.iter().enumerate() {
-            let bbox = &element.bounding_box;
+            let bbox = &element.pdf_placement().bounding_box;
 
             // Check for impossible coordinates
             if bbox.x < 0.0 || bbox.y < 0.0 || bbox.width <= 0.0 || bbox.height <= 0.0 {
@@ -202,19 +202,20 @@ impl<'a> ValidationRule<'a> {
         issues: &mut Vec<ValidationIssue>,
     ) {
         for (i, element) in elements.iter().enumerate() {
+            let page_number = element.pdf_placement().page_number;
             // Check for reasonable page numbers
-            if element.page_number == 0 {
+            if page_number == 0 {
                 issues.push(ValidationIssue::PageInconsistency {
                     position: i,
-                    page: element.page_number,
+                    page: page_number,
                     issue: "Page number is 0 (should start from 1)".to_string(),
                 });
             }
 
             // Check for huge page number jumps (might indicate parsing issues)
             if i > 0 {
-                let prev_page = elements[i - 1].page_number;
-                let curr_page = element.page_number;
+                let prev_page = elements[i - 1].pdf_placement().page_number;
+                let curr_page = page_number;
                 if curr_page > prev_page + 5 {
                     // Allow some tolerance
                     issues.push(ValidationIssue::PageInconsistency {

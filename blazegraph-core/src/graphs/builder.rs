@@ -308,9 +308,10 @@ impl GraphBuilder {
                 crate::types::ParsedElementType::Paragraph => "Paragraph",
             };
 
+            let placement = first_element.pdf_placement();
             let physical = Some(PhysicalLocation {
-                page: first_element.page_number,
-                bounding_box: first_element.bounding_box.clone(),
+                page: placement.page_number,
+                bounding_box: placement.bounding_box.clone(),
             });
 
             (node_type, physical)

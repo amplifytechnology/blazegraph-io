@@ -51,12 +51,10 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
                         hierarchy_level: 3, // Default hierarchy level (will be updated)
                         position: i,
                         style_info: text_element.style_info.clone(),
-                        bounding_box: text_element.bounding_box.clone(),
-                        page_number: text_element.page_number,
-                        paragraph_number: text_element.paragraph_number,
+                        placement: Some(text_element.placement.clone()),
                         reading_order: text_element.reading_order,
                         bookmark_match: text_element.bookmark_match.clone(),
-                        token_count: text_element.token_count, // Use pre-calculated token count
+                        token_count: text_element.token_count,
                     }
                 })
                 .collect()

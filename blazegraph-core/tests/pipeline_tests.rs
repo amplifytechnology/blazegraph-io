@@ -14,7 +14,7 @@
 
 use blazegraph_io_core::preprocessors::pdf::xhtml_parser;
 use blazegraph_io_core::{
-    BoundingBox, DocumentAnalysis, FontClass, PdfTextElement, StyleData,
+    BoundingBox, DocumentAnalysis, FontClass, Placement, PdfTextElement, StyleData,
 };
 use blazegraph_io_core::rules::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
 use blazegraph_io_core::rules::section_detection_v2::SectionDetectionV2Rule;
@@ -414,10 +414,10 @@ fn test_parser_band_and_column_propagation() {
     let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
     let e = &output.text_elements;
     assert_eq!(e.len(), 3);
-    assert_eq!(e[0].band, 0); assert_eq!(e[0].nr_band_columns, 2); assert_eq!(e[0].column, 0);
-    assert_eq!(e[1].band, 0); assert_eq!(e[1].nr_band_columns, 2); assert_eq!(e[1].column, 1);
-    assert_eq!(e[2].band, 1); assert_eq!(e[2].nr_band_columns, 1); assert_eq!(e[2].column, 0);
-    assert!(e.iter().all(|el| el.rotation == 0));
+    assert_eq!(e[0].placement.band, 0); assert_eq!(e[0].placement.nr_band_columns, 2); assert_eq!(e[0].placement.column, 0);
+    assert_eq!(e[1].placement.band, 0); assert_eq!(e[1].placement.nr_band_columns, 2); assert_eq!(e[1].placement.column, 1);
+    assert_eq!(e[2].placement.band, 1); assert_eq!(e[2].placement.nr_band_columns, 1); assert_eq!(e[2].placement.column, 0);
+    assert!(e.iter().all(|el| el.placement.rotation == 0));
     assert!(e.iter().all(|el| el.raw_tags.is_empty()));
 }
 
@@ -437,10 +437,10 @@ fn test_parser_rotation_from_aside() {
 </body></html>"#;
     let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
     let e = &output.text_elements;
-    let rotated: Vec<_> = e.iter().filter(|el| el.rotation != 0).collect();
-    let body: Vec<_> = e.iter().filter(|el| el.rotation == 0).collect();
+    let rotated: Vec<_> = e.iter().filter(|el| el.placement.rotation != 0).collect();
+    let body: Vec<_> = e.iter().filter(|el| el.placement.rotation == 0).collect();
     assert_eq!(rotated.len(), 1);
-    assert_eq!(rotated[0].rotation, 90);
+    assert_eq!(rotated[0].placement.rotation, 90);
     assert!(!body.is_empty());
 }
 
@@ -456,10 +456,10 @@ fn test_parser_old_format_defaults() {
     let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
     assert!(!output.text_elements.is_empty());
     for el in &output.text_elements {
-        assert_eq!(el.rotation, 0, "default rotation");
-        assert_eq!(el.column, 0, "default column");
-        assert_eq!(el.band, 0, "default band");
-        assert_eq!(el.nr_band_columns, 1, "default nr_band_columns");
+        assert_eq!(el.placement.rotation, 0, "default rotation");
+        assert_eq!(el.placement.column, 0, "default column");
+        assert_eq!(el.placement.band, 0, "default band");
+        assert_eq!(el.placement.nr_band_columns, 1, "default nr_band_columns");
         assert!(el.raw_tags.is_empty(), "default raw_tags");
     }
 }
@@ -493,9 +493,9 @@ fn test_integration_rfc_quic_bands_and_columns() {
         .expect("Pre-populated XHTML not found — see worktree setup in handoff (rfc-quic)");
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
-    assert!(e.iter().any(|el| el.band > 0), "expected multiple bands");
-    assert!(e.iter().any(|el| el.nr_band_columns > 1), "expected at least one multi-col band");
-    assert!(e.iter().all(|el| el.rotation == 0), "rfc-quic has no rotated content");
+    assert!(e.iter().any(|el| el.placement.band > 0), "expected multiple bands");
+    assert!(e.iter().any(|el| el.placement.nr_band_columns > 1), "expected at least one multi-col band");
+    assert!(e.iter().all(|el| el.placement.rotation == 0), "rfc-quic has no rotated content");
 }
 
 #[test]
@@ -508,9 +508,9 @@ fn test_integration_attention_rotation() {
         .expect("Pre-populated XHTML not found — see worktree setup in handoff (attention)");
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
-    assert!(e.iter().any(|el| el.rotation != 0), "attention has rotated sidebar (aside data-rotation=90)");
-    assert!(e.iter().any(|el| el.rotation == 0), "attention has non-rotated body text");
-    assert!(e.iter().any(|el| el.band > 0), "attention has multiple bands");
+    assert!(e.iter().any(|el| el.placement.rotation != 0), "attention has rotated sidebar (aside data-rotation=90)");
+    assert!(e.iter().any(|el| el.placement.rotation == 0), "attention has non-rotated body text");
+    assert!(e.iter().any(|el| el.placement.band > 0), "attention has multiple bands");
 }
 
 // ============================================================================
@@ -529,18 +529,20 @@ fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextEleme
             font_weight: "normal".to_string(),
             color: "#000000".to_string(),
         },
-        bounding_box: BoundingBox { x: 0.0, y: 0.0, width: 100.0, height: font_size },
-        page_number: 0,
-        paragraph_number: 0,
-        line_number: 0,
-        segment_number: 0,
+        placement: Placement {
+            page_number: 0,
+            bounding_box: BoundingBox { x: 0.0, y: 0.0, width: 100.0, height: font_size },
+            band: 0,
+            column: 0,
+            nr_band_columns: 1,
+            line_number: 0,
+            segment_number: 0,
+            rotation,
+            paragraph_number: 0,
+        },
         reading_order: 0,
         bookmark_match: None,
         token_count: 1,
-        rotation,
-        column: 0,
-        band: 0,
-        nr_band_columns: 1,
         raw_tags: vec![],
     }
 }
@@ -642,7 +644,7 @@ fn rotated_elements_not_removed_from_input() {
     let _analysis = DocumentAnalysis::analyze_text_elements(&elements);
 
     assert_eq!(elements.len(), 11, "input slice length must not change");
-    let rotated_count = elements.iter().filter(|e| e.rotation != 0).count();
+    let rotated_count = elements.iter().filter(|e| e.rotation() != 0).count();
     assert_eq!(rotated_count, 1, "rotated element must still be present in input");
 }
 
@@ -704,18 +706,20 @@ fn make_v2_element(
             font_weight: font_weight.to_string(),
             color: "#000000".to_string(),
         },
-        bounding_box: BoundingBox { x, y: 0.0, width, height: font_size },
-        page_number: 0,
-        paragraph_number: 0,
-        line_number,
-        segment_number: 0,
+        placement: Placement {
+            page_number: 0,
+            bounding_box: BoundingBox { x, y: 0.0, width, height: font_size },
+            band,
+            column,
+            nr_band_columns: 1,
+            line_number,
+            segment_number: 0,
+            rotation,
+            paragraph_number: 0,
+        },
         reading_order: 0,
         bookmark_match: None,
         token_count: 1,
-        rotation,
-        column,
-        band,
-        nr_band_columns: 1,
         raw_tags: vec![],
     }
 }
@@ -997,6 +1001,34 @@ fn v2_test7_rotated_element_is_never_section() {
         result[0].element_type, ParsedElementType::Paragraph,
         "Rotated element (rotation=90) must never be classified as Section"
     );
+}
+
+// ============================================================================
+// Block 05a: Placement struct — structural migration test
+// ============================================================================
+
+/// Confirm that all 9 spatial fields round-trip correctly through the Placement struct.
+/// This test verifies the structural migration is complete and nothing was silently dropped.
+#[test]
+fn placement_fields_accessible_via_struct() {
+    let element = make_v2_element("header", "Round-trip test", 14.0, "bold", 90, 3, 2, 1, 42.5, 120.0);
+    assert_eq!(element.placement.page_number, 0);
+    assert_eq!(element.placement.bounding_box.x, 42.5);
+    assert_eq!(element.placement.bounding_box.width, 120.0);
+    assert_eq!(element.placement.band, 2);
+    assert_eq!(element.placement.column, 1);
+    assert_eq!(element.placement.nr_band_columns, 1);
+    assert_eq!(element.placement.line_number, 3);
+    assert_eq!(element.placement.segment_number, 0);
+    assert_eq!(element.placement.rotation, 90);
+    assert_eq!(element.placement.paragraph_number, 0);
+    // Accessor methods agree with direct field reads
+    assert_eq!(element.rotation(), 90);
+    assert_eq!(element.band(), 2);
+    assert_eq!(element.column(), 1);
+    assert_eq!(element.line_number(), 3);
+    assert_eq!(element.page_number(), 0);
+    assert_eq!(element.bounding_box().x, 42.5);
 }
 
 // ── Test 8 ─────────────────────────────────────────────────────────────────

@@ -324,34 +324,88 @@ impl Default for DepthDistribution {
 // Raw XHTML is now cached as .xhtml files at cache point C1.
 // Parsed elements live in PreprocessorOutput at cache point C2.
 
+/// Spatial and structural metadata about where a text element lives in its source.
+/// Populated for PDF-sourced elements. Future HTML/Markdown preprocessors may produce
+/// elements with `placement: None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Placement {
+    /// 1-indexed page number on the source PDF.
+    pub page_number: u32,
+
+    /// Bounding box on the PDF page.
+    pub bounding_box: BoundingBox,
+
+    /// 0-indexed Y-band container index on the page (CR-16).
+    pub band: u32,
+
+    /// 0-indexed column identity within the band (CR-15).
+    pub column: u32,
+
+    /// Number of columns in this band (CR-16). Values > 2 suggest table-like content.
+    pub nr_band_columns: u32,
+
+    /// 0-indexed line number within the paragraph. From `data-line` on span.
+    pub line_number: u32,
+
+    /// 0-indexed segment number within the line. From `data-segment` on span.
+    pub segment_number: u32,
+
+    /// Text rotation in degrees: 0, 90, 180, 270. Non-zero when inside `<aside data-rotation="N">` (CR-10).
+    pub rotation: i32,
+
+    /// Tika's paragraph number within the page (per-page counter, reset each page).
+    /// This is a Y-gap heuristic — reliable for clean prose, less so for math/list content.
+    pub paragraph_number: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PdfTextElement {
     pub text: String,
-    pub style_info: FontClass, // Self-contained style information (no Option)
-    pub bounding_box: BoundingBox, // Required positioning (no Option)
-    pub page_number: u32,
-    pub paragraph_number: u32, // Which paragraph this belongs to
-    pub line_number: u32,      // data-line from XHTML
-    pub segment_number: u32,   // data-segment from XHTML
-    pub reading_order: u32,    // computed from line + segment
-    pub bookmark_match: Option<BookmarkSection>, // Full bookmark section if this span matches
-    pub token_count: usize,    // Pre-calculated token count for performance
-    // --- Enriched XHTML fields (CR-10, CR-15, CR-16, CR-17) ---
-    /// Rotation degrees from enclosing `<aside data-rotation="N">`. 0 when not inside an aside.
-    /// i32 to match Tika-side computeRotationDegrees and allow future negative values.
-    pub rotation: i32,
-    /// Column index from `data-column="K"` on the span itself. 0 when not present.
-    pub column: u32,
-    /// Band index from enclosing `<div class="band" data-band="N">`. 0 when not inside a band.
-    pub band: u32,
-    /// Number of columns in the enclosing band (`data-columns="K"`). 1 when not inside a band.
-    /// nr_ prefix signals this is a replicated band-level attribute, not a per-element identifier.
-    pub nr_band_columns: u32,
+    pub style_info: FontClass,
+    pub placement: Placement,                   // REPLACES: bounding_box, page_number,
+                                                //   paragraph_number, line_number,
+                                                //   segment_number, rotation, band,
+                                                //   column, nr_band_columns
+    pub reading_order: u32,
+    pub bookmark_match: Option<BookmarkSection>,
+    pub token_count: usize,
     /// Unrecognized XHTML tag fragments that are descendants of this span (any depth).
     /// Each entry is the full unparsed fragment including content text.
     /// Empty for all spans in current core Tika output. A future corpus-tier Tika JAR
     /// will emit <a href>, <annotation>, etc. here.
     pub raw_tags: Vec<String>,
+}
+
+impl PdfTextElement {
+    /// Bounding box of this element on the source PDF page.
+    pub fn bounding_box(&self) -> &BoundingBox {
+        &self.placement.bounding_box
+    }
+
+    /// 1-indexed page number on the source PDF.
+    pub fn page_number(&self) -> u32 {
+        self.placement.page_number
+    }
+
+    /// Text rotation in degrees.
+    pub fn rotation(&self) -> i32 {
+        self.placement.rotation
+    }
+
+    /// Band index from enclosing band div.
+    pub fn band(&self) -> u32 {
+        self.placement.band
+    }
+
+    /// Column index within the band.
+    pub fn column(&self) -> u32 {
+        self.placement.column
+    }
+
+    /// 0-indexed line number within the paragraph.
+    pub fn line_number(&self) -> u32 {
+        self.placement.line_number
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundingBox {
@@ -523,7 +577,7 @@ impl DocumentAnalysis {
             // Exclude rotated elements (rotation != 0) from font hierarchy statistics.
             // Rotated content (e.g. arxiv sidebar at rotation=90) corrupts most_common_font_size
             // and potential_header_sizes with non-body-flow sizes. CR-10 / Block 02.
-            if element.rotation != 0 {
+            if element.rotation() != 0 {
                 continue;
             }
 
@@ -638,13 +692,20 @@ pub struct ParsedPdfElement {
     pub text: String,
     pub hierarchy_level: u32,
     pub position: usize,
-    pub style_info: FontClass,     // Rich font data (no Option)
-    pub bounding_box: BoundingBox, // Always present positioning
-    pub page_number: u32,
-    pub paragraph_number: u32,                   // New: paragraph context
-    pub reading_order: u32,                      // New: spatial reading order
-    pub bookmark_match: Option<BookmarkSection>, // New: bookmark section data
-    pub token_count: usize,                      // Pre-calculated token count for performance
+    pub style_info: FontClass,
+    pub placement: Option<Placement>,            // REPLACES: bounding_box, page_number, paragraph_number
+                                                 // None for non-PDF sources (future HTML/Markdown).
+    pub reading_order: u32,
+    pub bookmark_match: Option<BookmarkSection>,
+    pub token_count: usize,
+}
+
+impl ParsedPdfElement {
+    /// Return the placement for PDF-sourced elements.
+    /// Panics with a clear message if called on a non-PDF element (placement is None).
+    pub fn pdf_placement(&self) -> &Placement {
+        self.placement.as_ref().expect("PDF-sourced ParsedPdfElement must have placement")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

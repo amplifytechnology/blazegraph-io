@@ -232,16 +232,16 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let cfg = &self.config.section_detection_v2;
 
         // Collect same-(band, column, line_number) neighbors
-        let band = element.band;
-        let col = element.column;
-        let line = element.line_number;
+        let band = element.band();
+        let col = element.column();
+        let line = element.line_number();
 
         let same_line: Vec<&PdfTextElement> = self
             .text_elements
             .iter()
             .enumerate()
             .filter(|(idx, e)| {
-                *idx != element_idx && e.band == band && e.column == col && e.line_number == line
+                *idx != element_idx && e.band() == band && e.column() == col && e.line_number() == line
             })
             .map(|(_, e)| e)
             .collect();
@@ -254,14 +254,14 @@ impl<'a> SectionDetectionV2Rule<'a> {
         }
 
         // Compute minimum X-gap between element and any neighbor
-        let elem_left = element.bounding_box.x;
-        let elem_right = element.bounding_box.x + element.bounding_box.width;
+        let elem_left = element.bounding_box().x;
+        let elem_right = element.bounding_box().x + element.bounding_box().width;
 
         let min_gap = same_line
             .iter()
             .map(|neighbor| {
-                let n_left = neighbor.bounding_box.x;
-                let n_right = neighbor.bounding_box.x + neighbor.bounding_box.width;
+                let n_left = neighbor.bounding_box().x;
+                let n_right = neighbor.bounding_box().x + neighbor.bounding_box().width;
                 // Gap between the two bboxes (positive = gap, negative = overlap)
                 let gap_left = n_left - elem_right; // neighbor is to the right
                 let gap_right = elem_left - n_right; // neighbor is to the left
@@ -279,14 +279,14 @@ impl<'a> SectionDetectionV2Rule<'a> {
     #[allow(dead_code)]
     fn is_isolated_by_ratio(&self, element: &PdfTextElement) -> bool {
         let cfg = &self.config.section_detection_v2;
-        let band = element.band;
-        let col = element.column;
+        let band = element.band();
+        let col = element.column();
 
         // Compute column width as max(x+width) − min(x) for all elements in this (band, col)
         let column_elements: Vec<&PdfTextElement> = self
             .text_elements
             .iter()
-            .filter(|e| e.band == band && e.column == col)
+            .filter(|e| e.band() == band && e.column() == col)
             .collect();
 
         if column_elements.is_empty() {
@@ -295,15 +295,15 @@ impl<'a> SectionDetectionV2Rule<'a> {
 
         let min_x = column_elements
             .iter()
-            .map(|e| e.bounding_box.x)
+            .map(|e| e.bounding_box().x)
             .fold(f32::INFINITY, f32::min);
         let max_right = column_elements
             .iter()
-            .map(|e| e.bounding_box.x + e.bounding_box.width)
+            .map(|e| e.bounding_box().x + e.bounding_box().width)
             .fold(f32::NEG_INFINITY, f32::max);
         let column_width = (max_right - min_x).max(1.0);
 
-        let text_width = element.bounding_box.width;
+        let text_width = element.bounding_box().width;
         text_width / column_width < cfg.isolation_threshold
     }
 
@@ -352,7 +352,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let element = &self.text_elements[element_idx];
 
         // §8: Rotated elements are never sections
-        if element.rotation != 0 {
+        if element.rotation() != 0 {
             return false;
         }
 
@@ -474,9 +474,7 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
                     hierarchy_level: 3,
                     position: i,
                     style_info: te.style_info.clone(),
-                    bounding_box: te.bounding_box.clone(),
-                    page_number: te.page_number,
-                    paragraph_number: te.paragraph_number,
+                    placement: Some(te.placement.clone()),
                     reading_order: te.reading_order,
                     bookmark_match: te.bookmark_match.clone(),
                     token_count: te.token_count,
