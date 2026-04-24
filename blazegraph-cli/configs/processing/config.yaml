@@ -17,9 +17,16 @@ pipeline:
     - name: "Validation"
       enabled: false
 section_detection_v2:
-  # Font size tolerance (points). A candidate is "strong" if font_size > body_size + this.
-  # At 0.1 everything above body auto-promotes. 1.5 requires a genuine size jump.
-  font_size_tolerance: 3.0
+  # Font size tolerance (points). Defines the ±tolerance band around body size.
+  # delta < -tolerance → REJECT; |delta| ≤ tolerance → Region 3 (at-body);
+  # tolerance < delta ≤ structural_size_margin → Region 2; delta > margin → Region 1 (auto).
+  font_size_tolerance: 1.0
+
+  # Points above body at which size alone promotes (Region 1 threshold: body + margin).
+  structural_size_margin: 5.0
+
+  # Proportional alternative: when set, Region 1 threshold = body * ratio (overrides margin).
+  structural_size_ratio: ~   # None
 
   # X-gap (points) to nearest same-line neighbor. Below this = NOT isolated (inline emphasis).
   isolation_neighbor_gap: 10.0

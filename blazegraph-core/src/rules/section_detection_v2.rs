@@ -117,20 +117,6 @@ impl HierarchyContext {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Candidate strength
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-enum CandidateStrength {
-    /// font_size > body_size + tolerance
-    Strong,
-    /// font_size ≈ body_size (within ±tolerance)
-    Weak,
-    /// font_size < body_size − tolerance → immediate reject
-    Reject,
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Rule struct
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -185,19 +171,6 @@ impl<'a> SectionDetectionV2Rule<'a> {
     // ──────────────────────────────────────────────────────────────────────
     // Signal helpers
     // ──────────────────────────────────────────────────────────────────────
-
-    /// Determine the candidate strength based on font size relative to body text.
-    fn candidate_strength(&self, font_size: f32) -> CandidateStrength {
-        let body = self.font_size_analysis.body_text_size;
-        let tol = self.config.section_detection_v2.font_size_tolerance;
-        if font_size > body + tol {
-            CandidateStrength::Strong
-        } else if font_size >= body - tol {
-            CandidateStrength::Weak
-        } else {
-            CandidateStrength::Reject
-        }
-    }
 
     /// Check whether an element's text has a sufficient alpha ratio.
     fn passes_alpha_ratio(&self, text: &str) -> bool {
@@ -339,15 +312,19 @@ impl<'a> SectionDetectionV2Rule<'a> {
 
     /// Core classification: returns `true` if the element should be a section after Pass 1.
     ///
-    /// Decision tree:
-    /// - Rotated → false (hard rule, §8)
-    /// - Strength == Reject → false
-    /// - Alpha ratio fails → false
-    /// - Strong + any confirming signal (bold OR isolated OR rare) → true
-    /// - Strong alone (no confirms) → true (size is authoritative)
-    /// - Weak + (bold AND isolated) → true
-    /// - Weak + (isolated AND rare) → true
-    /// - Weak alone → false
+    /// Four-region piecewise decision based on `delta = font_size - body_size`:
+    ///
+    /// - `delta < -tolerance`               → REJECT (below-body noise)
+    /// - `|delta| ≤ tolerance`              → Region 3 (at-body band):
+    ///                                         promote if isolated AND (bold OR rare)
+    /// - `tolerance < delta ≤ margin`       → Region 2 (moderate):
+    ///                                         promote if bold OR isolated
+    /// - `delta > margin`                   → Region 1 (large): auto-promote unconditionally
+    ///
+    /// Region 1 threshold is `body_size + structural_size_margin` by default,
+    /// or `body_size * structural_size_ratio` when a ratio is configured.
+    ///
+    /// Rotated elements are always rejected (§8).
     fn classify_pass1(&self, element_idx: usize) -> bool {
         let element = &self.text_elements[element_idx];
 
@@ -356,10 +333,14 @@ impl<'a> SectionDetectionV2Rule<'a> {
             return false;
         }
 
+        let cfg = &self.config.section_detection_v2;
+        let body_size = self.font_size_analysis.body_text_size;
         let font_size = element.style_info.font_size;
-        let strength = self.candidate_strength(font_size);
+        let tolerance = cfg.font_size_tolerance;
+        let delta = font_size - body_size;
 
-        if strength == CandidateStrength::Reject {
+        // REJECT: below body − tolerance
+        if delta < -tolerance {
             return false;
         }
 
@@ -368,22 +349,28 @@ impl<'a> SectionDetectionV2Rule<'a> {
             return false;
         }
 
+        // Region 1 threshold: body + margin (or body * ratio when configured)
+        let region1_threshold = match cfg.structural_size_ratio {
+            Some(ratio) => body_size * ratio,
+            None => body_size + cfg.structural_size_margin,
+        };
+
+        // Region 1: size alone is authoritative — auto-promote
+        if font_size > region1_threshold {
+            return true;
+        }
+
         let bold = Self::is_bold(element);
         let isolated = self.is_isolated(element_idx);
         let rare = self.is_rare_font(element);
 
-        match strength {
-            CandidateStrength::Strong => {
-                // Size is authoritative — a strong candidate is always a section.
-                // Confirming signals (bold / isolated / rare) add confidence but aren't required.
-                true
-            }
-            CandidateStrength::Weak => {
-                // Needs isolation plus at least one of: bold, rare.
-                // Equivalent to: (bold AND isolated) OR (isolated AND rare)
-                isolated && (bold || rare)
-            }
-            CandidateStrength::Reject => false, // already handled above
+        if delta > tolerance {
+            // Region 2 (moderate): one confirming signal required
+            bold || isolated
+        } else {
+            // Region 3 (at-body band): |delta| ≤ tolerance
+            // Needs isolation AND at least one font-distinctive signal
+            isolated && (bold || rare)
         }
     }
 
@@ -520,5 +507,344 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
 
     fn name(&self) -> &str {
         "SectionDetectionV2"
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unit tests — CR-19 four-region piecewise classification
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ParsingConfig, SectionDetectionV2Config};
+    use crate::rules::engine::FontSizeAnalysis;
+    use crate::types::{
+        BoundingBox, DocumentAnalysis, FontClass, Placement, PdfTextElement, StyleData,
+    };
+    use std::collections::HashMap;
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn make_placement(band: u32, column: u32, line_number: u32, rotation: i32) -> Placement {
+        Placement {
+            page_number: 1,
+            bounding_box: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 12.0,
+            },
+            band,
+            column,
+            nr_band_columns: 1,
+            line_number,
+            segment_number: 0,
+            rotation,
+            paragraph_number: 0,
+        }
+    }
+
+    fn make_element(
+        font_size: f32,
+        bold: bool,
+        class_name: &str,
+        line_number: u32,
+    ) -> PdfTextElement {
+        let font_weight = if bold {
+            "bold".to_string()
+        } else {
+            "normal".to_string()
+        };
+        PdfTextElement {
+            text: "Introduction".to_string(),
+            style_info: FontClass {
+                class_name: class_name.to_string(),
+                font_family: "TestFont".to_string(),
+                font_size,
+                font_style: "normal".to_string(),
+                font_weight,
+                color: "#000000".to_string(),
+            },
+            placement: make_placement(0, 0, line_number, 0),
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            raw_tags: vec![],
+        }
+    }
+
+    /// Standalone neighbour element sharing the same (band, column, line_number) as index 0.
+    fn make_neighbour(line_number: u32) -> PdfTextElement {
+        PdfTextElement {
+            text: "neighbour".to_string(),
+            style_info: FontClass {
+                class_name: "body".to_string(),
+                font_family: "TestFont".to_string(),
+                font_size: 10.0,
+                font_style: "normal".to_string(),
+                font_weight: "normal".to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Placement {
+                page_number: 1,
+                bounding_box: BoundingBox {
+                    x: 110.0, // right next to element at x=0, width=100 → gap = 10pt
+                    y: 0.0,
+                    width: 50.0,
+                    height: 12.0,
+                },
+                band: 0,
+                column: 0,
+                nr_band_columns: 1,
+                line_number,
+                segment_number: 1,
+                rotation: 0,
+                paragraph_number: 0,
+            },
+            reading_order: 1,
+            bookmark_match: None,
+            token_count: 1,
+            raw_tags: vec![],
+        }
+    }
+
+    fn make_font_analysis(body_size: f32, class_counts: Vec<(&str, usize)>) -> FontSizeAnalysis {
+        let mut class_usage_counts = HashMap::new();
+        for (name, count) in &class_counts {
+            class_usage_counts.insert(name.to_string(), *count);
+        }
+        FontSizeAnalysis {
+            body_text_size: body_size,
+            class_usage_counts,
+            ..FontSizeAnalysis::default()
+        }
+    }
+
+    fn make_config(
+        tolerance: f32,
+        margin: f32,
+        ratio: Option<f32>,
+        isolation_neighbor_gap: f32,
+    ) -> ParsingConfig {
+        let mut cfg = ParsingConfig::default();
+        cfg.section_detection_v2 = SectionDetectionV2Config {
+            font_size_tolerance: tolerance,
+            structural_size_margin: margin,
+            structural_size_ratio: ratio,
+            isolation_neighbor_gap,
+            font_rarity_threshold: 0.05, // < 5% → rare
+            ..SectionDetectionV2Config::default()
+        };
+        cfg
+    }
+
+    fn make_style_data() -> StyleData {
+        StyleData {
+            font_classes: HashMap::new(),
+        }
+    }
+
+    fn make_document_analysis() -> DocumentAnalysis {
+        DocumentAnalysis {
+            font_size_counts: HashMap::new(),
+            font_family_counts: HashMap::new(),
+            bold_counts: (0, 0),
+            italic_counts: (0, 0),
+            most_common_font_size: 10.0,
+            most_common_font_family: "TestFont".to_string(),
+            all_font_sizes: vec![],
+        }
+    }
+
+    /// Build a `SectionDetectionV2Rule` and call `classify_pass1` on index 0.
+    fn classify(
+        elements: &[PdfTextElement],
+        font_analysis: &FontSizeAnalysis,
+        config: &ParsingConfig,
+    ) -> bool {
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            elements,
+            config,
+            &document_analysis,
+            font_analysis,
+            &style_data,
+        );
+        rule.classify_pass1(0)
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// Test 1 — Region 1: auto-promotes without any confirming signals.
+    /// delta = 16 - 10 = 6 > margin (5) → Region 1 → true
+    #[test]
+    fn test_region1_auto_promotes_without_signals() {
+        let body = 10.0;
+        // element: 16pt, not bold, common font, isolated (no neighbours → line_number 0 unique)
+        let elements = vec![make_element(16.0, false, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 2 — Region 1 boundary: delta == margin is Region 2 (not Region 1).
+    /// delta = 15 - 10 = 5 = margin → font_size = 15 is NOT > region1_threshold (15) → Region 2
+    /// No bold, not isolated (has a neighbour within gap) → NOT promoted.
+    #[test]
+    fn test_region1_boundary_is_region2() {
+        let body = 10.0;
+        // Two elements share same line → element 0 is NOT isolated (gap = 10 < gap_cfg 20)
+        let elements = vec![
+            make_element(15.0, false, "body", 5),
+            make_neighbour(5), // same line, gap = 10pt < isolation_neighbor_gap 20 → not isolated
+        ];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 3 — Region 2: bold alone promotes.
+    /// delta = 13 - 10 = 3, tolerance = 1, margin = 5 → 1 < 3 < 5 → Region 2
+    /// bold = true → promoted
+    #[test]
+    fn test_region2_bold_alone_promotes() {
+        let body = 10.0;
+        let elements = vec![make_element(13.0, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 4 — Region 2: isolated alone promotes.
+    /// delta = 13 - 10 = 3, tolerance = 1, margin = 5 → Region 2
+    /// not bold, isolated (no same-line neighbours) → promoted
+    #[test]
+    fn test_region2_isolated_alone_promotes() {
+        let body = 10.0;
+        let elements = vec![make_element(13.0, false, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        // element is on a unique line (line 0, no neighbours) → is_isolated = true
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 5 — Region 2: neither bold nor isolated rejects (arXiv watermark shape).
+    /// delta = 3 → Region 2; not bold, has neighbour within gap → NOT promoted
+    #[test]
+    fn test_region2_neither_signal_rejects() {
+        let body = 10.0;
+        let elements = vec![
+            make_element(13.0, false, "body", 7),
+            make_neighbour(7), // shares line, gap 10 < gap_cfg 20 → not isolated
+        ];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 6 — Region 3: isolated AND bold promotes.
+    /// |delta| = |10.5 - 10| = 0.5 ≤ tolerance 1 → Region 3
+    /// isolated (unique line), bold → promoted
+    #[test]
+    fn test_region3_isolated_and_bold_promotes() {
+        let body = 10.0;
+        let elements = vec![make_element(10.5, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 7 — Region 3: isolated AND rare promotes (bold not required).
+    /// |delta| = 0.5 ≤ tolerance → Region 3; isolated, not bold, rare font → promoted
+    #[test]
+    fn test_region3_isolated_and_rare_promotes() {
+        let body = 10.0;
+        // "rare_font" appears 1/100 times = 1% < rarity_threshold 5% → rare
+        let elements = vec![make_element(10.5, false, "rare_font", 0)];
+        let font_analysis = make_font_analysis(
+            body,
+            vec![("rare_font", 1), ("body", 99)],
+        );
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 8 — Region 3: isolated alone does NOT promote.
+    /// |delta| ≤ tolerance, isolated, not bold, common font → NOT promoted
+    #[test]
+    fn test_region3_isolated_alone_does_not_promote() {
+        let body = 10.0;
+        // "body" = 90/100 = 90% → not rare
+        let elements = vec![make_element(10.5, false, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 90), ("other", 10)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 9 — Region 3: non-isolated bold does NOT promote.
+    /// |delta| ≤ tolerance, bold but has neighbour within gap → not isolated → NOT promoted
+    #[test]
+    fn test_region3_non_isolated_bold_does_not_promote() {
+        let body = 10.0;
+        let elements = vec![
+            make_element(10.5, true, "body", 3),
+            make_neighbour(3), // same line, gap 10 < 20 → not isolated
+        ];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 10 — Reject: below body − tolerance.
+    /// delta = 8 - 10 = -2 < -tolerance (-1) → REJECT regardless of signals
+    #[test]
+    fn test_reject_below_body_minus_tolerance() {
+        let body = 10.0;
+        let elements = vec![make_element(8.0, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// Test 11 — Proportional mode: structural_size_ratio overrides margin.
+    /// ratio = Some(1.5), body = 10 → threshold = 15.
+    /// 12pt: delta = 2 > tolerance 1, < threshold 15 → Region 2; not bold, isolated → promoted.
+    /// 16pt: delta = 6 > threshold 15... wait: font_size 16 > threshold 15 → Region 1 → promoted.
+    #[test]
+    fn test_proportional_ratio_overrides_margin() {
+        let body = 10.0;
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        // margin=0.1 so body+margin=10.1; ratio=Some(1.5) → threshold=15
+        // isolation_neighbor_gap = 20; elements at unique lines → isolated
+        let config = make_config(1.0, 0.1, Some(1.5), 20.0);
+
+        // 12pt: delta=2 > tolerance 1 → Region 2, isolated, not bold → promoted (isolated suffices)
+        let elements_12 = vec![make_element(12.0, false, "body", 0)];
+        assert!(classify(&elements_12, &font_analysis, &config));
+
+        // 16pt: font_size 16 > threshold 15 → Region 1 → promoted
+        let elements_16 = vec![make_element(16.0, false, "body", 0)];
+        assert!(classify(&elements_16, &font_analysis, &config));
+    }
+
+    /// Test 12 — arXiv watermark regression.
+    /// body=7pt, element=11pt, not bold, has same-line neighbour (gap<20) → not isolated,
+    /// common font, default config (margin=5.0, tolerance=1.0).
+    /// delta = 11 - 7 = 4, threshold = 7 + 5 = 12; 4 ≤ 5 (margin), 4 > 1 (tolerance) → Region 2.
+    /// Region 2: bold OR isolated → neither → NOT promoted.
+    #[test]
+    fn test_arxiv_watermark_regression() {
+        let body = 7.0;
+        let elements = vec![
+            make_element(11.0, false, "body", 9),
+            make_neighbour(9), // gap 10 < 20 → not isolated
+        ];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        assert!(!classify(&elements, &font_analysis, &config));
     }
 }

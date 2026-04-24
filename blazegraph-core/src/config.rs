@@ -626,8 +626,21 @@ pub struct SectionDetectionV2Config {
     /// class_usage / total_non_rotated_elements < this → rare.
     pub font_rarity_threshold: f32,
 
-    /// Font-size tolerance (points) for "same size as body".
+    /// Font-size tolerance (points). Defines the symmetric ±tolerance band around body size.
+    ///
+    /// - `delta < -tolerance` → REJECT (below-body noise).
+    /// - `|delta| ≤ tolerance` → Region 3 (at-body band): needs isolated AND (bold OR rare).
+    /// - `tolerance < delta ≤ structural_size_margin` → Region 2 (moderate): needs bold OR isolated.
+    /// - `delta > structural_size_margin` → Region 1 (large): auto-promote unconditionally.
     pub font_size_tolerance: f32,
+
+    /// Size margin (points) above body text at which size alone confirms structural role.
+    /// Region 1 threshold: delta > structural_size_margin → auto-promote.
+    pub structural_size_margin: f32,
+
+    /// Proportional alternative to structural_size_margin. When Some, Region 1 threshold
+    /// is body_size * ratio instead of body_size + margin. Default None (use margin).
+    pub structural_size_ratio: Option<f32>,
 
     /// Minimum alphabetic character ratio for a candidate to survive
     /// (inherits semantics from old rule's min_alpha_ratio).
@@ -654,6 +667,8 @@ impl Default for SectionDetectionV2Config {
             isolation_neighbor_gap: 20.0,
             font_rarity_threshold: 0.05,
             font_size_tolerance: 0.1,
+            structural_size_margin: 5.0,
+            structural_size_ratio: None,
             min_alpha_ratio: 0.5,
             max_depth: 6,
             enforce_max_depth: true,
