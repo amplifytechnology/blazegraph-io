@@ -187,8 +187,19 @@ impl<'a> SectionDetectionV2Rule<'a> {
     }
 
     /// Check whether the element is bold.
+    ///
+    /// CR-20: LaTeX PDFs encode bold in the font-family name rather than CSS font-weight.
+    /// Common patterns: "NimbusRomNo9L-Medi" (contains "medi"), "CMBX10" (contains "bx").
+    /// We check both fields to catch both CSS-based and LaTeX-encoded bold.
     fn is_bold(element: &PdfTextElement) -> bool {
-        element.style_info.font_weight.to_lowercase().contains("bold")
+        let weight = element.style_info.font_weight.to_lowercase();
+        if weight.contains("bold") {
+            return true;
+        }
+        let family = element.style_info.font_family.to_lowercase();
+        family.contains("bold")
+            || family.contains("medi")
+            || family.contains("bx")
     }
 
     /// Determine isolation using segment-based neighbor lookup.
@@ -204,7 +215,13 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let element = &self.text_elements[element_idx];
         let cfg = &self.config.section_detection_v2;
 
-        // Collect same-(band, column, line_number) neighbors
+        // Collect same-(page, band, column, line_number) neighbors.
+        //
+        // CR-21: `data-band` resets to 0 on each PDF page, so the same (band, col, line)
+        // triple can appear on multiple pages. Without the page predicate, an element on
+        // page 2 band=0 would incorrectly match watermark or header elements on page 1
+        // band=0, producing a computed gap of 0 and falsely marking it as non-isolated.
+        let page = element.page_number();
         let band = element.band();
         let col = element.column();
         let line = element.line_number();
@@ -214,7 +231,11 @@ impl<'a> SectionDetectionV2Rule<'a> {
             .iter()
             .enumerate()
             .filter(|(idx, e)| {
-                *idx != element_idx && e.band() == band && e.column() == col && e.line_number() == line
+                *idx != element_idx
+                    && e.page_number() == page
+                    && e.band() == band
+                    && e.column() == col
+                    && e.line_number() == line
             })
             .map(|(_, e)| e)
             .collect();
@@ -846,5 +867,198 @@ mod tests {
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         let config = make_config(1.0, 5.0, None, 20.0);
         assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    // ── CR-20 tests — bold detection font-family fallback ─────────────────────
+
+    /// Helper: build a PdfTextElement with explicit font_weight and font_family strings.
+    fn make_element_with_font(
+        font_size: f32,
+        font_weight: &str,
+        font_family: &str,
+        class_name: &str,
+        line_number: u32,
+    ) -> PdfTextElement {
+        PdfTextElement {
+            text: "Introduction".to_string(),
+            style_info: FontClass {
+                class_name: class_name.to_string(),
+                font_family: font_family.to_string(),
+                font_size,
+                font_style: "normal".to_string(),
+                font_weight: font_weight.to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: make_placement(0, 0, line_number, 0),
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            raw_tags: vec![],
+        }
+    }
+
+    /// CR-20 Test 1 — Regression: font_weight="bold" still detected as bold.
+    #[test]
+    fn test_bold_detected_via_font_weight() {
+        let element = make_element_with_font(12.0, "bold", "ArialMT", "h1", 0);
+        assert!(SectionDetectionV2Rule::is_bold(&element));
+    }
+
+    /// CR-20 Test 2 — LaTeX "Medi" family detected as bold (NimbusRomNo9L-Medi).
+    #[test]
+    fn test_bold_detected_via_medi_family() {
+        let element =
+            make_element_with_font(12.0, "normal", "NimbusRomNo9L-Medi", "latex-medi", 0);
+        assert!(SectionDetectionV2Rule::is_bold(&element));
+    }
+
+    /// CR-20 Test 3 — LaTeX "bx" family detected as bold (CMBX10).
+    #[test]
+    fn test_bold_detected_via_bx_family() {
+        let element = make_element_with_font(12.0, "normal", "CMBX10", "latex-bx", 0);
+        assert!(SectionDetectionV2Rule::is_bold(&element));
+    }
+
+    /// CR-20 Test 4 — Regular fonts are not bold: NimbusRomNo9L-Regu and CMR10.
+    #[test]
+    fn test_regular_font_not_bold() {
+        let regu = make_element_with_font(10.0, "normal", "NimbusRomNo9L-Regu", "body", 0);
+        assert!(!SectionDetectionV2Rule::is_bold(&regu));
+
+        let cmr = make_element_with_font(10.0, "normal", "CMR10", "body", 0);
+        assert!(!SectionDetectionV2Rule::is_bold(&cmr));
+    }
+
+    // ── CR-21 tests — page-scoped band matching ────────────────────────────────
+
+    /// Build a PdfTextElement with an explicit page number, x position, band, column, line.
+    fn make_element_on_page(
+        font_size: f32,
+        page_number: u32,
+        band: u32,
+        column: u32,
+        line_number: u32,
+        x: f32,
+    ) -> PdfTextElement {
+        PdfTextElement {
+            text: "1 Introduction".to_string(),
+            style_info: FontClass {
+                class_name: "section".to_string(),
+                font_family: "NimbusRomNo9L-Medi".to_string(),
+                font_size,
+                font_style: "normal".to_string(),
+                font_weight: "normal".to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Placement {
+                page_number,
+                bounding_box: BoundingBox {
+                    x,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 12.0,
+                },
+                band,
+                column,
+                nr_band_columns: 1,
+                line_number,
+                segment_number: 0,
+                rotation: 0,
+                paragraph_number: 0,
+            },
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 2,
+            raw_tags: vec![],
+        }
+    }
+
+    /// CR-21 Test 5 — Elements sharing (band=0, col=0, line=0) but on different pages
+    /// must NOT be treated as same-line neighbours. Target is index 1 (page 2).
+    /// Expected: isolated=true (page 1 element is ignored).
+    #[test]
+    fn test_isolation_cross_page_same_band_not_neighbours() {
+        let elements = vec![
+            // Page 1 — same band/col/line, x=110 (would create gap=10 → not isolated if counted)
+            make_element_on_page(12.0, 1, 0, 0, 0, 110.0),
+            // Page 2 — the target we're classifying, x=0
+            make_element_on_page(12.0, 2, 0, 0, 0, 0.0),
+        ];
+        let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
+        // isolation_neighbor_gap = 20: a gap of 10 would be < 20 → not isolated
+        let config = make_config(1.0, 5.0, None, 20.0);
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            &elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        // Index 1 is on page 2; page 1 element must not count as a neighbour
+        assert!(rule.is_isolated(1), "cross-page element must not be a neighbour");
+    }
+
+    /// CR-21 Test 6 — Same page, same (band=0, col=0, line=0), gap < isolation_neighbor_gap.
+    /// Expected: isolated=false (same-page behaviour preserved).
+    #[test]
+    fn test_isolation_same_page_same_band_are_neighbours() {
+        let elements = vec![
+            // Target at x=0, width=80 → right edge at 80
+            make_element_on_page(12.0, 1, 0, 0, 0, 0.0),
+            // Neighbour at x=90 → gap = 90 - 80 = 10 < 20
+            make_element_on_page(12.0, 1, 0, 0, 0, 90.0),
+        ];
+        let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            &elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        assert!(!rule.is_isolated(0), "same-page neighbour must suppress isolation");
+    }
+
+    /// CR-21 Test 7 — Simulate the "1 Introduction" / watermark collision.
+    /// Page 1 element at (band=0, col=0, line=0, x=124) — simulates a watermark.
+    /// Page 2 element at (band=0, col=0, line=0, x=108) — simulates "1 Introduction".
+    /// Without CR-21, the page 1 element would be counted as a same-line neighbour,
+    /// producing a gap of 0 (overlap) → isolated=false → section header rejected.
+    /// With CR-21, page 1 is excluded → no neighbours → isolated=true.
+    #[test]
+    fn test_isolation_introduction_scenario() {
+        let elements = vec![
+            // Page 1 watermark-like element
+            make_element_on_page(11.0, 1, 0, 0, 0, 124.0),
+            // Page 2 "1 Introduction"
+            make_element_on_page(11.0, 2, 0, 0, 0, 108.0),
+        ];
+        let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
+        let config = make_config(1.0, 5.0, None, 20.0);
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            &elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        // Page 2 element (index 1) must be isolated — page 1 element not a neighbour
+        assert!(
+            rule.is_isolated(1),
+            "page 2 introduction must be isolated despite page 1 band collision"
+        );
     }
 }
