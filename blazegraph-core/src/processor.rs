@@ -284,6 +284,7 @@ impl DocumentProcessor {
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
+        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
 
         println!(
             "📋 Stage 3: Graph captured ({} nodes)",
@@ -421,6 +422,7 @@ impl DocumentProcessor {
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data.clone();
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
+        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
 
         Ok(graph)
     }

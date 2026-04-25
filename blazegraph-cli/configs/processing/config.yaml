@@ -1,5 +1,19 @@
 document_type: Generic
 
+# Graph sanity-check-and-correction pipe (CR-28). Runs post-graph-build to
+# enforce structural invariants. Each invariant has a check (always-on
+# diagnostic) and a correct (config-gated rewrite) mode.
+graph_sanity:
+  enabled: true
+  invariants:
+    # node.depth = parent.depth + 1 for every non-root node.
+    # Correction strategy: BFS from root, recompute depth from topology.
+    # Fixes the §86-style depth drift caused by stack pollution during
+    # section detection (CR-27 wrap-line classification side-effect).
+    depth_consistency:
+      check: true
+      correct: true
+
 # Pipeline configuration - defines which rules to run and in what order
 # NEW APPROACH: Section detection FIRST, then spatial clustering
 pipeline:

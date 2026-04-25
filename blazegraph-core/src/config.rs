@@ -43,6 +43,11 @@ pub struct ParsingConfig {
     /// Uses `#[serde(default)]` so existing YAML configs without this key still deserialize.
     #[serde(default)]
     pub paragraph_clustering: ParagraphClusteringConfig,
+    /// Configuration for the graph sanity-check-and-correction pipe (CR-28).
+    /// Runs post-graph-build; defaults are safe (enabled with all invariants
+    /// in check + correct mode).
+    #[serde(default)]
+    pub graph_sanity: GraphSanityConfig,
 }
 
 // ─── ParagraphClustering config (Block 05b) ───────────────────────────────
@@ -694,6 +699,50 @@ pub struct TiebreakerKeyword {
     pub pattern: String,
 }
 
+// ─── CR-28 — Graph Sanity-Check-and-Correction Pipe ──────────────────────────
+
+/// Per-invariant gating: every sanity-check invariant has both a check mode
+/// (always-on diagnostic emission) and a correct mode (config-gated rewrite).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvariantToggle {
+    pub check: bool,
+    pub correct: bool,
+}
+
+impl Default for InvariantToggle {
+    fn default() -> Self {
+        Self { check: true, correct: true }
+    }
+}
+
+/// Set of invariants the graph sanity pipe enforces.
+/// Future invariants (childless pruning, repetition filter, etc.) will appear
+/// here as additional fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GraphSanityInvariants {
+    /// `node.depth = parent.depth + 1` for every non-root node.
+    /// Correction strategy: BFS from root, recompute depth.
+    pub depth_consistency: InvariantToggle,
+}
+
+/// Configuration for the graph sanity-check-and-correction pipe (CR-28).
+/// Runs after graph build to enforce structural invariants on the assembled
+/// graph. Each invariant has check + correct gating.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphSanityConfig {
+    pub enabled: bool,
+    pub invariants: GraphSanityInvariants,
+}
+
+impl Default for GraphSanityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            invariants: GraphSanityInvariants::default(),
+        }
+    }
+}
+
 impl Default for SectionDetectionV2Config {
     fn default() -> Self {
         Self {
@@ -817,6 +866,7 @@ impl ConfigManager {
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
             paragraph_clustering: ParagraphClusteringConfig::default(),
+            graph_sanity: GraphSanityConfig::default(),
         };
         self.configs
             .insert(DocumentType::AcademicPaper, academic_config);
@@ -870,6 +920,7 @@ impl ConfigManager {
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
             paragraph_clustering: ParagraphClusteringConfig::default(),
+            graph_sanity: GraphSanityConfig::default(),
         };
         self.configs
             .insert(DocumentType::LegalContract, legal_config);
@@ -916,6 +967,7 @@ impl ConfigManager {
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
             paragraph_clustering: ParagraphClusteringConfig::default(),
+            graph_sanity: GraphSanityConfig::default(),
         }
     }
 }
@@ -977,6 +1029,7 @@ impl Default for ParsingConfig {
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
             paragraph_clustering: ParagraphClusteringConfig::default(),
+            graph_sanity: GraphSanityConfig::default(),
         }
     }
 }
