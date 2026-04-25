@@ -85,6 +85,10 @@ section_detection_v2:
     - "(?i)^article\\s+\\d+[a-z]?\\s*$"
     - "(?i)^section\\s+\\d+[a-z]?\\s*$"
     - "(?i)^appendix\\s+[A-Z\\d]+\\s*$"
+    # Numbered academic sections — "1. Introduction", "2.3 Methods", etc.
+    # Isolation + length cap (20) prevents body-line false positives.
+    - "^\\d+\\.\\s+[A-Z]"
+    - "^\\d+\\.\\d+(\\.\\d+)*\\s+[A-Z]"
 
   # Maximum text length (characters) for an inclusion-pattern match to promote.
   # Defence in depth alongside the shape-anchored patterns above — caps any
