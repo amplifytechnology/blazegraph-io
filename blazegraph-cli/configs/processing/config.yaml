@@ -59,10 +59,23 @@ section_detection_v2:
   enforce_max_depth: true
   starting_section_level: 1
 
-  # Inclusion patterns: promote a weak/rejected candidate to section (e.g. numbered subsections).
+  # Inclusion patterns: promote a weak/rejected candidate to section when the regex
+  # matches AND the element is structurally isolated AND the text length is within
+  # `inclusion_max_length` (CR-26). Patterns require the keyword followed by an
+  # explicit identifier (number / Roman / letter) and an end-of-string anchor.
+  # This shape distinguishes real labels ("Article 64", "CHAPTER 4 – Other
+  # provisions") from body wrap-lines that begin with the keyword but continue
+  # with prose ("section 12(1) and Schedule 2", "article or offensive weapon.").
   inclusion_patterns:
-    - "^Chapter\\s+\\d+"
-    - "^Appendix\\s+[A-Z]"
+    - "(?i)^chapter\\s+[IVXLCDM\\d]+([\\s\\.\\-–—:].*)?\\s*$"
+    - "(?i)^article\\s+\\d+[a-z]?\\s*$"
+    - "(?i)^section\\s+\\d+[a-z]?\\s*$"
+    - "(?i)^appendix\\s+[A-Z\\d]+\\s*$"
+
+  # Maximum text length (characters) for an inclusion-pattern match to promote.
+  # Defence in depth alongside the shape-anchored patterns above — caps any
+  # accidentally-permissive future pattern at the structural-label scale.
+  inclusion_max_length: 20
 
   # Exclusion patterns: demote a promoted candidate (applied before inclusion).
   exclusion_patterns:
@@ -70,6 +83,21 @@ section_detection_v2:
     - "^Table\\s"
     - "^\\d+\\.?\\d*$" # bare numbers / decimals like "0.1", "4.92"
     - "^[\\d\\s\\.]+$" # rows of numbers (table data)
+
+  # Tiebreaker keywords (CR-27): identify the structural "tier" of a section.
+  # Consulted only when font-size delta vs. previous section is within tolerance
+  # (the tie). Same keyword → sibling. Different keyword present in stack → step
+  # back to that tier. New keyword → tiebreaker fires, push deeper.
+  # Order matters — first match wins; specific keywords before generic ones.
+  tiebreaker_keywords:
+    - { name: part,     pattern: "(?i)^part\\s+[IVXLCDM\\d]+" }
+    - { name: chapter,  pattern: "(?i)^chapter\\s+[IVXLCDM\\d]+" }
+    - { name: article,  pattern: "(?i)^article\\s+\\d+[a-z]?" }
+    - { name: section,  pattern: "(?i)^section\\s+\\d+[a-z]?" }
+    - { name: appendix, pattern: "(?i)^appendix\\s+[A-Z\\d]+" }
+    - { name: schedule, pattern: "(?i)^schedule\\s+\\d+" }
+    - { name: annex,    pattern: "(?i)^annex\\s+[IVX\\d]+" }
+    - { name: numbered, pattern: "^\\d+\\s+[A-Z]" }
 
 section_and_hierarchy:
   # Font size analysis parameters

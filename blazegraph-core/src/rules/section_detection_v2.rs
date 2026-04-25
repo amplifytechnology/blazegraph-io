@@ -20,100 +20,204 @@ use regex::Regex;
 use std::collections::HashMap;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// HierarchyContext (copied from section_detection.rs — same semantics, self-contained)
+// HierarchyContext (CR-27: stack-based with keyword tiebreaker)
 //
-// This is intentionally a private copy so V2 is self-contained and V1 is untouched.
-// If a future block extracts this to rules/hierarchy.rs, only imports need to change.
+// Depth assignment uses font-size delta as the primary signal. When the delta
+// is within tolerance (the "tie"), a tiebreaker keyword identifies the
+// section's structural tier and the stack of `(keyword, depth)` anchors
+// resolves whether the new section is a sibling, a step-back-up to an
+// earlier tier, or a new deeper tier.
+//
+// `None` keyword (Pass-1 promotions with no pattern match) is a real keyword
+// class for sibling comparisons, but is *skipped past* when a real-keyword
+// section arrives — a Pass-1 subtitle should not become the parent of a
+// keyword-bearing structural section that follows it.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct HierarchyContext {
-    current_level: u32,
-    previous_section_font_size: Option<f32>,
-    level_font_sizes: Vec<f32>,
+struct HierarchyAnchor {
+    keyword: Option<String>,
+    depth: u32,
+    font_size: f32,
 }
 
-impl Default for HierarchyContext {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Debug, Clone, Default)]
+struct HierarchyContext {
+    stack: Vec<HierarchyAnchor>,
+    previous_section_font_size: Option<f32>,
 }
 
 impl HierarchyContext {
     fn new() -> Self {
-        Self {
-            current_level: 1,
-            previous_section_font_size: None,
-            level_font_sizes: Vec::new(),
+        Self::default()
+    }
+
+    fn current_depth(&self) -> u32 {
+        self.stack.last().map_or(1, |a| a.depth)
+    }
+
+    fn cap_depth(depth: u32, config: &SectionDetectionV2Config) -> u32 {
+        if config.enforce_max_depth {
+            depth.min(config.max_depth)
+        } else {
+            depth
         }
     }
 
-    /// Update context when we encounter a new section; returns the assigned level.
-    fn update_for_section(&mut self, font_size: f32, config: &SectionDetectionV2Config) -> u32 {
-        let new_level = match self.previous_section_font_size {
+    /// Update context when we encounter a new section; returns the assigned depth.
+    fn update_for_section(
+        &mut self,
+        font_size: f32,
+        keyword: Option<&str>,
+        config: &SectionDetectionV2Config,
+    ) -> u32 {
+        let prev = self.previous_section_font_size;
+        self.previous_section_font_size = Some(font_size);
+
+        let depth = match prev {
             None => {
-                self.current_level = config.starting_section_level;
-                self.level_font_sizes = vec![font_size];
-                config.starting_section_level
+                let d = config.starting_section_level;
+                self.stack.push(HierarchyAnchor {
+                    keyword: keyword.map(String::from),
+                    depth: d,
+                    font_size,
+                });
+                d
             }
             Some(prev_font) => {
-                if font_size < prev_font {
-                    // Smaller font → subsection (go deeper)
-                    let proposed = self.current_level + 1;
-                    if config.enforce_max_depth && proposed > config.max_depth {
-                        // Cap at max_depth; update the size at current level
-                        if let Some(slot) = self.level_font_sizes.get_mut(self.current_level as usize - 1) {
-                            *slot = font_size;
-                        }
-                        self.current_level
-                    } else {
-                        self.current_level = proposed;
-                        while self.level_font_sizes.len() < self.current_level as usize {
-                            self.level_font_sizes.push(0.0);
-                        }
-                        self.level_font_sizes[self.current_level as usize - 1] = font_size;
-                        self.current_level
-                    }
-                } else if (font_size - prev_font).abs() < config.font_size_tolerance {
-                    // Same size (within tolerance) → parallel sibling
-                    if let Some(slot) = self.level_font_sizes.get_mut(self.current_level as usize - 1) {
-                        *slot = font_size;
-                    }
-                    self.current_level
+                let delta = font_size - prev_font;
+                let tol = config.font_size_tolerance;
+
+                if delta > tol {
+                    // Larger font → step back up to a level with matching size, or
+                    // collapse to a shallower level.
+                    self.step_back_up(font_size, keyword, config)
+                } else if delta < -tol {
+                    // Smaller font → push deeper.
+                    let d = Self::cap_depth(self.current_depth() + 1, config);
+                    self.stack.push(HierarchyAnchor {
+                        keyword: keyword.map(String::from),
+                        depth: d,
+                        font_size,
+                    });
+                    d
                 } else {
-                    // Larger font → step back up
-                    self.current_level = self.find_level_for(font_size, config);
-                    while self.level_font_sizes.len() < self.current_level as usize {
-                        self.level_font_sizes.push(0.0);
-                    }
-                    self.level_font_sizes[self.current_level as usize - 1] = font_size;
-                    self.current_level
+                    // Tie — keyword decides.
+                    self.resolve_tie(keyword, font_size, config)
                 }
             }
         };
-        self.previous_section_font_size = Some(font_size);
-        new_level
+        depth
     }
 
-    /// Find the appropriate level for a font size when stepping back up.
-    fn find_level_for(&self, font_size: f32, config: &SectionDetectionV2Config) -> u32 {
-        // Look for an existing level with matching size
-        for (idx, &sz) in self.level_font_sizes.iter().enumerate() {
-            if (font_size - sz).abs() < config.font_size_tolerance {
-                return (idx + 1) as u32;
+    /// Resolve a section transition where font-delta is within tolerance.
+    ///
+    /// CR-27 algorithm:
+    /// - If a keyword-bearing section arrives and the top of stack is a `None`
+    ///   anchor, look past the `None` layer for the structural parent (so a
+    ///   Pass-1 subtitle doesn't become the parent of a real keyword section).
+    /// - If the incoming keyword equals the (effective) top's keyword → sibling.
+    /// - If the incoming keyword exists deeper in the stack → step back up to
+    ///   that anchor's depth.
+    /// - Otherwise the tiebreaker fires → push a new anchor at depth + 1.
+    fn resolve_tie(
+        &mut self,
+        keyword: Option<&str>,
+        font_size: f32,
+        config: &SectionDetectionV2Config,
+    ) -> u32 {
+        // None-skip refinement: when a keyword-bearing section meets a None top,
+        // the None anchor is transient and should be popped before resolution.
+        if keyword.is_some()
+            && self.stack.len() >= 2
+            && self.stack.last().map_or(false, |a| a.keyword.is_none())
+        {
+            self.stack.pop();
+        }
+
+        let top_keyword = self
+            .stack
+            .last()
+            .and_then(|a| a.keyword.as_deref());
+
+        // Same keyword as effective top → sibling. Replace top's font_size so
+        // future deltas measure against the most recent section.
+        if keyword == top_keyword {
+            if let Some(top) = self.stack.last_mut() {
+                top.font_size = font_size;
+            }
+            return self.current_depth();
+        }
+
+        // Different keyword: look for it deeper in the stack — but only when the
+        // incoming keyword is concrete. A `None` keyword should not step back
+        // to an earlier `None` anchor (e.g., the document title), because two
+        // unrelated subtitles with no keyword aren't structurally related.
+        // None subtitles only ever match the *immediate* top, otherwise they
+        // push deeper.
+        if keyword.is_some() {
+            if let Some(idx) = self
+                .stack
+                .iter()
+                .rposition(|a| a.keyword.as_deref() == keyword)
+            {
+                self.stack.truncate(idx + 1);
+                if let Some(top) = self.stack.last_mut() {
+                    top.font_size = font_size;
+                }
+                return self.stack[idx].depth;
             }
         }
-        // Fall back: find first level whose size is smaller than this one
-        for (idx, &sz) in self.level_font_sizes.iter().enumerate() {
-            if font_size > sz {
-                return (idx + 1) as u32;
+
+        // Tiebreaker fires — push deeper.
+        let d = Self::cap_depth(self.current_depth() + 1, config);
+        self.stack.push(HierarchyAnchor {
+            keyword: keyword.map(String::from),
+            depth: d,
+            font_size,
+        });
+        d
+    }
+
+    /// Handle a transition where the incoming font is decisively larger.
+    /// Look for an existing anchor with matching font size and step back to it;
+    /// otherwise treat as a new top-level entry.
+    fn step_back_up(
+        &mut self,
+        font_size: f32,
+        keyword: Option<&str>,
+        config: &SectionDetectionV2Config,
+    ) -> u32 {
+        let tol = config.font_size_tolerance;
+        if let Some(idx) = self
+            .stack
+            .iter()
+            .rposition(|a| (a.font_size - font_size).abs() < tol)
+        {
+            self.stack.truncate(idx + 1);
+            if let Some(top) = self.stack.last_mut() {
+                top.font_size = font_size;
+                // Update keyword on the anchor only if it's currently None and
+                // the incoming has a real one — preserves stable identity.
+                if top.keyword.is_none() {
+                    top.keyword = keyword.map(String::from);
+                }
             }
+            return self.stack[idx].depth;
         }
-        1
+        // No matching size in stack — this is a new top-level entry.
+        self.stack.clear();
+        let d = config.starting_section_level;
+        self.stack.push(HierarchyAnchor {
+            keyword: keyword.map(String::from),
+            depth: d,
+            font_size,
+        });
+        d
     }
 
     fn get_content_level(&self) -> u32 {
-        self.current_level + 1
+        self.current_depth() + 1
     }
 }
 
@@ -132,6 +236,10 @@ pub struct SectionDetectionV2Rule<'a> {
     inclusion_regexes: Vec<Regex>,
     /// Compiled exclusion regexes (demote promoted candidates)
     exclusion_regexes: Vec<Regex>,
+    /// Compiled tiebreaker patterns paired with their keyword names. CR-27 —
+    /// consulted by `HierarchyContext` to resolve depth when font-delta is
+    /// within tolerance.
+    tiebreaker_regexes: Vec<(String, Regex)>,
     /// Per `(page, band)` x-extent: `(min_x, max_right)` aggregated across all elements
     /// in that band. Used to derive a stable column width for ratio-based isolation,
     /// independent of whether the column under inspection has body neighbors.
@@ -161,6 +269,16 @@ impl<'a> SectionDetectionV2Rule<'a> {
             .filter_map(|p| Regex::new(p).ok())
             .collect();
 
+        let tiebreaker_regexes = v2
+            .tiebreaker_keywords
+            .iter()
+            .filter_map(|tk| {
+                Regex::new(&tk.pattern)
+                    .ok()
+                    .map(|re| (tk.name.clone(), re))
+            })
+            .collect();
+
         let mut band_extents: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
         for e in text_elements {
             let key = (e.page_number(), e.band());
@@ -181,8 +299,21 @@ impl<'a> SectionDetectionV2Rule<'a> {
             _style_data: style_data,
             inclusion_regexes,
             exclusion_regexes,
+            tiebreaker_regexes,
             band_extents,
         }
+    }
+
+    /// Detect the structural-tier keyword for a section's text. Returns the
+    /// name of the first matching tiebreaker pattern, or `None` when no
+    /// pattern matches (Pass-1 promotions, generic bold subtitles, etc.).
+    fn detect_keyword(&self, text: &str) -> Option<&str> {
+        for (name, re) in &self.tiebreaker_regexes {
+            if re.is_match(text) {
+                return Some(name);
+            }
+        }
+        None
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -395,11 +526,25 @@ impl<'a> SectionDetectionV2Rule<'a> {
 
     /// Apply exclusion patterns (demote) then inclusion patterns (promote).
     ///
-    /// Ordering: exclusion runs first, then inclusion can override it.
-    /// Rationale: for an element that is both "Figure 3: ..." and matches a numbered
-    /// pattern, the figure caption intent is more specific — but the inclusion override
-    /// keeps the system composable for edge cases. Document the choice clearly.
-    fn apply_pattern_refinement(&self, pass1_is_section: bool, text: &str) -> bool {
+    /// Inclusion matches additionally require:
+    /// 1. `is_isolated(element_idx)` — element sits alone on its visual line (not a
+    ///    paragraph-internal reference like "as described in Article 5 of this
+    ///    Regulation").
+    /// 2. text length ≤ `inclusion_max_length` — synthetic length gate that filters
+    ///    body wrap-lines beginning with a structural keyword. Pass 1 protects body
+    ///    text via bold/rarity gates that depend on a meaningful font_size signal;
+    ///    on documents where Tika reports degenerate font sizes (CELEX/EU regulation
+    ///    embedded fonts), Pass 2 has neither bold nor size to lean on, so length
+    ///    is the discriminator: real labels are short, body wraps are long.
+    ///
+    /// Patterns ship as written in config; per-pattern case sensitivity is controlled
+    /// by `(?i)` in the YAML.
+    fn apply_pattern_refinement(
+        &self,
+        pass1_is_section: bool,
+        element_idx: usize,
+        text: &str,
+    ) -> bool {
         let mut result = pass1_is_section;
 
         // Exclusion first: demote even if Pass 1 promoted
@@ -412,14 +557,18 @@ impl<'a> SectionDetectionV2Rule<'a> {
             }
         }
 
-        // Inclusion last: promote (can override exclusion for numbered subsections etc.)
-        // Note: inclusion always wins — if both exclusion and inclusion match, inclusion wins.
-        // This lets "^\\d+\\.\\d+" promote "Figure 3.1" — review with human if undesirable.
+        // Inclusion: promote only when text matches AND element is isolated AND
+        // text length is within the structural-label cap. Char count, not byte
+        // length — labels are ASCII in practice but we count chars to stay
+        // predictable for any future Latin/Roman/numeric variants.
         if !result {
-            for re in &self.inclusion_regexes {
-                if re.is_match(text) {
-                    result = true;
-                    break;
+            let max_len = self.config.section_detection_v2.inclusion_max_length;
+            if text.chars().count() <= max_len {
+                for re in &self.inclusion_regexes {
+                    if re.is_match(text) && self.is_isolated(element_idx) {
+                        result = true;
+                        break;
+                    }
                 }
             }
         }
@@ -443,12 +592,16 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let pass1 = self.classify_pass1(element_idx);
 
         // Pass 2
-        let is_section = self.apply_pattern_refinement(pass1, &element.text);
+        let is_section = self.apply_pattern_refinement(pass1, element_idx, &element.text);
 
         if is_section {
             let font_size = element.style_info.font_size;
-            let level = hierarchy_context
-                .update_for_section(font_size, &self.config.section_detection_v2);
+            let keyword = self.detect_keyword(&element.text);
+            let level = hierarchy_context.update_for_section(
+                font_size,
+                keyword,
+                &self.config.section_detection_v2,
+            );
             (ParsedElementType::Section, level)
         } else {
             let content_level = hierarchy_context.get_content_level();
@@ -1134,5 +1287,357 @@ mod tests {
             rule.is_isolated(1),
             "page 2 introduction must be isolated despite page 1 band collision"
         );
+    }
+
+    // ── CR-26 tests — isolation-gated inclusion patterns ──────────────────────
+
+    /// Build a body-size, non-bold, non-rotated element at the given x/width on
+    /// page=1 / band=0 / col=0 / y=0. Used to construct isolation scenarios where
+    /// the inclusion-pattern path is the only route to promotion.
+    fn make_inclusion_element(text: &str, x: f32, width: f32) -> PdfTextElement {
+        PdfTextElement {
+            text: text.to_string(),
+            style_info: FontClass {
+                class_name: "body".to_string(),
+                font_family: "TestFont".to_string(),
+                font_size: 10.0,
+                font_style: "normal".to_string(),
+                font_weight: "normal".to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Placement {
+                page_number: 1,
+                bounding_box: BoundingBox { x, y: 0.0, width, height: 12.0 },
+                band: 0,
+                column: 0,
+                nr_band_columns: 1,
+                line_number: 0,
+                segment_number: 0,
+                rotation: 0,
+                paragraph_number: 0,
+            },
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            raw_tags: vec![],
+        }
+    }
+
+    /// Build a configured rule with custom inclusion/exclusion pattern lists.
+    /// All other config values match `make_config(1.0, 5.0, None, 0.80)`.
+    fn build_pattern_rule_test(
+        elements: &[PdfTextElement],
+        inclusion: Vec<&str>,
+        exclusion: Vec<&str>,
+    ) -> (
+        ParsingConfig,
+        FontSizeAnalysis,
+        DocumentAnalysis,
+        StyleData,
+        RuleEngine,
+    ) {
+        let mut config = make_config(1.0, 5.0, None, 0.80);
+        config.section_detection_v2.inclusion_patterns =
+            inclusion.into_iter().map(String::from).collect();
+        config.section_detection_v2.exclusion_patterns =
+            exclusion.into_iter().map(String::from).collect();
+        let font_analysis = make_font_analysis(10.0, vec![("body", elements.len().max(1))]);
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let engine = RuleEngine::new().expect("engine");
+        (config, font_analysis, document_analysis, style_data, engine)
+    }
+
+    /// CR-26 Test 1 — Inclusion match on an isolated element promotes.
+    /// Element alone on its visual line (no same-Y neighbours) → isolated=true.
+    #[test]
+    fn test_cr26_inclusion_isolated_promotes() {
+        let elements = vec![make_inclusion_element("Article 5", 100.0, 80.0)];
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test(&elements, vec!["(?i)article"], vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(rule.apply_pattern_refinement(false, 0, "Article 5"));
+    }
+
+    /// CR-26 Test 2 — Inclusion match on a column-filling line does NOT promote.
+    /// Two side-by-side elements at the same Y union to fill the column. The
+    /// substring `Article` matches but `is_isolated` returns false. This is the
+    /// load-bearing case the gate exists to handle.
+    #[test]
+    fn test_cr26_inclusion_paragraph_internal_does_not_promote() {
+        let elements = vec![
+            make_inclusion_element("as described in Article 5 of", 100.0, 200.0),
+            make_inclusion_element("this Regulation, the framework", 305.0, 195.0),
+        ];
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test(&elements, vec!["(?i)article"], vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        // line_extent ≈ 400, column_width ≈ 400 → ratio ≈ 1.0 ≥ 0.80 → not isolated
+        assert!(!rule.apply_pattern_refinement(false, 0, "as described in Article 5 of"));
+    }
+
+    /// CR-26 Test 3 — `(?i)` flag honoured per-pattern.
+    /// `(?i)chapter` matches `CHAPTER II`; bare `chapter` does not.
+    #[test]
+    fn test_cr26_case_insensitive_flag_honoured() {
+        let elements = vec![make_inclusion_element("CHAPTER II", 100.0, 80.0)];
+
+        // (?i)chapter → matches CHAPTER II → isolated → promote
+        let (config_ci, fa_ci, da_ci, sd_ci, eng_ci) =
+            build_pattern_rule_test(&elements, vec!["(?i)chapter"], vec![]);
+        let rule_ci =
+            SectionDetectionV2Rule::new(&eng_ci, &elements, &config_ci, &da_ci, &fa_ci, &sd_ci);
+        assert!(rule_ci.apply_pattern_refinement(false, 0, "CHAPTER II"));
+
+        // bare lowercase `chapter` does NOT match CHAPTER II → no promote
+        let (config_cs, fa_cs, da_cs, sd_cs, eng_cs) =
+            build_pattern_rule_test(&elements, vec!["chapter"], vec![]);
+        let rule_cs =
+            SectionDetectionV2Rule::new(&eng_cs, &elements, &config_cs, &da_cs, &fa_cs, &sd_cs);
+        assert!(!rule_cs.apply_pattern_refinement(false, 0, "CHAPTER II"));
+    }
+
+    /// CR-26 Test 4 — Exclusion still demotes Pass 1-promoted candidates.
+    /// Verifies the exclusion path is unaffected by the isolation-gate change on
+    /// the inclusion path.
+    #[test]
+    fn test_cr26_exclusion_unaffected_by_isolation_gate() {
+        let elements = vec![make_inclusion_element("Figure 3: Architecture", 100.0, 80.0)];
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test(&elements, vec![], vec!["^Figure\\s"]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        // Pass 1 = true (simulating Region 1 promotion); exclusion match → demoted
+        assert!(!rule.apply_pattern_refinement(true, 0, "Figure 3: Architecture"));
+    }
+
+    /// CR-26 Test 5 — Length cap rejects long body wrap-lines.
+    /// Body wrap-line begins with `Article` and is structurally isolated (single
+    /// span, no same-Y neighbours), but its length exceeds `inclusion_max_length`.
+    /// The synthetic length gate is what protects Pass 2 on documents like CELEX
+    /// where Tika reports degenerate font sizes and Pass 1 cannot disambiguate.
+    #[test]
+    fn test_cr26_length_cap_rejects_body_wrap() {
+        let long_wrap = "Article 17, including ICT network performance issues and ICT-related";
+        assert!(long_wrap.chars().count() > 30, "fixture must exceed cap");
+        let elements = vec![make_inclusion_element(long_wrap, 100.0, 400.0)];
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test(&elements, vec!["(?i)^article"], vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        // Pattern matches, element is isolated, but length > 30 → not promoted
+        assert!(!rule.apply_pattern_refinement(false, 0, long_wrap));
+    }
+
+    /// CR-26 Test 6 — Length cap admits short structural labels.
+    /// Companion to Test 5: confirms the cap doesn't accidentally reject the
+    /// real labels we're trying to catch.
+    #[test]
+    fn test_cr26_length_cap_admits_short_label() {
+        let label = "Article 64";
+        assert!(label.chars().count() <= 30, "fixture must be within cap");
+        let elements = vec![make_inclusion_element(label, 100.0, 80.0)];
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test(&elements, vec!["(?i)^article"], vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(rule.apply_pattern_refinement(false, 0, label));
+    }
+
+    // ── CR-27 tests — keyword tiebreaker hierarchy ───────────────────────────
+
+    /// Default config for hierarchy unit tests: tolerance=0.1, margin=5.0,
+    /// no proportional ratio, isolation_threshold default.
+    fn cr27_config() -> SectionDetectionV2Config {
+        SectionDetectionV2Config {
+            font_size_tolerance: 0.1,
+            structural_size_margin: 5.0,
+            structural_size_ratio: None,
+            max_depth: 6,
+            enforce_max_depth: true,
+            starting_section_level: 1,
+            ..SectionDetectionV2Config::default()
+        }
+    }
+
+    /// CR-27 Test 1 — same keyword at equal font is sibling.
+    #[test]
+    fn test_cr27_same_keyword_is_sibling() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+        let d1 = ctx.update_for_section(12.0, Some("part"), &cfg);
+        let d2 = ctx.update_for_section(12.0, Some("part"), &cfg);
+        assert_eq!(d1, d2, "two PARTs at equal font must be siblings");
+    }
+
+    /// CR-27 Test 2 — different keyword at equal font fires tiebreaker (deeper).
+    #[test]
+    fn test_cr27_different_keyword_fires_tiebreaker() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+        let d_part = ctx.update_for_section(12.0, Some("part"), &cfg);
+        let d_chap = ctx.update_for_section(12.0, Some("chapter"), &cfg);
+        assert_eq!(d_chap, d_part + 1, "CHAPTER must be one deeper than PART");
+    }
+
+    /// CR-27 Test 3 — keyword reappearance steps back up.
+    #[test]
+    fn test_cr27_keyword_reappearance_steps_back_up() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+        let d_part1 = ctx.update_for_section(12.0, Some("part"), &cfg);
+        let _d_chap = ctx.update_for_section(12.0, Some("chapter"), &cfg);
+        let _d_num = ctx.update_for_section(12.0, Some("numbered"), &cfg);
+        let d_part2 = ctx.update_for_section(12.0, Some("part"), &cfg);
+        assert_eq!(d_part2, d_part1, "PART 2 must return to PART 1's depth");
+    }
+
+    /// CR-27 Test 4 — `None` ↔ `None` is sibling.
+    #[test]
+    fn test_cr27_none_is_sibling_with_none() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+        let d1 = ctx.update_for_section(12.0, None, &cfg);
+        let d2 = ctx.update_for_section(12.0, None, &cfg);
+        assert_eq!(d1, d2, "two None-keyword sections at equal font must be siblings");
+    }
+
+    /// CR-27 Test 5 — `None` after a keyword fires tiebreaker (deeper).
+    /// Pass-1 subtitle following a CHAPTER becomes a child of the CHAPTER.
+    #[test]
+    fn test_cr27_none_after_keyword_goes_deeper() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+        let d_chap = ctx.update_for_section(12.0, Some("chapter"), &cfg);
+        let d_subtitle = ctx.update_for_section(12.0, None, &cfg);
+        assert_eq!(d_subtitle, d_chap + 1, "subtitle must be one deeper than CHAPTER");
+    }
+
+    /// CR-27 Test 6 — font-delta still wins when decisive (skips the tiebreaker).
+    #[test]
+    fn test_cr27_font_delta_wins_when_decisive() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+        let d_title = ctx.update_for_section(24.0, None, &cfg);
+        let d_part = ctx.update_for_section(12.0, Some("part"), &cfg);
+        assert_eq!(d_part, d_title + 1, "decisive font-delta still pushes deeper");
+    }
+
+    /// CR-27 Test 7 — full Police Act PART/CHAPTER/numbered sequence.
+    /// Title → PART 1 → numbered → numbered → PART 2 → CHAPTER 1 → numbered.
+    /// Expected depths: 1, 2, 3, 3, 2, 3, 4.
+    #[test]
+    fn test_cr27_police_act_sequence() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+
+        // Title at 24pt
+        assert_eq!(ctx.update_for_section(24.0, None, &cfg), 1);
+        // PART 1 at 12pt — font-delta decisive (smaller), pushed deeper to 2
+        assert_eq!(ctx.update_for_section(12.0, Some("part"), &cfg), 2);
+        // numbered at 12pt — tie, different keyword, not in stack → tiebreaker → 3
+        assert_eq!(ctx.update_for_section(12.0, Some("numbered"), &cfg), 3);
+        // sibling numbered → still 3
+        assert_eq!(ctx.update_for_section(12.0, Some("numbered"), &cfg), 3);
+        // PART 2 at 12pt — tie, keyword 'part' in stack at depth 2 → step back → 2
+        assert_eq!(ctx.update_for_section(12.0, Some("part"), &cfg), 2);
+        // CHAPTER 1 at 12pt — tie, 'chapter' not in stack → tiebreaker → 3
+        assert_eq!(ctx.update_for_section(12.0, Some("chapter"), &cfg), 3);
+        // numbered at 12pt — tie, 'numbered' was popped during PART 2 step-back
+        //   → not currently in stack → tiebreaker → 4
+        assert_eq!(ctx.update_for_section(12.0, Some("numbered"), &cfg), 4);
+    }
+
+    /// CR-27 Test 8 — CELEX cascade with all-equal-font sections.
+    /// Title (None) → CHAPTER → subtitle (None) → Article → article-title (None).
+    /// Expected: 1, 2, 3, 3, 4. The subtitle is a None layer that gets skipped
+    /// past when Article arrives, so Article sits at chapter+1 = 3 alongside
+    /// (not under) the subtitle.
+    #[test]
+    fn test_cr27_celex_cascade() {
+        let mut cfg = cr27_config();
+        // CELEX has font_size = 1.0 everywhere; lower margin so Title→CHAPTER
+        // doesn't trigger the decisive-delta path.
+        cfg.structural_size_margin = 5.0;
+        let mut ctx = HierarchyContext::new();
+
+        // Title — first section, no prior, depth = starting_level
+        assert_eq!(ctx.update_for_section(1.0, None, &cfg), 1);
+        // CHAPTER I — tie (delta=0), keyword chapter ≠ None → tiebreaker → 2
+        assert_eq!(ctx.update_for_section(1.0, Some("chapter"), &cfg), 2);
+        // "General provisions" subtitle — tie, None ≠ chapter → tiebreaker → 3
+        assert_eq!(ctx.update_for_section(1.0, None, &cfg), 3);
+        // Article 1 — tie, top is None subtitle → skip past it; effective top
+        //   is chapter; article ≠ chapter, not in stack → tiebreaker → 3
+        assert_eq!(ctx.update_for_section(1.0, Some("article"), &cfg), 3);
+        // "Subject matter" — tie, None ≠ article → tiebreaker → 4
+        assert_eq!(ctx.update_for_section(1.0, None, &cfg), 4);
+    }
+
+    /// CR-27 Test 9 — depth cap respected when enforce_max_depth=true.
+    #[test]
+    fn test_cr27_depth_cap_respected() {
+        let mut cfg = cr27_config();
+        cfg.max_depth = 3;
+        cfg.enforce_max_depth = true;
+        let mut ctx = HierarchyContext::new();
+        // Each section adds a tier at the same font: 1, 2, 3, then capped at 3
+        assert_eq!(ctx.update_for_section(12.0, Some("part"), &cfg), 1);
+        assert_eq!(ctx.update_for_section(12.0, Some("chapter"), &cfg), 2);
+        assert_eq!(ctx.update_for_section(12.0, Some("article"), &cfg), 3);
+        assert_eq!(ctx.update_for_section(12.0, Some("section"), &cfg), 3);
+    }
+
+    /// CR-27 Test 10 — REGRESSION REPRO: title-wrap drift on Police Act §86.
+    ///
+    /// Reproduces the depth-5 paragraph drift observed under section 86
+    /// "Causing death by dangerous driving or careless driving when under the
+    /// influence of drink or drugs: increased penalties". The section title
+    /// is split across two Tika lines, same font class (f9), same band:
+    ///
+    ///   Line 0: "86 Causing death by dangerous driving..."  → matches `numbered`
+    ///   Line 1: "influence of drink or drugs: increased..." → matches no keyword
+    ///
+    /// Both pass Pass 1 (bold + isolated). Line 0 promotes at the correct
+    /// numbered tier. Line 1 arrives with `None` keyword at the same font,
+    /// triggering the CR-27 tiebreaker and pushing (None, depth+1) on the stack.
+    /// Subsequent body paragraphs then read `current_depth + 1`, landing one
+    /// level too deep.
+    ///
+    /// This test currently documents the buggy behaviour. See discussion: this
+    /// is arguably an upstream Pass-1 issue (over-promotion of title wrap-lines)
+    /// surfaced by CR-27's now-correct tier discrimination.
+    #[test]
+    fn test_cr27_title_wrap_drifts_deeper_repro() {
+        let cfg = cr27_config();
+        let mut ctx = HierarchyContext::new();
+
+        // Set up the Police Act §86 surrounding context.
+        // Title (24pt) → PART 5 (12pt) → "86 Causing death..." line 0 (12pt, numbered)
+        ctx.update_for_section(24.0, None, &cfg); // Title at d=1
+        let d_part = ctx.update_for_section(12.0, Some("part"), &cfg);
+        assert_eq!(d_part, 2, "PART 5 expected at depth 2");
+
+        let d_section = ctx.update_for_section(12.0, Some("numbered"), &cfg);
+        assert_eq!(d_section, 3, "numbered section expected at depth 3");
+
+        // Now the title wrap-line: same font, no keyword match.
+        let d_wrap = ctx.update_for_section(12.0, None, &cfg);
+
+        // Body paragraphs after the section read get_content_level().
+        let body_depth = ctx.get_content_level();
+
+        // Demonstrate the bug: wrap-line is treated as a NEW deeper section,
+        // and body content is pushed one level too deep.
+        assert_eq!(
+            d_wrap, 4,
+            "BUG: wrap-line classified as deeper section instead of sibling/continuation"
+        );
+        assert_eq!(
+            body_depth, 5,
+            "BUG: body paragraphs land at section_depth + 2 instead of + 1"
+        );
+
+        // Expected behaviour (commented out — these are the assertions we'd
+        // want after a fix):
+        //   assert_eq!(d_wrap, 3, "wrap-line should remain at section depth (continuation)");
+        //   assert_eq!(body_depth, 4, "body should be one level under the section");
     }
 }

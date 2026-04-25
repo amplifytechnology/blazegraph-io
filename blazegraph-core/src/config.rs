@@ -659,11 +659,39 @@ pub struct SectionDetectionV2Config {
 
     /// Regex patterns that promote a weak/rejected candidate to a section
     /// (escape hatch — e.g., "^\\d+\\.\\d+" for numbered subsections).
+    /// Promotion additionally requires `is_isolated()` and a length cap
+    /// (`inclusion_max_length`) — see CR-26.
     pub inclusion_patterns: Vec<String>,
+
+    /// Maximum text length (in characters) for an inclusion-pattern match to
+    /// promote. Real structural labels ("Article 64", "CHAPTER II") are short;
+    /// body wrap-lines that happen to begin with a structural keyword are long.
+    /// This is the synthetic gate Pass 2 needs because, unlike Pass 1, it has
+    /// no bold/rarity confirming signal — pattern + isolation alone admit
+    /// recital wrap-lines on documents like CELEX where font_size is degenerate.
+    pub inclusion_max_length: usize,
 
     /// Regex patterns that demote a promoted candidate back to non-section
     /// (escape hatch — e.g., "^Figure\\s" for figure captions).
     pub exclusion_patterns: Vec<String>,
+
+    /// Ordered list of `(keyword_name, regex)` pairs that identify the structural
+    /// "tier" of a section. Consulted only when the font-size delta vs. the
+    /// previous section is within `font_size_tolerance` (the tie). When the tie
+    /// fires, keyword identity decides whether the new section is a sibling, a
+    /// step-back-up to an earlier tier, or a deeper tier.
+    ///
+    /// Order matters: the first matching pattern wins. Place specific keywords
+    /// before generic ones (e.g. structural words before bare-numbered).
+    pub tiebreaker_keywords: Vec<TiebreakerKeyword>,
+}
+
+/// Named tiebreaker pattern used by the hierarchy stack to classify the tier
+/// of a structural section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TiebreakerKeyword {
+    pub name: String,
+    pub pattern: String,
 }
 
 impl Default for SectionDetectionV2Config {
@@ -685,9 +713,20 @@ impl Default for SectionDetectionV2Config {
                 r"^Chapter\s+\d+".to_string(),
                 r"^Appendix\s+[A-Z]".to_string(),
             ],
+            inclusion_max_length: 30,
             exclusion_patterns: vec![
                 r"^Figure\s".to_string(),
                 r"^Table\s".to_string(),
+            ],
+            tiebreaker_keywords: vec![
+                TiebreakerKeyword { name: "part".into(),     pattern: r"(?i)^part\s+[IVXLCDM\d]+".into() },
+                TiebreakerKeyword { name: "chapter".into(),  pattern: r"(?i)^chapter\s+[IVXLCDM\d]+".into() },
+                TiebreakerKeyword { name: "article".into(),  pattern: r"(?i)^article\s+\d+[a-z]?".into() },
+                TiebreakerKeyword { name: "section".into(),  pattern: r"(?i)^section\s+\d+[a-z]?".into() },
+                TiebreakerKeyword { name: "appendix".into(), pattern: r"(?i)^appendix\s+[A-Z\d]+".into() },
+                TiebreakerKeyword { name: "schedule".into(), pattern: r"(?i)^schedule\s+\d+".into() },
+                TiebreakerKeyword { name: "annex".into(),    pattern: r"(?i)^annex\s+[IVX\d]+".into() },
+                TiebreakerKeyword { name: "numbered".into(), pattern: r"^\d+\s+[A-Z]".into() },
             ],
         }
     }
