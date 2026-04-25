@@ -614,13 +614,19 @@ impl Default for SizeEnforcerConfig {
 /// and font-rarity signals rather than gating them sequentially.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionDetectionV2Config {
-    /// Column-width ratio below which a line's text is considered isolated
-    /// (fallback for when segment information is unavailable).
+    /// Column-width ratio below which a visual line is considered isolated.
+    /// `line_extent / column_width < this` → isolated. The line extent is the union
+    /// of all bboxes sharing the candidate's `(page, band, column)` and Y-coordinate
+    /// (within `line_height_tolerance`). Short lines in wide columns are isolated;
+    /// lines that fill the column (mid-line emphasis, justified body, Tika overlay
+    /// spans for inline styling) are not.
     pub isolation_threshold: f32,
 
-    /// X-gap in points. If a candidate's nearest same-line neighbor segment
-    /// is closer than this, the candidate is NOT isolated.
-    pub isolation_neighbor_gap: f32,
+    /// Y-coordinate tolerance (points) for grouping bboxes onto the same visual line.
+    /// Two elements within `|Δy| < this` in the same `(page, band, column)` are
+    /// considered to be on the same baseline. Defaults to a value smaller than typical
+    /// inter-line spacing so consecutive lines do not merge.
+    pub line_height_tolerance: f32,
 
     /// Frequency ratio (0.0–1.0) below which a font class is "rare".
     /// class_usage / total_non_rotated_elements < this → rare.
@@ -663,8 +669,8 @@ pub struct SectionDetectionV2Config {
 impl Default for SectionDetectionV2Config {
     fn default() -> Self {
         Self {
-            isolation_threshold: 0.5,
-            isolation_neighbor_gap: 20.0,
+            isolation_threshold: 0.80,
+            line_height_tolerance: 3.0,
             font_rarity_threshold: 0.05,
             font_size_tolerance: 0.1,
             structural_size_margin: 5.0,

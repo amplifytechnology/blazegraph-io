@@ -17,6 +17,7 @@ use crate::config::{ParsingConfig, SectionDetectionV2Config};
 use crate::types::*;
 use anyhow::Result;
 use regex::Regex;
+use std::collections::HashMap;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HierarchyContext (copied from section_detection.rs — same semantics, self-contained)
@@ -131,6 +132,10 @@ pub struct SectionDetectionV2Rule<'a> {
     inclusion_regexes: Vec<Regex>,
     /// Compiled exclusion regexes (demote promoted candidates)
     exclusion_regexes: Vec<Regex>,
+    /// Per `(page, band)` x-extent: `(min_x, max_right)` aggregated across all elements
+    /// in that band. Used to derive a stable column width for ratio-based isolation,
+    /// independent of whether the column under inspection has body neighbors.
+    band_extents: HashMap<(u32, u32), (f32, f32)>,
 }
 
 impl<'a> SectionDetectionV2Rule<'a> {
@@ -156,6 +161,17 @@ impl<'a> SectionDetectionV2Rule<'a> {
             .filter_map(|p| Regex::new(p).ok())
             .collect();
 
+        let mut band_extents: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
+        for e in text_elements {
+            let key = (e.page_number(), e.band());
+            let bbox = e.bounding_box();
+            let entry = band_extents
+                .entry(key)
+                .or_insert((f32::INFINITY, f32::NEG_INFINITY));
+            entry.0 = entry.0.min(bbox.x);
+            entry.1 = entry.1.max(bbox.x + bbox.width);
+        }
+
         Self {
             _engine: engine,
             text_elements,
@@ -165,6 +181,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
             _style_data: style_data,
             inclusion_regexes,
             exclusion_regexes,
+            band_extents,
         }
     }
 
@@ -202,103 +219,79 @@ impl<'a> SectionDetectionV2Rule<'a> {
             || family.contains("bx")
     }
 
-    /// Determine isolation using segment-based neighbor lookup.
+    /// Determine isolation as a single geometric question:
+    /// **does the visual line this element sits on fill its column?**
     ///
-    /// Primary path: find all elements in `text_elements` that share the same
-    /// `(band, column, line_number)` as `element` (excluding `element` itself).
-    /// Compute the minimum X-gap between element's bbox and each neighbor's bbox.
-    /// If the gap is < `isolation_neighbor_gap`, the element is NOT isolated.
+    /// "Visual line" = all elements in the same `(page, band, column)` whose Y-coordinate
+    /// is within `line_height_tolerance` of `element.bounding_box.y`. Y is ground truth;
+    /// Tika's `data-line` counter is unreliable (resets per `<p>`, so a header and the
+    /// next paragraph's first body line collide on `line=0` even though they're at
+    /// different visual Y).
     ///
-    /// Fallback (when no same-line neighbors exist): use
-    /// `text_width / column_width < isolation_threshold`.
+    /// An element alone on its visual line → isolated (no other content sharing the
+    /// baseline). Otherwise compute the union extent of all bboxes on this line and
+    /// compare to `column_width = band_x_extent / nr_band_columns`. A short line in a
+    /// wide column is isolated; a line that fills the column is not (mid-line bold
+    /// emphasis, justified body, or Tika overlay-style spans for inline styling).
     fn is_isolated(&self, element_idx: usize) -> bool {
         let element = &self.text_elements[element_idx];
         let cfg = &self.config.section_detection_v2;
 
-        // Collect same-(page, band, column, line_number) neighbors.
-        //
-        // CR-21: `data-band` resets to 0 on each PDF page, so the same (band, col, line)
-        // triple can appear on multiple pages. Without the page predicate, an element on
-        // page 2 band=0 would incorrectly match watermark or header elements on page 1
-        // band=0, producing a computed gap of 0 and falsely marking it as non-isolated.
         let page = element.page_number();
         let band = element.band();
         let col = element.column();
-        let line = element.line_number();
+        let y = element.bounding_box().y;
+        let tol = cfg.line_height_tolerance;
 
-        let same_line: Vec<&PdfTextElement> = self
-            .text_elements
-            .iter()
-            .enumerate()
-            .filter(|(idx, e)| {
-                *idx != element_idx
-                    && e.page_number() == page
-                    && e.band() == band
-                    && e.column() == col
-                    && e.line_number() == line
-            })
-            .map(|(_, e)| e)
-            .collect();
+        let mut min_x = element.bounding_box().x;
+        let mut max_right = element.bounding_box().x + element.bounding_box().width;
+        let mut had_line_neighbor = false;
+        for (idx, n) in self.text_elements.iter().enumerate() {
+            if idx == element_idx
+                || n.page_number() != page
+                || n.band() != band
+                || n.column() != col
+                || (n.bounding_box().y - y).abs() >= tol
+            {
+                continue;
+            }
+            had_line_neighbor = true;
+            let n_left = n.bounding_box().x;
+            let n_right = n.bounding_box().x + n.bounding_box().width;
+            if n_left < min_x {
+                min_x = n_left;
+            }
+            if n_right > max_right {
+                max_right = n_right;
+            }
+        }
 
-        if same_line.is_empty() {
-            // No same-line neighbors — use fallback ratio if line info is meaningful
-            // (line_number == 0 can mean "not in a band", so always treat as isolated
-            // when there's nothing to compare against)
+        if !had_line_neighbor {
             return true;
         }
 
-        // Compute minimum X-gap between element and any neighbor
-        let elem_left = element.bounding_box().x;
-        let elem_right = element.bounding_box().x + element.bounding_box().width;
-
-        let min_gap = same_line
-            .iter()
-            .map(|neighbor| {
-                let n_left = neighbor.bounding_box().x;
-                let n_right = neighbor.bounding_box().x + neighbor.bounding_box().width;
-                // Gap between the two bboxes (positive = gap, negative = overlap)
-                let gap_left = n_left - elem_right; // neighbor is to the right
-                let gap_right = elem_left - n_right; // neighbor is to the left
-                gap_left.max(gap_right).max(0.0)
-            })
-            .fold(f32::INFINITY, f32::min);
-
-        min_gap >= cfg.isolation_neighbor_gap
+        let line_extent = max_right - min_x;
+        let column_width = self.column_width_for(page, band, element.placement.nr_band_columns);
+        if column_width <= 0.0 {
+            return false;
+        }
+        line_extent / column_width < cfg.isolation_threshold
     }
 
-    /// Fallback isolation: text_width / column_width < threshold.
-    /// Used when isolation_neighbor_gap check is inconclusive.
-    /// Kept for completeness; currently superseded by `is_isolated` which handles
-    /// the no-same-line-neighbors case by returning `true` (isolated).
-    #[allow(dead_code)]
-    fn is_isolated_by_ratio(&self, element: &PdfTextElement) -> bool {
-        let cfg = &self.config.section_detection_v2;
-        let band = element.band();
-        let col = element.column();
-
-        // Compute column width as max(x+width) − min(x) for all elements in this (band, col)
-        let column_elements: Vec<&PdfTextElement> = self
-            .text_elements
-            .iter()
-            .filter(|e| e.band() == band && e.column() == col)
-            .collect();
-
-        if column_elements.is_empty() {
-            return true; // No column context → assume isolated
+    /// Column width derived from band x-extent divided by `nr_band_columns`.
+    ///
+    /// Uses band extent (not per-column extent) so that a column containing only the
+    /// header still gets a meaningful denominator from sibling columns' content.
+    fn column_width_for(&self, page: u32, band: u32, nr_band_columns: u32) -> f32 {
+        let Some(&(min_x, max_right)) = self.band_extents.get(&(page, band)) else {
+            return 0.0;
+        };
+        let band_width = max_right - min_x;
+        if band_width <= 0.0 {
+            return 0.0;
         }
-
-        let min_x = column_elements
-            .iter()
-            .map(|e| e.bounding_box().x)
-            .fold(f32::INFINITY, f32::min);
-        let max_right = column_elements
-            .iter()
-            .map(|e| e.bounding_box().x + e.bounding_box().width)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let column_width = (max_right - min_x).max(1.0);
-
-        let text_width = element.bounding_box().width;
-        text_width / column_width < cfg.isolation_threshold
+        let nr_cols = nr_band_columns.max(1) as f32;
+        (band_width / nr_cols).max(1.0)
     }
 
     /// Check whether the element's font class is rare in the document.
@@ -647,14 +640,15 @@ mod tests {
         tolerance: f32,
         margin: f32,
         ratio: Option<f32>,
-        isolation_neighbor_gap: f32,
+        isolation_threshold: f32,
     ) -> ParsingConfig {
         let mut cfg = ParsingConfig::default();
         cfg.section_detection_v2 = SectionDetectionV2Config {
             font_size_tolerance: tolerance,
             structural_size_margin: margin,
             structural_size_ratio: ratio,
-            isolation_neighbor_gap,
+            isolation_threshold,
+            line_height_tolerance: 3.0,
             font_rarity_threshold: 0.05, // < 5% → rare
             ..SectionDetectionV2Config::default()
         };
@@ -709,7 +703,7 @@ mod tests {
         // element: 16pt, not bold, common font, isolated (no neighbours → line_number 0 unique)
         let elements = vec![make_element(16.0, false, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(classify(&elements, &font_analysis, &config));
     }
 
@@ -725,7 +719,7 @@ mod tests {
             make_neighbour(5), // same line, gap = 10pt < isolation_neighbor_gap 20 → not isolated
         ];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -737,7 +731,7 @@ mod tests {
         let body = 10.0;
         let elements = vec![make_element(13.0, true, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(classify(&elements, &font_analysis, &config));
     }
 
@@ -749,7 +743,7 @@ mod tests {
         let body = 10.0;
         let elements = vec![make_element(13.0, false, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -763,7 +757,7 @@ mod tests {
             make_neighbour(7), // shares line, gap 10 < gap_cfg 20 → not isolated
         ];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -775,7 +769,7 @@ mod tests {
         let body = 10.0;
         let elements = vec![make_element(10.5, true, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(classify(&elements, &font_analysis, &config));
     }
 
@@ -790,7 +784,7 @@ mod tests {
             body,
             vec![("rare_font", 1), ("body", 99)],
         );
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(classify(&elements, &font_analysis, &config));
     }
 
@@ -802,21 +796,28 @@ mod tests {
         // "body" = 90/100 = 90% → not rare
         let elements = vec![make_element(10.5, false, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 90), ("other", 10)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
     /// Test 9 — Region 3: non-isolated bold does NOT promote.
-    /// |delta| ≤ tolerance, bold but has neighbour within gap → not isolated → NOT promoted
+    /// |delta| ≤ tolerance, bold, column-filling AND has same-line neighbour →
+    /// fails both segment and width-ratio isolation → NOT promoted.
+    ///
+    /// Constructs an element wide enough to defeat the ratio check
+    /// (text_width=160 in a band of 200 → ratio 0.80 ≥ 0.75) and a same-line
+    /// neighbour at gap=10pt < `isolation_neighbor_gap` (20) to defeat the segment check.
     #[test]
     fn test_region3_non_isolated_bold_does_not_promote() {
         let body = 10.0;
-        let elements = vec![
-            make_element(10.5, true, "body", 3),
-            make_neighbour(3), // same line, gap 10 < 20 → not isolated
-        ];
+        let mut element = make_element(10.5, true, "body", 3);
+        element.placement.bounding_box.width = 160.0;
+        let mut neighbour = make_neighbour(3);
+        neighbour.placement.bounding_box.x = 170.0;
+        neighbour.placement.bounding_box.width = 30.0;
+        let elements = vec![element, neighbour];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -827,7 +828,7 @@ mod tests {
         let body = 10.0;
         let elements = vec![make_element(8.0, true, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -841,7 +842,7 @@ mod tests {
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         // margin=0.1 so body+margin=10.1; ratio=Some(1.5) → threshold=15
         // isolation_neighbor_gap = 20; elements at unique lines → isolated
-        let config = make_config(1.0, 0.1, Some(1.5), 20.0);
+        let config = make_config(1.0, 0.1, Some(1.5), 0.80);
 
         // 12pt: delta=2 > tolerance 1 → Region 2, isolated, bold → promoted (both signals)
         let elements_12 = vec![make_element(12.0, true, "body", 0)];
@@ -865,7 +866,7 @@ mod tests {
             make_neighbour(9), // gap 10 < 20 → not isolated
         ];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -986,7 +987,7 @@ mod tests {
         ];
         let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
         // isolation_neighbor_gap = 20: a gap of 10 would be < 20 → not isolated
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         let engine = RuleEngine::new().expect("engine");
         let document_analysis = make_document_analysis();
         let style_data = make_style_data();
@@ -1002,18 +1003,19 @@ mod tests {
         assert!(rule.is_isolated(1), "cross-page element must not be a neighbour");
     }
 
-    /// CR-21 Test 6 — Same page, same (band=0, col=0, line=0), gap < isolation_neighbor_gap.
-    /// Expected: isolated=false (same-page behaviour preserved).
+    /// Same page, same (page, band, col), same Y line — line-extent fills column.
+    /// Two side-by-side elements at the same Y union to fill the column width →
+    /// ratio ≥ isolation_threshold → not isolated.
     #[test]
     fn test_isolation_same_page_same_band_are_neighbours() {
         let elements = vec![
             // Target at x=0, width=80 → right edge at 80
             make_element_on_page(12.0, 1, 0, 0, 0, 0.0),
-            // Neighbour at x=90 → gap = 90 - 80 = 10 < 20
+            // Neighbour at x=90, width=80 → right edge at 170 (same Y=0)
             make_element_on_page(12.0, 1, 0, 0, 0, 90.0),
         ];
         let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         let engine = RuleEngine::new().expect("engine");
         let document_analysis = make_document_analysis();
         let style_data = make_style_data();
@@ -1025,7 +1027,79 @@ mod tests {
             &font_analysis,
             &style_data,
         );
-        assert!(!rule.is_isolated(0), "same-page neighbour must suppress isolation");
+        // line_extent = 170, band_x_extent = 170, nr_band_columns=1 → ratio = 1.0 ≥ 0.80
+        assert!(
+            !rule.is_isolated(0),
+            "same-Y neighbour fills column union → not isolated"
+        );
+    }
+
+    /// Line-extent Test A — Attention 3.1 / 3.2 shape regression.
+    /// Header alone on its Y line (a real section title) is isolated even when
+    /// the body block below shares the same `(page, band, col)` and Tika's
+    /// per-paragraph `data-line` collides. Y-coordinate is the ground truth.
+    #[test]
+    fn test_line_extent_isolated_when_alone_on_y_line() {
+        // Header at y=490, x=108, width=145 (≈ "3.1 Encoder and Decoder Stacks")
+        let mut header = make_element_on_page(9.0, 3, 2, 0, 0, 108.0);
+        header.placement.bounding_box.y = 490.0;
+        header.placement.bounding_box.width = 145.0;
+        // Body line below at y=510, fills column. Defines band x-extent.
+        let mut body = make_element_on_page(9.0, 3, 2, 0, 0, 108.0);
+        body.placement.bounding_box.y = 510.0;
+        body.placement.bounding_box.width = 402.0;
+        let elements = vec![header, body];
+        let font_analysis = make_font_analysis(9.0, vec![("section", 100)]);
+        let config = make_config(0.1, 5.0, None, 0.80);
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            &elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        // Header is alone on y=490 (body at y=510, gap=20 > tolerance=3) → isolated
+        assert!(rule.is_isolated(0));
+    }
+
+    /// Line-extent Test B — Tika overlapping-spans regression (QUIC "MUST" pattern).
+    /// When Tika emits an inline-styled word as a separate span overlapping a
+    /// base-font line, both spans share the same Y. Their union fills the column,
+    /// so neither is treated as isolated. This catches false positives where
+    /// mid-paragraph bold lead-ins (`Encoder:`) would otherwise be promoted.
+    #[test]
+    fn test_line_extent_rejects_overlapping_inline_span() {
+        // Base-font line at y=300 spanning the whole column
+        let mut base = make_element_on_page(9.0, 1, 0, 0, 0, 108.0);
+        base.placement.bounding_box.y = 300.0;
+        base.placement.bounding_box.width = 400.0;
+        // Overlapping inline-styled span at same Y, narrow
+        let mut overlay = make_element_on_page(9.0, 1, 0, 0, 0, 200.0);
+        overlay.placement.bounding_box.y = 300.0;
+        overlay.placement.bounding_box.width = 30.0;
+        let elements = vec![overlay, base];
+        let font_analysis = make_font_analysis(9.0, vec![("section", 50), ("body", 50)]);
+        let config = make_config(0.1, 5.0, None, 0.80);
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            &elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        // line_extent ≈ 400, column_width ≈ 400 → ratio ≈ 1.0 → not isolated
+        assert!(
+            !rule.is_isolated(0),
+            "inline-styled overlay span on a full-width line must not be isolated"
+        );
     }
 
     /// CR-21 Test 7 — Simulate the "1 Introduction" / watermark collision.
@@ -1043,7 +1117,7 @@ mod tests {
             make_element_on_page(11.0, 2, 0, 0, 0, 108.0),
         ];
         let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
-        let config = make_config(1.0, 5.0, None, 20.0);
+        let config = make_config(1.0, 5.0, None, 0.80);
         let engine = RuleEngine::new().expect("engine");
         let document_analysis = make_document_analysis();
         let style_data = make_style_data();

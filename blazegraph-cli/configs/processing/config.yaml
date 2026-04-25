@@ -28,17 +28,31 @@ section_detection_v2:
   # Proportional alternative: when set, Region 1 threshold = body * ratio (overrides margin).
   structural_size_ratio: ~ # None
 
-  # X-gap (points) to nearest same-line neighbor. Below this = NOT isolated (inline emphasis).
-  isolation_neighbor_gap: 33.0
+  # Y-coordinate tolerance (points) for grouping bboxes onto the same visual line.
+  # Smaller than typical inter-line spacing (~13pt at 9pt body) so consecutive lines
+  # do not merge. Y is ground truth — we deliberately ignore Tika's `data-line` counter
+  # because it resets per `<p>` and so collides across paragraphs in the same band.
+  line_height_tolerance: 3.0
 
-  # Column-width ratio fallback for isolation when segment info is unavailable.
-  isolation_threshold: 0.20
+  # Column-width ratio: line_extent / column_width < this → isolated.
+  # `line_extent` is the union of all bboxes sharing (page, band, column) at this Y.
+  # `column_width = band_x_extent / nr_band_columns`. Real headers on their own line
+  # score 0.2–0.5; lines containing body or mid-line emphasis fill the column at ≥0.85.
+  # NOTE: 0.80 is calibrated against attention-page-3 "3.2 Attention" (ratio 0.789)
+  # where Tika fabricates a 5-column band on a single-column page, deflating col_width.
+  # Statistical-page-geometry (handoff) will override nr_band_columns with the
+  # document-dominant count so this threshold can drop toward 0.6 once column
+  # inference is trustworthy.
+  isolation_threshold: 0.80
 
   # Font class frequency below this ratio is considered "rare" (structural).
   font_rarity_threshold: 0.00
 
   # Minimum alphabetic character ratio — filters math symbols and noise.
-  min_alpha_ratio: 0.8
+  # 0.7 keeps short numbered headers like "3.2 Attention" (9 alpha / 12 non-ws = 0.75)
+  # while still rejecting math/formula spans (typically <0.5 ASCII-alpha).
+  # Bare numeric content is rejected separately via exclusion_patterns.
+  min_alpha_ratio: 0.7
 
   # Hierarchy depth limits.
   max_depth: 6
