@@ -39,10 +39,13 @@ pub struct ParsingConfig {
     /// Uses `#[serde(default)]` so existing YAML configs without this key still deserialize.
     #[serde(default)]
     pub section_detection_v2: SectionDetectionV2Config,
-    /// Configuration for the ParagraphClustering rule (Block 05b).
-    /// Uses `#[serde(default)]` so existing YAML configs without this key still deserialize.
-    #[serde(default)]
-    pub paragraph_clustering: ParagraphClusteringConfig,
+    /// Configuration for the NodeTypeClustering rule (CR-29; Block 05b — renamed
+    /// from ParagraphClustering once Section started flowing through the same rule).
+    /// Uses `#[serde(default)]` so existing YAML configs without this key still
+    /// deserialize. Also accepts the legacy `paragraph_clustering:` block via the
+    /// migration shim on `NodeTypeClusteringConfig` deserialization (see below).
+    #[serde(default, alias = "paragraph_clustering")]
+    pub node_type_clustering: NodeTypeClusteringConfig,
     /// Configuration for the graph sanity-check-and-correction pipe (CR-28).
     /// Runs post-graph-build; defaults are safe (enabled with all invariants
     /// in check + correct mode).
@@ -50,47 +53,211 @@ pub struct ParsingConfig {
     pub graph_sanity: GraphSanityConfig,
 }
 
-// ─── ParagraphClustering config (Block 05b) ───────────────────────────────
+// ─── NodeTypeClustering config (CR-29; was ParagraphClustering) ───────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParagraphClusteringConfig {
-    /// Merge segments within the same (band, column, line_number, element_type).
-    /// Tika splits lines into segments by font class; segments on the same line
-    /// almost always read as one continuous text.
-    pub merge_segments: bool,              // default: true
-
-    /// Merge lines within the same (band, column, paragraph_number, element_type).
-    /// Uses Tika's Y-gap-based paragraph detection. Reliable for prose.
-    /// Implies merge_segments (auto-promote with warn if inconsistent).
-    pub merge_lines: bool,                 // default: true
-
-    /// Merge across columns within the same (band, element_type).
-    /// Ignores paragraph_number. DANGEROUS for prose — scrambles reading order
-    /// across column boundaries. Intended for table-like bands (nr_band_columns > 2).
-    /// Implies merge_lines.
-    pub merge_columns: bool,               // default: false
-
-    /// Merge across bands within the same (page, element_type). Rarely desirable.
-    /// Implies merge_columns.
-    pub merge_bands: bool,                 // default: false
-
-    /// Separator inserted between merged lines when nr_band_columns <= 2 (prose).
-    pub prose_line_separator: String,      // default: " "
-
-    /// Separator inserted between merged lines when nr_band_columns > 2 (table-like).
-    pub table_line_separator: String,      // default: "\n"
+/// Per-element-type clustering configuration. Each `ParsedElementType` has its
+/// own self-contained merge config — no shared defaults, no override inheritance.
+/// Adding a new element type to the pipeline (e.g. Table) requires explicitly
+/// adding a block here.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeTypeClusteringConfig {
+    pub section: NodeTypeMergeConfig,
+    pub paragraph: NodeTypeMergeConfig,
+    pub list: NodeTypeMergeConfig,
+    pub list_item: NodeTypeMergeConfig,
 }
 
-impl Default for ParagraphClusteringConfig {
+impl Default for NodeTypeClusteringConfig {
     fn default() -> Self {
         Self {
-            merge_segments: true,
-            merge_lines: true,
-            merge_columns: false,
-            merge_bands: false,
+            section: NodeTypeMergeConfig::default_section(),
+            paragraph: NodeTypeMergeConfig::default_paragraph(),
+            list: NodeTypeMergeConfig::default_paragraph(),
+            list_item: NodeTypeMergeConfig::default_paragraph(),
+        }
+    }
+}
+
+/// Merge configuration for one element type. Algorithm: partition coarsely at
+/// `(page, element_type)`, walk reading-order-sorted bucket, split into a new
+/// merge group whenever any constraint fails between consecutive elements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeTypeMergeConfig {
+    // ── Boundary constraints (split when violated between consecutive elements) ──
+
+    /// Require both elements be in the same Tika line (line_number equality).
+    #[serde(default)]
+    pub same_line: bool,
+
+    /// Require both elements be in the same Tika paragraph (paragraph_number equality).
+    /// `true` is the conservative prose-safe default.
+    #[serde(default)]
+    pub same_paragraph: bool,
+
+    /// Require both elements be in the same Tika band (band equality).
+    /// `false` allows cross-band merge — the multi-line section title case.
+    #[serde(default)]
+    pub same_band: bool,
+
+    /// Require both elements be in the same Tika column (column equality).
+    /// `true` for almost everything — cross-column merging scrambles reading order.
+    #[serde(default = "default_true")]
+    pub same_column: bool,
+
+    // ── Safety constraints ──────────────────────────────────────────────────────
+
+    /// Require both elements have equal `hierarchy_level`. Prevents a section
+    /// header and a sub-section header on the same page from merging just
+    /// because they share a band-collapsed bucket.
+    #[serde(default)]
+    pub same_depth: bool,
+
+    /// Maximum Y-gap (in points) between `last.bbox.bottom` and `current.bbox.top`.
+    /// `None` disables the proximity check. Geometric distance separates "one
+    /// logical title fragmented across bands" (small gap) from "two unrelated
+    /// nodes on the same page" (large gap).
+    #[serde(default)]
+    pub max_y_gap: Option<f32>,
+
+    // ── Output formatting ───────────────────────────────────────────────────────
+
+    /// Separator between merged elements crossing line boundaries when the
+    /// element's band has ≤2 columns (prose flows continuously).
+    #[serde(default = "default_prose_separator")]
+    pub prose_line_separator: String,
+
+    /// Separator between merged elements crossing line boundaries when the
+    /// element's band has >2 columns (table-like — preserve rows).
+    #[serde(default = "default_table_separator")]
+    pub table_line_separator: String,
+}
+
+fn default_prose_separator() -> String { " ".to_string() }
+fn default_table_separator() -> String { "\n".to_string() }
+
+impl NodeTypeMergeConfig {
+    /// Section default: cross-band merge enabled (multi-line title case), gated
+    /// on depth equality and proximity to prevent unrelated section collapse.
+    pub fn default_section() -> Self {
+        Self {
+            same_line: false,
+            same_paragraph: false,
+            same_band: false,
+            same_column: true,
+            same_depth: true,
+            max_y_gap: Some(50.0),
             prose_line_separator: " ".to_string(),
             table_line_separator: "\n".to_string(),
         }
+    }
+
+    /// Paragraph (and List / ListItem) default: conservative prose-safe.
+    /// Tika's paragraph_number is the reliable cluster signal; no cross-band
+    /// merging.
+    pub fn default_paragraph() -> Self {
+        Self {
+            same_line: false,
+            same_paragraph: true,
+            same_band: true,
+            same_column: true,
+            same_depth: false,
+            max_y_gap: None,
+            prose_line_separator: " ".to_string(),
+            table_line_separator: "\n".to_string(),
+        }
+    }
+}
+
+// ── Migration shim ───────────────────────────────────────────────────────────
+//
+// The original `paragraph_clustering:` YAML block used four cascade booleans
+// (merge_segments / merge_lines / merge_columns / merge_bands). When we encounter
+// that shape, translate it into the equivalent constraint set applied uniformly
+// to all four element types (matching pre-CR-29 behaviour exactly).
+
+impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserialize into a generic Value first so we can inspect the keys
+        // and pick the right shape. `untagged` enums don't work here because
+        // both legacy and new shapes have all-optional fields and would both
+        // match an empty mapping ambiguously.
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let mapping = value
+            .as_mapping()
+            .ok_or_else(|| serde::de::Error::custom(
+                "node_type_clustering: expected a mapping",
+            ))?;
+
+        // If any legacy cascade key is present, route to the migration shim.
+        let legacy_keys = ["merge_segments", "merge_lines", "merge_columns", "merge_bands"];
+        let is_legacy = legacy_keys
+            .iter()
+            .any(|k| mapping.contains_key(serde_yaml::Value::String((*k).to_string())));
+
+        if is_legacy {
+            #[derive(Deserialize)]
+            struct LegacyParagraphClustering {
+                #[serde(default = "default_true")]
+                merge_segments: bool,
+                #[serde(default = "default_true")]
+                merge_lines: bool,
+                #[serde(default)]
+                merge_columns: bool,
+                #[serde(default)]
+                merge_bands: bool,
+                #[serde(default = "default_prose_separator")]
+                prose_line_separator: String,
+                #[serde(default = "default_table_separator")]
+                table_line_separator: String,
+            }
+            let l: LegacyParagraphClustering = serde_yaml::from_value(value)
+                .map_err(serde::de::Error::custom)?;
+
+            // Translate cascade booleans → constraint set. The cascade rule is:
+            // higher levels imply all lower levels. Effective level = highest
+            // enabled flag. The constraint that splits on each level boundary
+            // is `same_X: true` for the level just above the effective one.
+            let unified = NodeTypeMergeConfig {
+                same_line:      l.merge_segments && !l.merge_lines && !l.merge_columns && !l.merge_bands,
+                same_paragraph: l.merge_lines     && !l.merge_columns && !l.merge_bands,
+                same_band:      !l.merge_bands,
+                same_column:    !l.merge_columns && !l.merge_bands,
+                same_depth: false,
+                max_y_gap: None,
+                prose_line_separator: l.prose_line_separator,
+                table_line_separator: l.table_line_separator,
+            };
+            return Ok(Self {
+                section: unified.clone(),
+                paragraph: unified.clone(),
+                list: unified.clone(),
+                list_item: unified,
+            });
+        }
+
+        // New shape: per-element-type blocks. Missing blocks fall back to the
+        // type's documented default.
+        #[derive(Deserialize)]
+        struct NewShape {
+            #[serde(default = "NodeTypeMergeConfig::default_section")]
+            section: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_paragraph")]
+            paragraph: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_paragraph")]
+            list: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_paragraph")]
+            list_item: NodeTypeMergeConfig,
+        }
+        let n: NewShape = serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            section: n.section,
+            paragraph: n.paragraph,
+            list: n.list,
+            list_item: n.list_item,
+        })
     }
 }
 
@@ -865,7 +1032,7 @@ impl ConfigManager {
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase - document type specific tuning
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
-            paragraph_clustering: ParagraphClusteringConfig::default(),
+            node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
         };
         self.configs
@@ -919,7 +1086,7 @@ impl ConfigManager {
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
-            paragraph_clustering: ParagraphClusteringConfig::default(),
+            node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
         };
         self.configs
@@ -966,7 +1133,7 @@ impl ConfigManager {
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
-            paragraph_clustering: ParagraphClusteringConfig::default(),
+            node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
         }
     }
@@ -1028,7 +1195,7 @@ impl Default for ParsingConfig {
             size_enforcer: SizeEnforcerConfig::default(),
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
-            paragraph_clustering: ParagraphClusteringConfig::default(),
+            node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
         }
     }

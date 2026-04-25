@@ -708,7 +708,7 @@ impl ParsedPdfElement {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ParsedElementType {
     Section,
     Paragraph,

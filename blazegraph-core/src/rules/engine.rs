@@ -4,7 +4,7 @@ use anyhow::Result;
 use regex::Regex;
 
 // Import rule types (only active rules)
-use super::paragraph_clustering::ParagraphClusteringRule;
+use super::node_type_clustering::NodeTypeClusteringRule;
 use super::section_detection::SectionAndHierarchyDetectionRule;
 use super::section_detection_v2::SectionDetectionV2Rule;
 use super::spatial_clustering::SpatialClusteringRule;
@@ -260,9 +260,11 @@ impl RuleEngine {
     ) -> Result<Vec<ParsedPdfElement>> {
         let rule_start = std::time::Instant::now();
         let result = match rule_name {
-            "ParagraphClustering" => {
-                println!("🧩 APPLYING PARAGRAPH CLUSTERING...");
-                let rule = ParagraphClusteringRule::new(
+            "NodeTypeClustering" | "ParagraphClustering" => {
+                // Accept the legacy "ParagraphClustering" pipeline name for
+                // backward compatibility with older config.yaml files.
+                println!("🧩 APPLYING NODE TYPE CLUSTERING...");
+                let rule = NodeTypeClusteringRule::new(
                     self,
                     text_elements,
                     config,
@@ -271,7 +273,7 @@ impl RuleEngine {
                     style_data,
                 );
                 let result = rule.apply(elements)?;
-                debug_pipeline_elements("ParagraphClustering", &result, &self.debug_config);
+                debug_pipeline_elements("NodeTypeClustering", &result, &self.debug_config);
                 Ok(result)
             }
             "SpatialClustering" => {

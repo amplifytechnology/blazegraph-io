@@ -24,7 +24,7 @@ pipeline:
       enabled: false
     - name: "ListDetection"
       enabled: false
-    - name: "ParagraphClustering"
+    - name: "NodeTypeClustering"
       enabled: true
     - name: "SizeEnforcer"
       enabled: false
@@ -37,7 +37,7 @@ section_detection_v2:
   font_size_tolerance: 0.1
 
   # Points above body at which size alone promotes (Region 1 threshold: body + margin).
-  structural_size_margin: 2.0
+  structural_size_margin: 1.5
 
   # Proportional alternative: when set, Region 1 threshold = body * ratio (overrides margin).
   structural_size_ratio: ~ # None
@@ -85,10 +85,6 @@ section_detection_v2:
     - "(?i)^article\\s+\\d+[a-z]?\\s*$"
     - "(?i)^section\\s+\\d+[a-z]?\\s*$"
     - "(?i)^appendix\\s+[A-Z\\d]+\\s*$"
-    # Numbered academic sections — "1. Introduction", "2.3 Methods", etc.
-    # Isolation + length cap (20) prevents body-line false positives.
-    - "^\\d+\\.\\s+[A-Z]"
-    - "^\\d+\\.\\d+(\\.\\d+)*\\s+[A-Z]"
 
   # Maximum text length (characters) for an inclusion-pattern match to promote.
   # Defence in depth alongside the shape-anchored patterns above — caps any
@@ -108,14 +104,74 @@ section_detection_v2:
   # back to that tier. New keyword → tiebreaker fires, push deeper.
   # Order matters — first match wins; specific keywords before generic ones.
   tiebreaker_keywords:
-    - { name: part,     pattern: "(?i)^part\\s+[IVXLCDM\\d]+" }
-    - { name: chapter,  pattern: "(?i)^chapter\\s+[IVXLCDM\\d]+" }
-    - { name: article,  pattern: "(?i)^article\\s+\\d+[a-z]?" }
-    - { name: section,  pattern: "(?i)^section\\s+\\d+[a-z]?" }
+    - { name: part, pattern: "(?i)^part\\s+[IVXLCDM\\d]+" }
+    - { name: chapter, pattern: "(?i)^chapter\\s+[IVXLCDM\\d]+" }
+    - { name: article, pattern: "(?i)^article\\s+\\d+[a-z]?" }
+    - { name: section, pattern: "(?i)^section\\s+\\d+[a-z]?" }
     - { name: appendix, pattern: "(?i)^appendix\\s+[A-Z\\d]+" }
     - { name: schedule, pattern: "(?i)^schedule\\s+\\d+" }
-    - { name: annex,    pattern: "(?i)^annex\\s+[IVX\\d]+" }
+    - { name: annex, pattern: "(?i)^annex\\s+[IVX\\d]+" }
     - { name: numbered, pattern: "^\\d+\\s+[A-Z]" }
+
+# Node type clustering (CR-29) — merges fragmented Tika elements into the
+# logical lines/paragraphs/sections they came from. Runs after SectionDetectionV2.
+#
+# Algorithm: partition coarsely at (page, element_type), then walk the bucket
+# in reading order and split into a new merge group whenever any constraint
+# fails between consecutive elements. Each ParsedElementType has its own
+# self-contained config — no shared defaults.
+#
+# Constraints (split when violated):
+#   same_line       — Tika line_number equality
+#   same_paragraph  — Tika paragraph_number equality (Y-gap-based; reliable for prose)
+#   same_band       — Tika band equality
+#   same_column     — Tika column equality (almost always required)
+#   same_depth      — hierarchy_level equality (safety against unrelated cross-band merges)
+#   max_y_gap       — points; null disables. Geometric proximity check.
+node_type_clustering:
+  section:
+    # Cross-band merge enabled — multi-line chapter titles routinely split into
+    # separate Tika bands. Safety: depth equality + 50pt proximity prevent
+    # collapsing unrelated section nodes that happen to share a page.
+    same_line: false
+    same_paragraph: false
+    same_band: false
+    same_column: true
+    same_depth: true
+    max_y_gap: 50.0
+    prose_line_separator: " "
+    table_line_separator: "\n"
+
+  paragraph:
+    # Conservative prose-safe: Tika's paragraph_number is the reliable signal.
+    same_line: false
+    same_paragraph: true
+    same_band: true
+    same_column: true
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: " "
+    table_line_separator: "\n"
+
+  list:
+    same_line: false
+    same_paragraph: true
+    same_band: true
+    same_column: true
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: " "
+    table_line_separator: "\n"
+
+  list_item:
+    same_line: false
+    same_paragraph: true
+    same_band: true
+    same_column: true
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: " "
+    table_line_separator: "\n"
 
 section_and_hierarchy:
   # Font size analysis parameters
