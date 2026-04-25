@@ -386,8 +386,9 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let rare = self.is_rare_font(element);
 
         if delta > tolerance {
-            // Region 2 (moderate): one confirming signal required
-            bold || isolated
+            // Region 2 (moderate): both signals required — bold-only or isolated-only is
+            // insufficient; non-bold body text that happens to be column-isolated must not promote.
+            bold && isolated
         } else {
             // Region 3 (at-body band): |delta| ≤ tolerance
             // Needs isolation AND at least one font-distinctive signal
@@ -740,17 +741,16 @@ mod tests {
         assert!(classify(&elements, &font_analysis, &config));
     }
 
-    /// Test 4 — Region 2: isolated alone promotes.
+    /// Test 4 — Region 2: isolated alone no longer promotes (AND semantics).
     /// delta = 13 - 10 = 3, tolerance = 1, margin = 5 → Region 2
-    /// not bold, isolated (no same-line neighbours) → promoted
+    /// not bold, isolated (no same-line neighbours) → NOT promoted (bold AND isolated required)
     #[test]
-    fn test_region2_isolated_alone_promotes() {
+    fn test_region2_isolated_alone_does_not_promote() {
         let body = 10.0;
         let elements = vec![make_element(13.0, false, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         let config = make_config(1.0, 5.0, None, 20.0);
-        // element is on a unique line (line 0, no neighbours) → is_isolated = true
-        assert!(classify(&elements, &font_analysis, &config));
+        assert!(!classify(&elements, &font_analysis, &config));
     }
 
     /// Test 5 — Region 2: neither bold nor isolated rejects (arXiv watermark shape).
@@ -833,8 +833,8 @@ mod tests {
 
     /// Test 11 — Proportional mode: structural_size_ratio overrides margin.
     /// ratio = Some(1.5), body = 10 → threshold = 15.
-    /// 12pt: delta = 2 > tolerance 1, < threshold 15 → Region 2; not bold, isolated → promoted.
-    /// 16pt: delta = 6 > threshold 15... wait: font_size 16 > threshold 15 → Region 1 → promoted.
+    /// 12pt: delta = 2 > tolerance 1, < threshold 15 → Region 2; bold + isolated → promoted.
+    /// 16pt: font_size 16 > threshold 15 → Region 1 → promoted.
     #[test]
     fn test_proportional_ratio_overrides_margin() {
         let body = 10.0;
@@ -843,8 +843,8 @@ mod tests {
         // isolation_neighbor_gap = 20; elements at unique lines → isolated
         let config = make_config(1.0, 0.1, Some(1.5), 20.0);
 
-        // 12pt: delta=2 > tolerance 1 → Region 2, isolated, not bold → promoted (isolated suffices)
-        let elements_12 = vec![make_element(12.0, false, "body", 0)];
+        // 12pt: delta=2 > tolerance 1 → Region 2, isolated, bold → promoted (both signals)
+        let elements_12 = vec![make_element(12.0, true, "body", 0)];
         assert!(classify(&elements_12, &font_analysis, &config));
 
         // 16pt: font_size 16 > threshold 15 → Region 1 → promoted
@@ -856,7 +856,7 @@ mod tests {
     /// body=7pt, element=11pt, not bold, has same-line neighbour (gap<20) → not isolated,
     /// common font, default config (margin=5.0, tolerance=1.0).
     /// delta = 11 - 7 = 4, threshold = 7 + 5 = 12; 4 ≤ 5 (margin), 4 > 1 (tolerance) → Region 2.
-    /// Region 2: bold OR isolated → neither → NOT promoted.
+    /// Region 2: bold AND isolated → neither → NOT promoted.
     #[test]
     fn test_arxiv_watermark_regression() {
         let body = 7.0;

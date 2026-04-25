@@ -20,19 +20,19 @@ section_detection_v2:
   # Font size tolerance (points). Defines the ±tolerance band around body size.
   # delta < -tolerance → REJECT; |delta| ≤ tolerance → Region 3 (at-body);
   # tolerance < delta ≤ structural_size_margin → Region 2; delta > margin → Region 1 (auto).
-  font_size_tolerance: 1.0
+  font_size_tolerance: 0.1
 
   # Points above body at which size alone promotes (Region 1 threshold: body + margin).
-  structural_size_margin: 5.0
+  structural_size_margin: 2.0
 
   # Proportional alternative: when set, Region 1 threshold = body * ratio (overrides margin).
-  structural_size_ratio: ~   # None
+  structural_size_ratio: ~ # None
 
   # X-gap (points) to nearest same-line neighbor. Below this = NOT isolated (inline emphasis).
-  isolation_neighbor_gap: 10.0
+  isolation_neighbor_gap: 33.0
 
   # Column-width ratio fallback for isolation when segment info is unavailable.
-  isolation_threshold: 0.33
+  isolation_threshold: 0.20
 
   # Font class frequency below this ratio is considered "rare" (structural).
   font_rarity_threshold: 0.00
@@ -47,8 +47,6 @@ section_detection_v2:
 
   # Inclusion patterns: promote a weak/rejected candidate to section (e.g. numbered subsections).
   inclusion_patterns:
-    - "^\\d+\\.\\s+[A-Z]" # "1. Introduction", "3. Model..." — number + space + capital word
-    - "^\\d+\\.\\d+\\.?\\s+[A-Z]" # "3.1 Encoder", "3.2.1 Scaled..." — subsection + capital
     - "^Chapter\\s+\\d+"
     - "^Appendix\\s+[A-Z]"
 
