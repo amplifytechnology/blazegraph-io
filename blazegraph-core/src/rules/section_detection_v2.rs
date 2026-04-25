@@ -179,9 +179,19 @@ impl HierarchyContext {
         d
     }
 
-    /// Handle a transition where the incoming font is decisively larger.
-    /// Look for an existing anchor with matching font size and step back to it;
-    /// otherwise treat as a new top-level entry.
+    /// Handle a transition where the incoming font is decisively larger than
+    /// the previous section's font. Search strategy mirrors V1's `find_level_for`:
+    ///
+    /// 1. Exact font-size match in the stack → step back to that anchor.
+    /// 2. Else, find the *shallowest* anchor whose font is smaller than the
+    ///    incoming size — the incoming section is more important than that
+    ///    tier, so it takes that depth and the smaller tier collapses
+    ///    (anchors below the chosen depth are popped). This preserves
+    ///    hierarchy continuity when font sizes don't exactly match: e.g., a
+    ///    14pt heading following 24pt title and 12pt chapters lands at the
+    ///    chapter tier rather than restarting at depth 1.
+    /// 3. Else (incoming is larger than every anchor), treat as a new
+    ///    top-level entry and reset the stack.
     fn step_back_up(
         &mut self,
         font_size: f32,
@@ -189,6 +199,8 @@ impl HierarchyContext {
         config: &SectionDetectionV2Config,
     ) -> u32 {
         let tol = config.font_size_tolerance;
+
+        // 1. Exact match (rposition: prefer the deepest match for stability).
         if let Some(idx) = self
             .stack
             .iter()
@@ -197,15 +209,27 @@ impl HierarchyContext {
             self.stack.truncate(idx + 1);
             if let Some(top) = self.stack.last_mut() {
                 top.font_size = font_size;
-                // Update keyword on the anchor only if it's currently None and
-                // the incoming has a real one — preserves stable identity.
                 if top.keyword.is_none() {
                     top.keyword = keyword.map(String::from);
                 }
             }
             return self.stack[idx].depth;
         }
-        // No matching size in stack — this is a new top-level entry.
+
+        // 2. Fallback — first (shallowest) anchor with smaller font. The
+        //    incoming section displaces that tier: truncate to it, replace
+        //    its font and keyword.
+        if let Some(idx) = self.stack.iter().position(|a| a.font_size < font_size) {
+            let depth = self.stack[idx].depth;
+            self.stack.truncate(idx + 1);
+            if let Some(top) = self.stack.last_mut() {
+                top.font_size = font_size;
+                top.keyword = keyword.map(String::from);
+            }
+            return depth;
+        }
+
+        // 3. Larger than everything in stack — new top-level entry.
         self.stack.clear();
         let d = config.starting_section_level;
         self.stack.push(HierarchyAnchor {
