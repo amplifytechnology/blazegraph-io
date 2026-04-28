@@ -145,16 +145,30 @@ fn merge_group(
     // per-band, so `line_number` alone collides across bands (both bands have
     // line=0). Without the band guard, cross-band merges concatenate without
     // separator and read as "ImprovingLLM accuracy".
+    //
+    // Same-line join rule: exactly one space at the boundary unless one side
+    // already provides whitespace. The xhtml parser preserves Tika's
+    // leading/trailing segment whitespace so a font-class transition like
+    // "implementations "+"MAY"+"choose" reads as "implementations MAY choose"
+    // rather than "implementationsMAYchoose". When the bracketing pre-pass
+    // (CR-25) ate the boundary space, neither side has it, and we insert one.
     let mut text = String::new();
     let mut prev_band_line: Option<(u32, u32)> = None;
     for el in &sorted_elements {
         let p = el.pdf_placement();
         let band_line = (p.band, p.line_number);
         let nr_cols = p.nr_band_columns;
+
         if !text.is_empty() {
             match prev_band_line {
                 Some(prev) if prev == band_line => {
-                    // Same line — no separator (segment merge)
+                    // Same-line: insert at most one space if neither side has
+                    // whitespace at the join boundary.
+                    let left_ws = text.ends_with(|c: char| c.is_whitespace());
+                    let right_ws = el.text.starts_with(|c: char| c.is_whitespace());
+                    if !left_ws && !right_ws {
+                        text.push(' ');
+                    }
                 }
                 _ => {
                     if nr_cols <= 2 {
@@ -165,9 +179,19 @@ fn merge_group(
                 }
             }
         }
-        text.push_str(&el.text);
+
+        // Drop leading whitespace on el.text if we already have whitespace at
+        // the boundary — guarantees the join is at most a single separator.
+        let to_push = if text.ends_with(|c: char| c.is_whitespace()) {
+            el.text.trim_start()
+        } else {
+            el.text.as_str()
+        };
+        text.push_str(to_push);
         prev_band_line = Some(band_line);
     }
+    // Trim accumulated boundary whitespace from the ends; interior preserved.
+    let text = text.trim().to_string();
 
     if text.trim().is_empty() {
         return None;
@@ -541,10 +565,12 @@ mod tests {
         assert_eq!(out[1].text, "B C");
     }
 
-    /// Test 7 — Same-band Section merge unchanged. Two same-band, same-line
-    /// section segments concatenate without separator (segment merge).
+    /// Test 7 — Same-band, same-line segments separated by a single space at
+    /// the join boundary when neither side carries whitespace. The xhtml
+    /// parser preserves Tika's segment-boundary whitespace; on segments where
+    /// Tika emitted none (e.g. CR-25 dropped it), the join inserts exactly one.
     #[test]
-    fn same_band_section_merge_unchanged() {
+    fn same_line_segments_join_with_single_space() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
         let p1 = mk_placement(22, 0, 0, 0, 0, 100.0);
         let p2 = mk_placement(22, 0, 0, 0, 0, 100.0);
@@ -554,7 +580,28 @@ mod tests {
         ];
         let out = run_rule(els, &cfg);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].text, "Titlecontinued");
+        assert_eq!(out[0].text, "Title continued");
+    }
+
+    /// Test 7b — Inline-styled emphasis case (the rfc-quic MAY pattern).
+    /// Tika emits three segments on the same band+line; the parser preserves
+    /// the trailing space on the first base-font segment but the bracketing
+    /// pre-pass removed the space between the styled word and the resuming
+    /// base-font run. Join must yield "implementations MAY choose...".
+    #[test]
+    fn same_line_inline_emphasis_join() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let p_a = mk_placement(14, 0, 0, 0, 1, 222.4);
+        let p_b = mk_placement(14, 0, 0, 0, 1, 222.4);
+        let p_c = mk_placement(14, 0, 0, 0, 1, 222.4);
+        let els = vec![
+            mk_element(ParsedElementType::Paragraph, "implementations ", 4, 0, p_a),
+            mk_element(ParsedElementType::Paragraph, "MAY", 4, 1, p_b),
+            mk_element(ParsedElementType::Paragraph, "choose to offer", 4, 2, p_c),
+        ];
+        let out = run_rule(els, &cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "implementations MAY choose to offer");
     }
 
     /// Test 8 — Migration shim: legacy YAML deserializes into per-type configs

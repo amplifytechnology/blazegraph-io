@@ -29,6 +29,7 @@ use quick_xml::reader::Reader;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
 
 // Pre-compiled regexes
 
@@ -319,8 +320,11 @@ fn extract_text_elements(
                             let end_pos = reader.buffer_position() - 7; // len("</span>") == 7
                             ctx.span_raw_tags =
                                 extract_raw_tags(xhtml.get(ctx.span_start_pos..end_pos).unwrap_or(""));
-                            let text_content = ctx.span_text.trim().to_string();
-                            if !text_content.is_empty() {
+                            // Preserve boundary whitespace (collapse internal runs, keep at most one
+                            // leading/trailing space) so downstream same-line concatenation can see
+                            // whether Tika emitted a separator at the segment join.
+                            let text_content = normalize_segment_text(&ctx.span_text);
+                            if !text_content.trim().is_empty() {
                                 if let Some(element) = build_element(
                                     &ctx,
                                     text_content,
@@ -438,12 +442,16 @@ fn build_element(
         fallback_font(&ctx.span_class)
     };
 
-    // Check for bookmark match
-    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
-    let text_normalized = normalize_ws(&text_content);
+    // Check for bookmark match — NFKC + whitespace fold both sides so a
+    // segment containing "oﬀer" matches a bookmark title with "offer".
+    let normalize_match = |s: &str| -> String {
+        let nfkc: String = s.nfkc().collect();
+        nfkc.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let text_normalized = normalize_match(&text_content);
     let bookmark_match = bookmark_sections
         .iter()
-        .find(|s| normalize_ws(&s.title) == text_normalized)
+        .find(|s| normalize_match(&s.title) == text_normalized)
         .cloned();
 
     Some(PdfTextElement {
@@ -465,6 +473,39 @@ fn build_element(
         token_count: estimate_token_count(&text_content),
         raw_tags: ctx.span_raw_tags.clone(),
     })
+}
+
+// ============================================================================
+// Segment text normalization
+// ============================================================================
+
+/// Normalize a span's raw text for emission.
+///
+/// Two operations: (a) Unicode NFKC fold so ligature glyphs (ﬀ ﬁ ﬂ ﬃ ﬄ),
+/// non-breaking space, and other compat-decomposable chars are reduced to
+/// their canonical forms — embeddings/search/AI then see what readers see;
+/// (b) whitespace cleanup that collapses internal runs to a single space
+/// while preserving a single leading/trailing space if the original had
+/// boundary whitespace. The boundary signal is what lets the downstream
+/// same-line concatenation know whether Tika emitted a separator.
+fn normalize_segment_text(s: &str) -> String {
+    let nfkc: String = s.nfkc().collect();
+    let leading = nfkc.starts_with(|c: char| c.is_whitespace());
+    let trailing = nfkc.ends_with(|c: char| c.is_whitespace());
+    let body: String = nfkc.split_whitespace().collect::<Vec<_>>().join(" ");
+    if body.is_empty() {
+        return String::new();
+    }
+    let mut out =
+        String::with_capacity(body.len() + leading as usize + trailing as usize);
+    if leading {
+        out.push(' ');
+    }
+    out.push_str(&body);
+    if trailing {
+        out.push(' ');
+    }
+    out
 }
 
 // ============================================================================
