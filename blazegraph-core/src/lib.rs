@@ -12,6 +12,7 @@ pub mod config;
 pub mod rules;
 pub mod classifier;
 pub mod storage;
+pub mod analytics;
 
 // Re-export main types and functions for easy use
 pub use types::*;
