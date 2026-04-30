@@ -60,9 +60,6 @@ fn size_key(size: f32) -> String {
 /// [`FontStats`].
 #[derive(Debug, Default)]
 pub struct FontStatsBuilder {
-    // config is used in the extension commit (Block 02 extension); retained here
-    // so the struct shape is stable across both commits.
-    #[allow(dead_code)]
     config: FontStatsConfig,
     // Accumulators populated during observe().
     size_counts: BTreeMap<String, usize>,   // size_key → count
@@ -174,6 +171,126 @@ impl Statistic for FontStatsBuilder {
             .map(|&bits| f32::from_bits(bits))
             .collect();
 
+        // ----------------------------------------------------------------
+        // Extension outputs (new descriptive primitives).
+        // ----------------------------------------------------------------
+
+        let total_count: usize = self.size_counts.values().sum();
+
+        // top_k_dominant_sizes: top config.top_k sizes sorted by
+        // (count desc, size desc).
+        let mut sorted_sizes: Vec<(f32, usize)> = self
+            .size_counts
+            .iter()
+            .filter_map(|(key, &cnt)| key.parse::<f32>().ok().map(|sz| (sz, cnt)))
+            .collect();
+        sorted_sizes.sort_by(|(sz_a, cnt_a), (sz_b, cnt_b)| {
+            cnt_b
+                .cmp(cnt_a)
+                .then_with(|| sz_b.partial_cmp(sz_a).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let top_k_dominant_sizes: Vec<f32> = sorted_sizes
+            .iter()
+            .take(self.config.top_k)
+            .map(|(sz, _)| *sz)
+            .collect();
+
+        // size_gap_first_to_second: absolute f32 difference between top-1 and
+        // top-2 in the (count desc, size desc) ordering.
+        let size_gap_first_to_second = if sorted_sizes.len() >= 2 {
+            (sorted_sizes[0].0 - sorted_sizes[1].0).abs()
+        } else {
+            0.0
+        };
+
+        // distinct_size_frequency_profile: sizes above the min-fraction
+        // threshold, sorted by (fraction desc, size desc).
+        let mut profile: Vec<(f32, DistinctSizeFrequency)> = if total_count > 0 {
+            self.size_counts
+                .iter()
+                .filter_map(|(key, &cnt)| {
+                    let fraction = cnt as f32 / total_count as f32;
+                    if fraction >= self.config.distinct_size_min_fraction {
+                        key.parse::<f32>().ok().map(|sz| {
+                            (
+                                sz,
+                                DistinctSizeFrequency {
+                                    size_key: key.clone(),
+                                    fraction_of_elements: fraction,
+                                },
+                            )
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        profile.sort_by(|(sz_a, entry_a), (sz_b, entry_b)| {
+            entry_b
+                .fraction_of_elements
+                .partial_cmp(&entry_a.fraction_of_elements)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| sz_b.partial_cmp(sz_a).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let distinct_size_frequency_profile: Vec<DistinctSizeFrequency> =
+            profile.into_iter().map(|(_, entry)| entry).collect();
+
+        // bold_density_per_size: for every size_key, fraction of elements at
+        // that size that are bold. Sizes with zero bold elements appear with
+        // value 0.0.
+        let bold_density_per_size: BTreeMap<String, f32> = self
+            .size_counts
+            .iter()
+            .map(|(key, &cnt)| {
+                let bold_cnt = self.bold_count_per_size.get(key).copied().unwrap_or(0);
+                (key.clone(), bold_cnt as f32 / cnt as f32)
+            })
+            .collect();
+
+        // mean / median / variance, all weighted by element count.
+        let (mean_font_size, median_font_size, variance_font_size) = if total_count == 0 {
+            (0.0, 0.0, 0.0)
+        } else {
+            // Build a list sorted ascending by size for median walk.
+            let mut asc: Vec<(f32, usize)> = self
+                .size_counts
+                .iter()
+                .filter_map(|(key, &cnt)| key.parse::<f32>().ok().map(|sz| (sz, cnt)))
+                .collect();
+            asc.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Mean.
+            let mean =
+                asc.iter().map(|(sz, cnt)| sz * *cnt as f32).sum::<f32>() / total_count as f32;
+
+            // Median: lower-of-two-midpoints order statistic (floor((n-1)/2)).
+            let midpoint = (total_count - 1) / 2;
+            let mut cumulative = 0usize;
+            let mut median = asc[0].0;
+            for (sz, cnt) in &asc {
+                cumulative += cnt;
+                if cumulative > midpoint {
+                    median = *sz;
+                    break;
+                }
+            }
+
+            // Variance: Σ((size - mean)² × count) / total_count.
+            let variance = asc
+                .iter()
+                .map(|(sz, cnt)| {
+                    let diff = sz - mean;
+                    diff * diff * *cnt as f32
+                })
+                .sum::<f32>()
+                / total_count as f32;
+
+            (mean, median, variance)
+        };
+
         FontStats {
             font_size_counts: self.size_counts,
             font_family_counts: self.family_counts,
@@ -188,14 +305,13 @@ impl Statistic for FontStatsBuilder {
             most_common_font_size,
             most_common_font_family,
             all_font_sizes,
-            // Extension fields — populated in Block 02 extension commit.
-            top_k_dominant_sizes: vec![],
-            distinct_size_frequency_profile: vec![],
-            size_gap_first_to_second: 0.0,
-            bold_density_per_size: BTreeMap::new(),
-            mean_font_size: 0.0,
-            median_font_size: 0.0,
-            variance_font_size: 0.0,
+            top_k_dominant_sizes,
+            distinct_size_frequency_profile,
+            size_gap_first_to_second,
+            bold_density_per_size,
+            mean_font_size,
+            median_font_size,
+            variance_font_size,
         }
     }
 }
@@ -338,6 +454,14 @@ mod tests {
 
     fn build_stats(elements: &[PdfTextElement]) -> FontStats {
         let mut b = FontStatsBuilder::default();
+        for e in elements {
+            b.observe(e);
+        }
+        b.finalize(&FinalizationContext::default())
+    }
+
+    fn build_stats_with_config(elements: &[PdfTextElement], config: FontStatsConfig) -> FontStats {
+        let mut b = FontStatsBuilder::new(config);
         for e in elements {
             b.observe(e);
         }
@@ -542,5 +666,215 @@ mod tests {
             5,
             "total element count should be 5"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // EXTENSION COMMIT TESTS
+    // -----------------------------------------------------------------------
+
+    /// Test 3 — top_k_dominant_sizes ordering.
+    ///
+    /// Input: 10pt × 5, 12pt × 5, 14pt × 3.
+    /// Sorted by (count desc, size desc): 12pt and 10pt tied at 5 — 12pt wins
+    /// (larger); 14pt at count=3 is third.
+    /// Expected: [12.0, 10.0, 14.0].
+    #[test]
+    fn test_top_k_dominant_sizes() {
+        let mut elements: Vec<PdfTextElement> = vec![];
+        for _ in 0..5 {
+            elements.push(make_element("a", 10.0, "F", "normal", "normal", 0));
+        }
+        for _ in 0..5 {
+            elements.push(make_element("b", 12.0, "F", "normal", "normal", 0));
+        }
+        for _ in 0..3 {
+            elements.push(make_element("c", 14.0, "F", "normal", "normal", 0));
+        }
+
+        let stats = build_stats(&elements);
+        assert_eq!(
+            stats.top_k_dominant_sizes,
+            vec![12.0, 10.0, 14.0],
+            "top_k ordering: (count desc, size desc)"
+        );
+    }
+
+    /// Test 4 — distinct_size_frequency_profile threshold filtering.
+    ///
+    /// Input: 12pt × 100, 10pt × 5, 14pt × 1 (106 total).
+    /// With default 0.05 threshold: only 12pt qualifies (100/106 ≈ 0.943).
+    /// With 0.04 threshold: 10pt also qualifies (5/106 ≈ 0.047).
+    #[test]
+    fn test_distinct_size_frequency_profile() {
+        let mut elements: Vec<PdfTextElement> = vec![];
+        for _ in 0..100 {
+            elements.push(make_element("a", 12.0, "F", "normal", "normal", 0));
+        }
+        for _ in 0..5 {
+            elements.push(make_element("b", 10.0, "F", "normal", "normal", 0));
+        }
+        elements.push(make_element("c", 14.0, "F", "normal", "normal", 0));
+
+        // Default threshold (0.05).
+        let stats = build_stats(&elements);
+        assert_eq!(
+            stats.distinct_size_frequency_profile.len(),
+            1,
+            "only 12pt qualifies at default 0.05 threshold"
+        );
+        assert_eq!(stats.distinct_size_frequency_profile[0].size_key, "12.0");
+        let expected_frac = 100.0f32 / 106.0;
+        assert!(
+            (stats.distinct_size_frequency_profile[0].fraction_of_elements - expected_frac).abs()
+                < 1e-4,
+            "12pt fraction expected ~{:.4}, got {:.4}",
+            expected_frac,
+            stats.distinct_size_frequency_profile[0].fraction_of_elements,
+        );
+
+        // Looser threshold (0.04) — 10pt also qualifies.
+        let config = FontStatsConfig {
+            distinct_size_min_fraction: 0.04,
+            ..Default::default()
+        };
+        let elements2 = elements.clone();
+        let stats2 = build_stats_with_config(&elements2, config);
+        assert_eq!(
+            stats2.distinct_size_frequency_profile.len(),
+            2,
+            "12pt and 10pt both qualify at 0.04 threshold"
+        );
+        // Sorted by (fraction desc, size desc): 12pt first, 10pt second.
+        assert_eq!(stats2.distinct_size_frequency_profile[0].size_key, "12.0");
+        assert_eq!(stats2.distinct_size_frequency_profile[1].size_key, "10.0");
+    }
+
+    /// Test 5 — size_gap_first_to_second.
+    ///
+    /// Three sub-cases: empty, single size, two sizes.
+    #[test]
+    fn test_size_gap_first_to_second() {
+        // Empty.
+        let stats = build_stats(&[]);
+        assert_eq!(stats.size_gap_first_to_second, 0.0, "empty: gap = 0.0");
+
+        // Single distinct size.
+        let elems: Vec<PdfTextElement> = (0..10)
+            .map(|_| make_element("a", 12.0, "F", "normal", "normal", 0))
+            .collect();
+        let stats = build_stats(&elems);
+        assert_eq!(
+            stats.size_gap_first_to_second, 0.0,
+            "single size: gap = 0.0"
+        );
+
+        // Two distinct sizes: 12pt × 10 (top-1), 16pt × 5 (top-2).
+        let mut elems: Vec<PdfTextElement> = (0..10)
+            .map(|_| make_element("a", 12.0, "F", "normal", "normal", 0))
+            .collect();
+        for _ in 0..5 {
+            elems.push(make_element("b", 16.0, "F", "normal", "normal", 0));
+        }
+        let stats = build_stats(&elems);
+        assert!(
+            (stats.size_gap_first_to_second - 4.0).abs() < 1e-4,
+            "gap expected 4.0, got {}",
+            stats.size_gap_first_to_second
+        );
+    }
+
+    /// Test 6 — bold_density_per_size.
+    ///
+    /// 3 elements at 12pt (1 bold, 2 non-bold), 2 elements at 16pt (all bold).
+    #[test]
+    fn test_bold_density_per_size() {
+        let elements: Vec<PdfTextElement> = vec![
+            make_element("a", 12.0, "F", "bold", "normal", 0),
+            make_element("b", 12.0, "F", "normal", "normal", 0),
+            make_element("c", 12.0, "F", "normal", "normal", 0),
+            make_element("d", 16.0, "F", "bold", "normal", 0),
+            make_element("e", 16.0, "F", "bold", "normal", 0),
+        ];
+
+        let stats = build_stats(&elements);
+
+        let d12 = *stats.bold_density_per_size.get("12.0").expect("12.0 key");
+        let d16 = *stats.bold_density_per_size.get("16.0").expect("16.0 key");
+
+        assert!(
+            (d12 - 1.0f32 / 3.0).abs() < 1e-4,
+            "12pt bold density: expected ~0.3333, got {:.4}",
+            d12
+        );
+        assert!(
+            (d16 - 1.0f32).abs() < 1e-4,
+            "16pt bold density: expected 1.0, got {:.4}",
+            d16
+        );
+    }
+
+    /// Test 7 — mean / median / variance.
+    ///
+    /// Histogram: 10.0 × 2, 12.0 × 5, 14.0 × 3 (10 elements total).
+    /// mean   = (20 + 60 + 42) / 10 = 12.2
+    /// median = 12.0 (cumulative crosses midpoint at 12.0)
+    /// variance = ((10-12.2)²×2 + (12-12.2)²×5 + (14-12.2)²×3) / 10
+    ///          = (9.68 + 0.2 + 9.72) / 10 = 1.96
+    #[test]
+    fn test_mean_median_variance() {
+        let mut elements: Vec<PdfTextElement> = vec![];
+        for _ in 0..2 {
+            elements.push(make_element("a", 10.0, "F", "normal", "normal", 0));
+        }
+        for _ in 0..5 {
+            elements.push(make_element("b", 12.0, "F", "normal", "normal", 0));
+        }
+        for _ in 0..3 {
+            elements.push(make_element("c", 14.0, "F", "normal", "normal", 0));
+        }
+
+        let stats = build_stats(&elements);
+
+        assert!(
+            (stats.mean_font_size - 12.2).abs() < 1e-3,
+            "mean expected 12.2, got {}",
+            stats.mean_font_size
+        );
+        assert!(
+            (stats.median_font_size - 12.0).abs() < 1e-3,
+            "median expected 12.0, got {}",
+            stats.median_font_size
+        );
+        assert!(
+            (stats.variance_font_size - 1.96).abs() < 1e-3,
+            "variance expected 1.96, got {}",
+            stats.variance_font_size
+        );
+    }
+
+    /// Test 8 — Idempotency / determinism.
+    ///
+    /// Two runs on the same non-trivial input must produce byte-identical JSON.
+    #[test]
+    fn test_idempotency() {
+        let mut elements: Vec<PdfTextElement> = vec![];
+        for _ in 0..8 {
+            elements.push(make_element("a", 12.0, "Arial", "normal", "normal", 0));
+        }
+        for _ in 0..4 {
+            elements.push(make_element("b", 14.0, "Times", "bold", "italic", 0));
+        }
+        for _ in 0..2 {
+            elements.push(make_element("c", 10.0, "Courier", "normal", "italic", 0));
+        }
+        // rotated — excluded
+        elements.push(make_element("d", 18.0, "Courier", "bold", "normal", 90));
+
+        let run1 = build_stats(&elements);
+        let run2 = build_stats(&elements);
+
+        let json1 = serde_json::to_string(&run1).expect("serialize run1");
+        let json2 = serde_json::to_string(&run2).expect("serialize run2");
+        assert_eq!(json1, json2, "two runs must produce byte-identical JSON");
     }
 }
