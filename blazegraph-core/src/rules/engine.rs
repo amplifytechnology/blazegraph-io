@@ -248,6 +248,7 @@ impl RuleEngine {
         Ok(elements)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_rule_by_name(
         &self,
         rule_name: &str,

@@ -143,9 +143,7 @@ fn check_and_correct_depth(
 mod tests {
     use super::*;
     use crate::config::{GraphSanityConfig, GraphSanityInvariants, InvariantToggle};
-    use crate::types::{
-        DocumentGraph, DocumentNode, NodeContent, NodeLocation, SemanticLocation,
-    };
+    use crate::types::{DocumentGraph, DocumentNode};
     use uuid::Uuid;
 
     /// Build a minimal graph: root → child(at depth `child_depth`).

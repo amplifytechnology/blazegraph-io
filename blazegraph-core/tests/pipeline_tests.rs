@@ -233,7 +233,7 @@ mod graph_structure {
         assert!(section_count > 0, "Shannon paper should have sections");
         // Shannon's paper has well-defined sections — this should be stable
         assert!(
-            section_count >= 5 && section_count <= 40,
+            (5..=40).contains(&section_count),
             "Shannon section count {section_count} outside expected range [5, 40]"
         );
     }
@@ -684,6 +684,7 @@ fn all_rotated_does_not_panic() {
 /// Build a PdfTextElement with full control over all fields relevant to V2.
 /// `text`, `font_size`, `font_weight` ("bold" or "normal"), `rotation`, `line_number`,
 /// `band`, `column`, `x`, `width` (bbox), and `class_name`.
+#[allow(clippy::too_many_arguments)]
 fn make_v2_element(
     class_name: &str,
     text: &str,

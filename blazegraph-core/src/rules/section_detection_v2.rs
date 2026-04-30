@@ -74,7 +74,7 @@ impl HierarchyContext {
         let prev = self.previous_section_font_size;
         self.previous_section_font_size = Some(font_size);
 
-        let depth = match prev {
+        match prev {
             None => {
                 let d = config.starting_section_level;
                 self.stack.push(HierarchyAnchor {
@@ -106,8 +106,7 @@ impl HierarchyContext {
                     self.resolve_tie(keyword, font_size, config)
                 }
             }
-        };
-        depth
+        }
     }
 
     /// Resolve a section transition where font-delta is within tolerance.
@@ -130,7 +129,7 @@ impl HierarchyContext {
         // the None anchor is transient and should be popped before resolution.
         if keyword.is_some()
             && self.stack.len() >= 2
-            && self.stack.last().map_or(false, |a| a.keyword.is_none())
+            && self.stack.last().is_some_and(|a| a.keyword.is_none())
         {
             self.stack.pop();
         }
@@ -483,12 +482,10 @@ impl<'a> SectionDetectionV2Rule<'a> {
     ///
     /// Four-region piecewise decision based on `delta = font_size - body_size`:
     ///
-    /// - `delta < -tolerance`               → REJECT (below-body noise)
-    /// - `|delta| ≤ tolerance`              → Region 3 (at-body band):
-    ///                                         promote if isolated AND (bold OR rare)
-    /// - `tolerance < delta ≤ margin`       → Region 2 (moderate):
-    ///                                         promote if bold OR isolated
-    /// - `delta > margin`                   → Region 1 (large): auto-promote unconditionally
+    /// - `delta < -tolerance` → REJECT (below-body noise)
+    /// - `|delta| ≤ tolerance` → Region 3 (at-body band): promote if isolated AND (bold OR rare)
+    /// - `tolerance < delta ≤ margin` → Region 2 (moderate): promote if bold OR isolated
+    /// - `delta > margin` → Region 1 (large): auto-promote unconditionally
     ///
     /// Region 1 threshold is `body_size + structural_size_margin` by default,
     /// or `body_size * structural_size_ratio` when a ratio is configured.
@@ -819,17 +816,18 @@ mod tests {
         ratio: Option<f32>,
         isolation_threshold: f32,
     ) -> ParsingConfig {
-        let mut cfg = ParsingConfig::default();
-        cfg.section_detection_v2 = SectionDetectionV2Config {
-            font_size_tolerance: tolerance,
-            structural_size_margin: margin,
-            structural_size_ratio: ratio,
-            isolation_threshold,
-            line_height_tolerance: 3.0,
-            font_rarity_threshold: 0.05, // < 5% → rare
-            ..SectionDetectionV2Config::default()
-        };
-        cfg
+        ParsingConfig {
+            section_detection_v2: SectionDetectionV2Config {
+                font_size_tolerance: tolerance,
+                structural_size_margin: margin,
+                structural_size_ratio: ratio,
+                isolation_threshold,
+                line_height_tolerance: 3.0,
+                font_rarity_threshold: 0.05, // < 5% → rare
+                ..SectionDetectionV2Config::default()
+            },
+            ..ParsingConfig::default()
+        }
     }
 
     fn make_style_data() -> StyleData {

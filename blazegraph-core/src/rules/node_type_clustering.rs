@@ -622,11 +622,11 @@ table_line_separator: "\n"
         let cfg: crate::config::NodeTypeClusteringConfig =
             serde_yaml::from_str(yaml).expect("legacy YAML must deserialize");
         for t in &[&cfg.section, &cfg.paragraph, &cfg.list, &cfg.list_item] {
-            assert_eq!(t.same_line, false, "legacy default does not require same_line");
-            assert_eq!(t.same_paragraph, true, "merge_lines=true keys on paragraph_number");
-            assert_eq!(t.same_band, true);
-            assert_eq!(t.same_column, true);
-            assert_eq!(t.same_depth, false);
+            assert!(!t.same_line, "legacy default does not require same_line");
+            assert!(t.same_paragraph, "merge_lines=true keys on paragraph_number");
+            assert!(t.same_band);
+            assert!(t.same_column);
+            assert!(!t.same_depth);
             assert!(t.max_y_gap.is_none());
         }
     }
@@ -644,8 +644,8 @@ merge_bands: false
         let cfg: crate::config::NodeTypeClusteringConfig =
             serde_yaml::from_str(yaml).expect("legacy YAML must deserialize");
         let t = &cfg.section;
-        assert_eq!(t.same_paragraph, false);
-        assert_eq!(t.same_band, true);
-        assert_eq!(t.same_column, false);
+        assert!(!t.same_paragraph);
+        assert!(t.same_band);
+        assert!(!t.same_column);
     }
 }

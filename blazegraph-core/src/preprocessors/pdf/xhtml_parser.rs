@@ -173,11 +173,9 @@ impl ParseContext {
 
 /// Get the string value of a named attribute from a quick-xml Attributes iterator.
 fn get_attr(attrs: &quick_xml::events::attributes::Attributes, name: &[u8]) -> Option<String> {
-    for attr in attrs.clone() {
-        if let Ok(a) = attr {
-            if a.key.as_ref() == name {
-                return String::from_utf8(a.value.to_vec()).ok();
-            }
+    for a in attrs.clone().filter_map(Result::ok) {
+        if a.key.as_ref() == name {
+            return String::from_utf8(a.value.to_vec()).ok();
         }
     }
     None
@@ -410,7 +408,7 @@ fn finalize_page_elements(
         el.reading_order = *global_reading_order;
         *global_reading_order += 1;
     }
-    all_elements.extend(page_elements.drain(..));
+    all_elements.append(page_elements);
 }
 
 /// Build a `PdfTextElement` from the current span context.
