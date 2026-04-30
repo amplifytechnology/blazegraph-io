@@ -144,7 +144,9 @@ impl DocumentProcessor {
         println!("📄 Processing: {}", input_path);
 
         // --- C3: Graph cache check ---
-        if fresh_from.should_use_cache(CachePoint::C3) && cache_defaults.should_write(CachePoint::C3) {
+        if fresh_from.should_use_cache(CachePoint::C3)
+            && cache_defaults.should_write(CachePoint::C3)
+        {
             let config_hash = calculate_config_hash(config)?;
             let cache_key = GraphCacheKey::new(pdf_hash.clone(), config_hash);
             if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
@@ -158,11 +160,8 @@ impl DocumentProcessor {
 
         // Create deterministic ID generator: version + pdf_hash + config_hash
         let config_hash = calculate_config_hash(config)?;
-        let id_gen = NodeIdGenerator::new(
-            cache::versions::BLAZEGRAPH_VERSION,
-            &pdf_hash,
-            &config_hash,
-        );
+        let id_gen =
+            NodeIdGenerator::new(cache::versions::BLAZEGRAPH_VERSION, &pdf_hash, &config_hash);
 
         // --- C2: Preprocessor cache check ---
         let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {
@@ -170,10 +169,24 @@ impl DocumentProcessor {
                 println!("🎯 C2 preprocessor cache hit — skipping extraction + parsing");
                 cached
             } else {
-                self.extract_and_parse(input_path, &pdf_bytes, &pdf_hash, &fresh_from, cache_defaults, &mut profiler)?
+                self.extract_and_parse(
+                    input_path,
+                    &pdf_bytes,
+                    &pdf_hash,
+                    &fresh_from,
+                    cache_defaults,
+                    &mut profiler,
+                )?
             }
         } else {
-            self.extract_and_parse(input_path, &pdf_bytes, &pdf_hash, &fresh_from, cache_defaults, &mut profiler)?
+            self.extract_and_parse(
+                input_path,
+                &pdf_bytes,
+                &pdf_hash,
+                &fresh_from,
+                cache_defaults,
+                &mut profiler,
+            )?
         };
 
         // --- Stages 2-5: Classification → Rules → Graph → Post-processing ---
@@ -182,10 +195,7 @@ impl DocumentProcessor {
         if enable_profiling {
             profiler.print_summary();
         }
-        println!(
-            "⏱️  Total: {:.0}ms",
-            start_time.elapsed().as_millis()
-        );
+        println!("⏱️  Total: {:.0}ms", start_time.elapsed().as_millis());
 
         Ok(graph)
     }
@@ -286,10 +296,7 @@ impl DocumentProcessor {
         graph.compute_breadcrumbs();
         crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
 
-        println!(
-            "📋 Stage 3: Graph captured ({} nodes)",
-            graph.nodes.len()
-        );
+        println!("📋 Stage 3: Graph captured ({} nodes)", graph.nodes.len());
 
         Ok(PipelineStages {
             xhtml,
@@ -347,8 +354,7 @@ impl DocumentProcessor {
         })?;
 
         if cache_defaults.should_write(CachePoint::C2) {
-            self.storage
-                .store_preprocessor_output(pdf_hash, &output)?;
+            self.storage.store_preprocessor_output(pdf_hash, &output)?;
             println!("💾 C2: PreprocessorOutput cached");
         }
 
@@ -407,7 +413,8 @@ impl DocumentProcessor {
 
         // Graph construction (deterministic UUIDv5 node IDs)
         let mut graph = profiler.time_step("Graph Construction", || {
-            self.graph_builder.build_graph_deterministic(parsed_elements, id_gen)
+            self.graph_builder
+                .build_graph_deterministic(parsed_elements, id_gen)
         })?;
 
         // Post-processing: metadata, analysis, breadcrumbs

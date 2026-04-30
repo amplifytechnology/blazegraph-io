@@ -1,5 +1,5 @@
-use crate::types::*;
 use super::node_id::NodeIdGenerator;
+use crate::types::*;
 use anyhow::Result;
 
 pub struct GraphBuilder;
@@ -277,7 +277,8 @@ impl GraphBuilder {
     ) -> Result<DocumentNode> {
         let (node_type_str, physical) = self.extract_node_type_and_physical(group);
 
-        let mut node = DocumentNode::new_with_id(node_id, node_type_str, group.combined_text.clone());
+        let mut node =
+            DocumentNode::new_with_id(node_id, node_type_str, group.combined_text.clone());
         node.location.physical = physical;
         node.text_order = Some(order);
         node.token_count = group.elements.iter().map(|e| e.token_count).sum();
@@ -299,7 +300,10 @@ impl GraphBuilder {
         Ok(node)
     }
 
-    fn extract_node_type_and_physical(&self, group: &ElementGroup) -> (&str, Option<PhysicalLocation>) {
+    fn extract_node_type_and_physical(
+        &self,
+        group: &ElementGroup,
+    ) -> (&str, Option<PhysicalLocation>) {
         if let Some(first_element) = group.elements.first() {
             let node_type = match first_element.element_type {
                 crate::types::ParsedElementType::Section => "Section",

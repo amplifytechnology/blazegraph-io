@@ -12,16 +12,16 @@
 //! To regenerate fixtures: `make test-generate-fixtures`
 //! No JVM required to run these tests.
 
-use blazegraph_io_core::preprocessors::pdf::xhtml_parser;
-use blazegraph_io_core::{
-    BoundingBox, DocumentAnalysis, FontClass, Placement, PdfTextElement, StyleData,
-};
-use blazegraph_io_core::rules::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
-use blazegraph_io_core::rules::section_detection_v2::SectionDetectionV2Rule;
 use blazegraph_io_core::config::{
     ParsingConfig, PipelineConfig, RuleConfig, SectionDetectionV2Config,
 };
+use blazegraph_io_core::preprocessors::pdf::xhtml_parser;
+use blazegraph_io_core::rules::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
+use blazegraph_io_core::rules::section_detection_v2::SectionDetectionV2Rule;
 use blazegraph_io_core::ParsedElementType;
+use blazegraph_io_core::{
+    BoundingBox, DocumentAnalysis, FontClass, PdfTextElement, Placement, StyleData,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,28 +36,46 @@ fn fixtures_dir() -> PathBuf {
 
 fn load_summary(fixture_name: &str) -> Value {
     let path = fixtures_dir().join(fixture_name).join("summary.json");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("Missing fixture: {}. Run `make test-generate-fixtures`", path.display()));
+    let contents = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "Missing fixture: {}. Run `make test-generate-fixtures`",
+            path.display()
+        )
+    });
     serde_json::from_str(&contents).expect("Invalid summary.json")
 }
 
 fn load_graph(fixture_name: &str) -> Value {
     let path = fixtures_dir().join(fixture_name).join("stage3_graph.json");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("Missing fixture: {}. Run `make test-generate-fixtures`", path.display()));
+    let contents = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "Missing fixture: {}. Run `make test-generate-fixtures`",
+            path.display()
+        )
+    });
     serde_json::from_str(&contents).expect("Invalid stage3_graph.json")
 }
 
 fn load_xhtml(fixture_name: &str) -> String {
     let path = fixtures_dir().join(fixture_name).join("stage1a_xhtml.html");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("Missing fixture: {}. Run `make test-generate-fixtures`", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "Missing fixture: {}. Run `make test-generate-fixtures`",
+            path.display()
+        )
+    })
 }
 
 fn load_text_elements(fixture_name: &str) -> Value {
-    let path = fixtures_dir().join(fixture_name).join("stage1b_text_elements.json");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("Missing fixture: {}. Run `make test-generate-fixtures`", path.display()));
+    let path = fixtures_dir()
+        .join(fixture_name)
+        .join("stage1b_text_elements.json");
+    let contents = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "Missing fixture: {}. Run `make test-generate-fixtures`",
+            path.display()
+        )
+    });
     serde_json::from_str(&contents).expect("Invalid stage1b_text_elements.json")
 }
 
@@ -89,7 +107,8 @@ mod tika_boundary {
 
         // XHTML should not change unless Tika version changes
         assert_eq!(
-            xhtml.len(), expected_bytes,
+            xhtml.len(),
+            expected_bytes,
             "XHTML byte count changed — did Tika version change?"
         );
     }
@@ -100,7 +119,11 @@ mod tika_boundary {
         let arr = elements.as_array().expect("text_elements should be array");
 
         // Text elements come directly from Tika — stable unless Tika changes
-        assert_eq!(arr.len(), 3021, "Text element count changed — Tika output drift?");
+        assert_eq!(
+            arr.len(),
+            3021,
+            "Text element count changed — Tika output drift?"
+        );
     }
 
     #[test]
@@ -110,7 +133,8 @@ mod tika_boundary {
         let expected_bytes = summary["stage_counts"]["xhtml_bytes"].as_u64().unwrap() as usize;
 
         assert_eq!(
-            xhtml.len(), expected_bytes,
+            xhtml.len(),
+            expected_bytes,
             "XHTML byte count changed — did Tika version change?"
         );
     }
@@ -120,7 +144,11 @@ mod tika_boundary {
         let elements = load_text_elements("elements_of_euclid");
         let arr = elements.as_array().expect("text_elements should be array");
 
-        assert_eq!(arr.len(), 9538, "Text element count changed — Tika output drift?");
+        assert_eq!(
+            arr.len(),
+            9538,
+            "Text element count changed — Tika output drift?"
+        );
     }
 }
 
@@ -135,7 +163,8 @@ mod schema_contract {
     fn schema_version_is_0_2_0() {
         let graph = load_graph("claude_shannon_paper");
         assert_eq!(
-            graph["schema_version"].as_str().unwrap(), "0.2.0",
+            graph["schema_version"].as_str().unwrap(),
+            "0.2.0",
             "Schema version changed — this is a contract break for API customers"
         );
     }
@@ -154,10 +183,16 @@ mod schema_contract {
     fn graph_has_required_top_level_fields() {
         let graph = load_graph("claude_shannon_paper");
 
-        assert!(graph["schema_version"].is_string(), "Missing schema_version");
+        assert!(
+            graph["schema_version"].is_string(),
+            "Missing schema_version"
+        );
         assert!(graph["nodes"].is_array(), "Missing nodes array");
         assert!(graph["document_info"].is_object(), "Missing document_info");
-        assert!(graph["structural_profile"].is_object(), "Missing structural_profile");
+        assert!(
+            graph["structural_profile"].is_object(),
+            "Missing structural_profile"
+        );
     }
 
     #[test]
@@ -170,10 +205,16 @@ mod schema_contract {
             assert!(node["node_type"].is_string(), "Node {i} missing node_type");
             assert!(node["location"].is_object(), "Node {i} missing location");
             assert!(node["content"].is_object(), "Node {i} missing content");
-            assert!(node["token_count"].is_number(), "Node {i} missing token_count");
+            assert!(
+                node["token_count"].is_number(),
+                "Node {i} missing token_count"
+            );
             // parent can be null (root node)
             // children should always be an array
-            assert!(node["children"].is_array(), "Node {i} missing children array");
+            assert!(
+                node["children"].is_array(),
+                "Node {i} missing children array"
+            );
         }
     }
 
@@ -183,8 +224,14 @@ mod schema_contract {
         let info = &graph["document_info"];
 
         assert!(info["root_id"].is_string(), "Missing root_id");
-        assert!(info["document_metadata"].is_object(), "Missing document_metadata");
-        assert!(info["document_analysis"].is_object(), "Missing document_analysis");
+        assert!(
+            info["document_metadata"].is_object(),
+            "Missing document_metadata"
+        );
+        assert!(
+            info["document_analysis"].is_object(),
+            "Missing document_analysis"
+        );
     }
 }
 
@@ -214,15 +261,26 @@ mod graph_structure {
         let graph = load_graph("claude_shannon_paper");
         let nodes = graph["nodes"].as_array().unwrap();
 
-        let doc_nodes: Vec<_> = nodes.iter()
+        let doc_nodes: Vec<_> = nodes
+            .iter()
             .filter(|n| n["node_type"].as_str() == Some("Document"))
             .collect();
 
-        assert_eq!(doc_nodes.len(), 1, "Should have exactly one Document root node");
+        assert_eq!(
+            doc_nodes.len(),
+            1,
+            "Should have exactly one Document root node"
+        );
 
         let root = doc_nodes[0];
-        assert!(root["parent"].is_null(), "Document root should have null parent");
-        assert!(!root["children"].as_array().unwrap().is_empty(), "Document root should have children");
+        assert!(
+            root["parent"].is_null(),
+            "Document root should have null parent"
+        );
+        assert!(
+            !root["children"].as_array().unwrap().is_empty(),
+            "Document root should have children"
+        );
     }
 
     #[test]
@@ -268,21 +326,22 @@ mod graph_structure {
         let nodes = graph["nodes"].as_array().unwrap();
 
         // First node is Document (text_order: null), rest should be ascending
-        let orders: Vec<Option<u64>> = nodes.iter()
-            .map(|n| n["text_order"].as_u64())
-            .collect();
+        let orders: Vec<Option<u64>> = nodes.iter().map(|n| n["text_order"].as_u64()).collect();
 
         // Document root has null text_order and comes first
-        assert!(orders[0].is_none(), "First node should be Document with null text_order");
+        assert!(
+            orders[0].is_none(),
+            "First node should be Document with null text_order"
+        );
 
         // Remaining should be monotonically non-decreasing
-        let rest: Vec<u64> = orders[1..].iter()
-            .filter_map(|o| *o)
-            .collect();
+        let rest: Vec<u64> = orders[1..].iter().filter_map(|o| *o).collect();
         for window in rest.windows(2) {
             assert!(
                 window[0] <= window[1],
-                "Nodes not sorted by text_order: {} > {}", window[0], window[1]
+                "Nodes not sorted by text_order: {} > {}",
+                window[0],
+                window[1]
             );
         }
     }
@@ -300,7 +359,8 @@ mod breadcrumbs {
         let graph = load_graph("claude_shannon_paper");
         let nodes = graph["nodes"].as_array().unwrap();
 
-        let root = nodes.iter()
+        let root = nodes
+            .iter()
             .find(|n| n["node_type"].as_str() == Some("Document"))
             .expect("No Document root node");
 
@@ -308,7 +368,10 @@ mod breadcrumbs {
             .as_array()
             .expect("Root should have breadcrumbs array");
 
-        assert!(!breadcrumbs.is_empty(), "Root breadcrumbs should contain the document title");
+        assert!(
+            !breadcrumbs.is_empty(),
+            "Root breadcrumbs should contain the document title"
+        );
     }
 
     #[test]
@@ -320,7 +383,9 @@ mod breadcrumbs {
         for node in nodes {
             if node["node_type"].as_str() == Some("Section") {
                 let section_text = node["content"]["text"].as_str().unwrap_or("");
-                let children_ids: Vec<&str> = node["children"].as_array().unwrap()
+                let children_ids: Vec<&str> = node["children"]
+                    .as_array()
+                    .unwrap()
                     .iter()
                     .filter_map(|c| c.as_str())
                     .collect();
@@ -343,7 +408,8 @@ mod breadcrumbs {
                         assert!(
                             crumbs.contains(&section_text),
                             "Child of section '{}' should have it in breadcrumbs, got: {:?}",
-                            section_text, crumbs
+                            section_text,
+                            crumbs
                         );
                         return; // One verified example is sufficient
                     }
@@ -386,7 +452,8 @@ mod breadcrumbs {
             assert!(
                 crumb_count <= (depth as usize + 2),
                 "Node at depth {} has {} breadcrumbs — suspiciously deep trail",
-                depth, crumb_count
+                depth,
+                crumb_count
             );
         }
     }
@@ -414,9 +481,15 @@ fn test_parser_band_and_column_propagation() {
     let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
     let e = &output.text_elements;
     assert_eq!(e.len(), 3);
-    assert_eq!(e[0].placement.band, 0); assert_eq!(e[0].placement.nr_band_columns, 2); assert_eq!(e[0].placement.column, 0);
-    assert_eq!(e[1].placement.band, 0); assert_eq!(e[1].placement.nr_band_columns, 2); assert_eq!(e[1].placement.column, 1);
-    assert_eq!(e[2].placement.band, 1); assert_eq!(e[2].placement.nr_band_columns, 1); assert_eq!(e[2].placement.column, 0);
+    assert_eq!(e[0].placement.band, 0);
+    assert_eq!(e[0].placement.nr_band_columns, 2);
+    assert_eq!(e[0].placement.column, 0);
+    assert_eq!(e[1].placement.band, 0);
+    assert_eq!(e[1].placement.nr_band_columns, 2);
+    assert_eq!(e[1].placement.column, 1);
+    assert_eq!(e[2].placement.band, 1);
+    assert_eq!(e[2].placement.nr_band_columns, 1);
+    assert_eq!(e[2].placement.column, 0);
     assert!(e.iter().all(|el| el.placement.rotation == 0));
     assert!(e.iter().all(|el| el.raw_tags.is_empty()));
 }
@@ -477,8 +550,7 @@ fn test_parser_raw_tags_anchor() {
     let el = output.text_elements.first().expect("no elements");
     assert_eq!(el.raw_tags.len(), 1, "expected one raw_tag entry");
     assert_eq!(
-        el.raw_tags[0],
-        r#"<a href="https://example.com">link text</a>"#,
+        el.raw_tags[0], r#"<a href="https://example.com">link text</a>"#,
         "raw_tag must include attributes and inner text verbatim"
     );
 }
@@ -493,9 +565,18 @@ fn test_integration_rfc_quic_bands_and_columns() {
         .expect("Pre-populated XHTML not found — see worktree setup in handoff (rfc-quic)");
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
-    assert!(e.iter().any(|el| el.placement.band > 0), "expected multiple bands");
-    assert!(e.iter().any(|el| el.placement.nr_band_columns > 1), "expected at least one multi-col band");
-    assert!(e.iter().all(|el| el.placement.rotation == 0), "rfc-quic has no rotated content");
+    assert!(
+        e.iter().any(|el| el.placement.band > 0),
+        "expected multiple bands"
+    );
+    assert!(
+        e.iter().any(|el| el.placement.nr_band_columns > 1),
+        "expected at least one multi-col band"
+    );
+    assert!(
+        e.iter().all(|el| el.placement.rotation == 0),
+        "rfc-quic has no rotated content"
+    );
 }
 
 #[test]
@@ -508,9 +589,18 @@ fn test_integration_attention_rotation() {
         .expect("Pre-populated XHTML not found — see worktree setup in handoff (attention)");
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
-    assert!(e.iter().any(|el| el.placement.rotation != 0), "attention has rotated sidebar (aside data-rotation=90)");
-    assert!(e.iter().any(|el| el.placement.rotation == 0), "attention has non-rotated body text");
-    assert!(e.iter().any(|el| el.placement.band > 0), "attention has multiple bands");
+    assert!(
+        e.iter().any(|el| el.placement.rotation != 0),
+        "attention has rotated sidebar (aside data-rotation=90)"
+    );
+    assert!(
+        e.iter().any(|el| el.placement.rotation == 0),
+        "attention has non-rotated body text"
+    );
+    assert!(
+        e.iter().any(|el| el.placement.band > 0),
+        "attention has multiple bands"
+    );
 }
 
 // ============================================================================
@@ -531,7 +621,12 @@ fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextEleme
         },
         placement: Placement {
             page_number: 0,
-            bounding_box: BoundingBox { x: 0.0, y: 0.0, width: 100.0, height: font_size },
+            bounding_box: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: font_size,
+            },
             band: 0,
             column: 0,
             nr_band_columns: 1,
@@ -551,14 +646,17 @@ fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextEleme
 fn make_style_data(classes: &[(&str, f32)]) -> StyleData {
     let mut font_classes = HashMap::new();
     for (class_name, font_size) in classes {
-        font_classes.insert(class_name.to_string(), FontClass {
-            class_name: class_name.to_string(),
-            font_family: "TestFamily".to_string(),
-            font_size: *font_size,
-            font_style: "normal".to_string(),
-            font_weight: "normal".to_string(),
-            color: "#000000".to_string(),
-        });
+        font_classes.insert(
+            class_name.to_string(),
+            FontClass {
+                class_name: class_name.to_string(),
+                font_family: "TestFamily".to_string(),
+                font_size: *font_size,
+                font_style: "normal".to_string(),
+                font_weight: "normal".to_string(),
+                color: "#000000".to_string(),
+            },
+        );
     }
     StyleData { font_classes }
 }
@@ -568,9 +666,7 @@ fn make_style_data(classes: &[(&str, f32)]) -> StyleData {
 /// After analysis, most_common_font_size should be 10.0 and 20pt should be absent.
 #[test]
 fn document_analysis_excludes_rotated() {
-    let mut elements: Vec<PdfTextElement> = (0..10)
-        .map(|_| make_element("f1", 10.0, 0))
-        .collect();
+    let mut elements: Vec<PdfTextElement> = (0..10).map(|_| make_element("f1", 10.0, 0)).collect();
     elements.push(make_element("f2", 20.0, 90));
 
     let analysis = DocumentAnalysis::analyze_text_elements(&elements);
@@ -605,9 +701,7 @@ fn document_analysis_excludes_rotated() {
 /// 10 elements at class f1 (10pt, rotation=0), 1 at class f2 (20pt, rotation=90).
 #[test]
 fn analyze_font_sizes_excludes_rotated() {
-    let mut elements: Vec<PdfTextElement> = (0..10)
-        .map(|_| make_element("f1", 10.0, 0))
-        .collect();
+    let mut elements: Vec<PdfTextElement> = (0..10).map(|_| make_element("f1", 10.0, 0)).collect();
     elements.push(make_element("f2", 20.0, 90));
 
     let style_data = make_style_data(&[("f1", 10.0), ("f2", 20.0)]);
@@ -623,11 +717,12 @@ fn analyze_font_sizes_excludes_rotated() {
         "potential_header_sizes should not contain rotated 20pt"
     );
     // The rotated class f2 should not be counted — it's either absent or zero.
-    let f2_count = font_analysis.class_usage_counts.get("f2").copied().unwrap_or(0);
-    assert_eq!(
-        f2_count, 0,
-        "rotated class f2 should have usage count 0"
-    );
+    let f2_count = font_analysis
+        .class_usage_counts
+        .get("f2")
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(f2_count, 0, "rotated class f2 should have usage count 0");
 }
 
 /// Test 3: Elements are NOT removed from the input slice.
@@ -635,9 +730,7 @@ fn analyze_font_sizes_excludes_rotated() {
 /// This test makes the "non-removal" contract explicit.
 #[test]
 fn rotated_elements_not_removed_from_input() {
-    let mut elements: Vec<PdfTextElement> = (0..10)
-        .map(|_| make_element("f1", 10.0, 0))
-        .collect();
+    let mut elements: Vec<PdfTextElement> = (0..10).map(|_| make_element("f1", 10.0, 0)).collect();
     elements.push(make_element("f2", 20.0, 90));
 
     // Call analyze — this must not consume or modify the input vec
@@ -645,7 +738,10 @@ fn rotated_elements_not_removed_from_input() {
 
     assert_eq!(elements.len(), 11, "input slice length must not change");
     let rotated_count = elements.iter().filter(|e| e.rotation() != 0).count();
-    assert_eq!(rotated_count, 1, "rotated element must still be present in input");
+    assert_eq!(
+        rotated_count, 1,
+        "rotated element must still be present in input"
+    );
 }
 
 /// Test 4: All-rotated edge case — must not panic.
@@ -709,7 +805,12 @@ fn make_v2_element(
         },
         placement: Placement {
             page_number: 0,
-            bounding_box: BoundingBox { x, y: 0.0, width, height: font_size },
+            bounding_box: BoundingBox {
+                x,
+                y: 0.0,
+                width,
+                height: font_size,
+            },
             band,
             column,
             nr_band_columns: 1,
@@ -780,13 +881,30 @@ fn make_doc_analysis() -> DocumentAnalysis {
 #[test]
 fn v2_test1_dispatched_and_detects_section() {
     // 1 section-quality element (18pt bold, isolated) + 5 body paragraphs (10pt)
-    let mut text_elements = vec![
-        make_v2_element("header", "Introduction", 18.0, "bold", 0, 1, 0, 0, 10.0, 100.0),
-    ];
+    let mut text_elements = vec![make_v2_element(
+        "header",
+        "Introduction",
+        18.0,
+        "bold",
+        0,
+        1,
+        0,
+        0,
+        10.0,
+        100.0,
+    )];
     for i in 0..5usize {
         text_elements.push(make_v2_element(
-            "body", "Body paragraph text here.", 10.0, "normal", 0,
-            (i as u32) + 2, 0, 0, 10.0, 300.0,
+            "body",
+            "Body paragraph text here.",
+            10.0,
+            "normal",
+            0,
+            (i as u32) + 2,
+            0,
+            0,
+            10.0,
+            300.0,
         ));
     }
 
@@ -795,16 +913,29 @@ fn v2_test1_dispatched_and_detects_section() {
     let font_analysis = make_font_analysis(10.0, &[("body", 5), ("header", 1)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     let result = rule.apply(vec![]).expect("apply should succeed");
 
-    let sections: Vec<_> = result.iter().filter(|e| e.element_type == ParsedElementType::Section).collect();
-    let paragraphs: Vec<_> = result.iter().filter(|e| e.element_type == ParsedElementType::Paragraph).collect();
+    let sections: Vec<_> = result
+        .iter()
+        .filter(|e| e.element_type == ParsedElementType::Section)
+        .collect();
+    let paragraphs: Vec<_> = result
+        .iter()
+        .filter(|e| e.element_type == ParsedElementType::Paragraph)
+        .collect();
 
     assert_eq!(sections.len(), 1, "should detect exactly 1 section");
     assert_eq!(paragraphs.len(), 5, "should have 5 body paragraphs");
@@ -816,13 +947,21 @@ fn v2_test1_dispatched_and_detects_section() {
 #[test]
 fn v2_test2_size_only_strong_candidate_is_section() {
     // header class is rare: 1 out of total 101 elements (< 5% threshold)
-    let mut text_elements = vec![
-        make_v2_element("h_rare", "Abstract", 18.0, "normal", 0, 1, 0, 0, 10.0, 80.0),
-    ];
+    let mut text_elements = vec![make_v2_element(
+        "h_rare", "Abstract", 18.0, "normal", 0, 1, 0, 0, 10.0, 80.0,
+    )];
     for i in 0..100usize {
         text_elements.push(make_v2_element(
-            "body", "Body text.", 10.0, "normal", 0,
-            (i as u32) + 2, 0, 0, 10.0, 300.0,
+            "body",
+            "Body text.",
+            10.0,
+            "normal",
+            0,
+            (i as u32) + 2,
+            0,
+            0,
+            10.0,
+            300.0,
         ));
     }
 
@@ -830,18 +969,26 @@ fn v2_test2_size_only_strong_candidate_is_section() {
     let font_analysis = make_font_analysis(10.0, &[("body", 100), ("h_rare", 1)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     // Only classify the first element
     let result = rule.apply(vec![]).expect("apply should succeed");
 
     let elem = &result[0];
     assert_eq!(
-        elem.element_type, ParsedElementType::Section,
+        elem.element_type,
+        ParsedElementType::Section,
         "18pt non-bold strong candidate should be a section"
     );
 }
@@ -855,27 +1002,58 @@ fn v2_test3_bold_inline_emphasis_is_not_section() {
     // Bboxes: x=10,w=100 | x=115,w=40               | x=160,w=200
     // Gap between seg0 and seg1: 115 - (10+100) = 5  → < isolation_neighbor_gap (20)
     let text_elements = vec![
-        make_v2_element("body", "Some leading text.", 10.0, "normal", 0, 5, 0, 0, 10.0, 100.0),
+        make_v2_element(
+            "body",
+            "Some leading text.",
+            10.0,
+            "normal",
+            0,
+            5,
+            0,
+            0,
+            10.0,
+            100.0,
+        ),
         make_v2_element("body_bold", "Note:", 10.0, "bold", 0, 5, 0, 0, 115.0, 40.0),
-        make_v2_element("body", "this is inline emphasis.", 10.0, "normal", 0, 5, 0, 0, 160.0, 200.0),
+        make_v2_element(
+            "body",
+            "this is inline emphasis.",
+            10.0,
+            "normal",
+            0,
+            5,
+            0,
+            0,
+            160.0,
+            200.0,
+        ),
     ];
 
     let font_analysis = make_font_analysis(10.0, &[("body", 2), ("body_bold", 1)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     let result = rule.apply(vec![]).expect("apply should succeed");
 
     for (i, elem) in result.iter().enumerate() {
         assert_eq!(
-            elem.element_type, ParsedElementType::Paragraph,
+            elem.element_type,
+            ParsedElementType::Paragraph,
             "element {} (text='{}') should be Paragraph, not Section (inline emphasis)",
-            i, elem.text
+            i,
+            elem.text
         );
     }
 }
@@ -887,13 +1065,30 @@ fn v2_test4_bold_isolated_at_body_size_is_section() {
     // The bold element is alone on its line — no same-line neighbors
     // It's also the only element with its class ("bold_class"): 1 out of 11 → 9% > 5%
     // So rarity doesn't confirm. But bold + isolated (weak) → section.
-    let mut text_elements = vec![
-        make_v2_element("bold_class", "Results", 10.0, "bold", 0, 3, 0, 0, 10.0, 60.0),
-    ];
+    let mut text_elements = vec![make_v2_element(
+        "bold_class",
+        "Results",
+        10.0,
+        "bold",
+        0,
+        3,
+        0,
+        0,
+        10.0,
+        60.0,
+    )];
     for i in 0..10usize {
         text_elements.push(make_v2_element(
-            "body", "Body paragraph text.", 10.0, "normal", 0,
-            (i as u32) + 4, 0, 0, 10.0, 300.0,
+            "body",
+            "Body paragraph text.",
+            10.0,
+            "normal",
+            0,
+            (i as u32) + 4,
+            0,
+            0,
+            10.0,
+            300.0,
         ));
     }
 
@@ -903,16 +1098,24 @@ fn v2_test4_bold_isolated_at_body_size_is_section() {
     let font_analysis = make_font_analysis(10.0, &[("bold_class", 1), ("body", 10)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     let result = rule.apply(vec![]).expect("apply should succeed");
 
     assert_eq!(
-        result[0].element_type, ParsedElementType::Section,
+        result[0].element_type,
+        ParsedElementType::Section,
         "10pt bold isolated element should be a section via weak+(bold AND isolated)"
     );
 }
@@ -925,9 +1128,18 @@ fn v2_test5_numbered_subsection_pattern_promotes_weak() {
     // Use exactly 10.05pt to be within the weak zone (body=10.0, tol=0.1 → weak = [9.9, 10.1])
     // Wait: weak = font_size >= body - tol → 10.05 >= 9.9 (yes) AND NOT font_size > body + tol
     // font_size > body + tol → 10.05 > 10.1 → false → weak. Correct.
-    let text_elements = vec![
-        make_v2_element("body", "3.2 Model Architecture", 10.05, "normal", 0, 1, 0, 0, 10.0, 150.0),
-    ];
+    let text_elements = vec![make_v2_element(
+        "body",
+        "3.2 Model Architecture",
+        10.05,
+        "normal",
+        0,
+        1,
+        0,
+        0,
+        10.0,
+        150.0,
+    )];
 
     // No same-line neighbors → isolated = true. But weak + (bold AND isolated) → bold is false.
     // weak + (isolated AND rare): count/total = 1/1 = 100% → not rare.
@@ -935,11 +1147,18 @@ fn v2_test5_numbered_subsection_pattern_promotes_weak() {
     let font_analysis = make_font_analysis(10.0, &[("body", 1)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     let result = rule.apply(vec![]).expect("apply should succeed");
 
@@ -957,18 +1176,34 @@ fn v2_test6_figure_caption_is_demoted() {
     // Text matches "^Figure\s" exclusion pattern → demoted.
     // Inclusion: "^\\d+\\." matches "Figure 3:" — no. "^\\d+" doesn't match "Figure".
     // So final result is non-section.
-    let text_elements = vec![
-        make_v2_element("caption", "Figure 3: The Transformer architecture.", 11.0, "bold", 0, 1, 0, 0, 10.0, 200.0),
-    ];
+    let text_elements = vec![make_v2_element(
+        "caption",
+        "Figure 3: The Transformer architecture.",
+        11.0,
+        "bold",
+        0,
+        1,
+        0,
+        0,
+        10.0,
+        200.0,
+    )];
 
     let font_analysis = make_font_analysis(10.0, &[("caption", 1)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     let result = rule.apply(vec![]).expect("apply should succeed");
 
@@ -983,23 +1218,40 @@ fn v2_test6_figure_caption_is_demoted() {
 #[test]
 fn v2_test7_rotated_element_is_never_section() {
     // 20pt bold — rotation=90 → must be Paragraph
-    let text_elements = vec![
-        make_v2_element("sidebar", "arxiv 2017.09", 20.0, "bold", 90, 1, 0, 0, 10.0, 200.0),
-    ];
+    let text_elements = vec![make_v2_element(
+        "sidebar",
+        "arxiv 2017.09",
+        20.0,
+        "bold",
+        90,
+        1,
+        0,
+        0,
+        10.0,
+        200.0,
+    )];
 
     let font_analysis = make_font_analysis(10.0, &[("sidebar", 1)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     let result = rule.apply(vec![]).expect("apply should succeed");
 
     assert_eq!(
-        result[0].element_type, ParsedElementType::Paragraph,
+        result[0].element_type,
+        ParsedElementType::Paragraph,
         "Rotated element (rotation=90) must never be classified as Section"
     );
 }
@@ -1012,7 +1264,18 @@ fn v2_test7_rotated_element_is_never_section() {
 /// This test verifies the structural migration is complete and nothing was silently dropped.
 #[test]
 fn placement_fields_accessible_via_struct() {
-    let element = make_v2_element("header", "Round-trip test", 14.0, "bold", 90, 3, 2, 1, 42.5, 120.0);
+    let element = make_v2_element(
+        "header",
+        "Round-trip test",
+        14.0,
+        "bold",
+        90,
+        3,
+        2,
+        1,
+        42.5,
+        120.0,
+    );
     assert_eq!(element.placement.page_number, 0);
     assert_eq!(element.placement.bounding_box.x, 42.5);
     assert_eq!(element.placement.bounding_box.width, 120.0);
@@ -1043,7 +1306,18 @@ fn v2_test8_hierarchy_levels_assigned_correctly() {
     let text_elements = vec![
         make_v2_element("h1", "Chapter One", 16.0, "bold", 0, 1, 0, 0, 10.0, 100.0),
         make_v2_element("h2", "Section 1.1", 13.0, "bold", 0, 2, 0, 0, 10.0, 80.0),
-        make_v2_element("h3", "Subsection 1.1.1", 11.0, "bold", 0, 3, 0, 0, 10.0, 120.0),
+        make_v2_element(
+            "h3",
+            "Subsection 1.1.1",
+            11.0,
+            "bold",
+            0,
+            3,
+            0,
+            0,
+            10.0,
+            120.0,
+        ),
         make_v2_element("h1", "Chapter Two", 16.0, "bold", 0, 4, 0, 0, 10.0, 100.0),
     ];
 
@@ -1054,19 +1328,41 @@ fn v2_test8_hierarchy_levels_assigned_correctly() {
         ..SectionDetectionV2Config::default()
     });
     let doc_analysis = make_doc_analysis();
-    let style_data = StyleData { font_classes: HashMap::new() };
+    let style_data = StyleData {
+        font_classes: HashMap::new(),
+    };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
     let rule = SectionDetectionV2Rule::new(
-        &engine, &text_elements, &config, &doc_analysis, &font_analysis, &style_data,
+        &engine,
+        &text_elements,
+        &config,
+        &doc_analysis,
+        &font_analysis,
+        &style_data,
     );
     let result = rule.apply(vec![]).expect("apply should succeed");
 
-    let sections: Vec<_> = result.iter().filter(|e| e.element_type == ParsedElementType::Section).collect();
+    let sections: Vec<_> = result
+        .iter()
+        .filter(|e| e.element_type == ParsedElementType::Section)
+        .collect();
     assert_eq!(sections.len(), 4, "should detect all 4 sections");
 
-    assert_eq!(sections[0].hierarchy_level, 1, "Chapter One (16pt) should be level 1");
-    assert_eq!(sections[1].hierarchy_level, 2, "Section 1.1 (13pt) should be level 2");
-    assert_eq!(sections[2].hierarchy_level, 3, "Subsection 1.1.1 (11pt) should be level 3");
-    assert_eq!(sections[3].hierarchy_level, 1, "Chapter Two (16pt) should step back to level 1");
+    assert_eq!(
+        sections[0].hierarchy_level, 1,
+        "Chapter One (16pt) should be level 1"
+    );
+    assert_eq!(
+        sections[1].hierarchy_level, 2,
+        "Section 1.1 (13pt) should be level 2"
+    );
+    assert_eq!(
+        sections[2].hierarchy_level, 3,
+        "Subsection 1.1.1 (11pt) should be level 3"
+    );
+    assert_eq!(
+        sections[3].hierarchy_level, 1,
+        "Chapter Two (16pt) should step back to level 1"
+    );
 }

@@ -93,11 +93,27 @@ fn equivalence_key(el: &ParsedPdfElement, cfg: &NodeTypeMergeConfig) -> Equivale
     EquivalenceKey {
         page: p.page_number,
         element_type: el.element_type.clone(),
-        band:      if cfg.same_band      { Some(p.band) }              else { None },
-        column:    if cfg.same_column    { Some(p.column) }            else { None },
-        paragraph: if cfg.same_paragraph { Some(p.paragraph_number) }  else { None },
-        line:      if cfg.same_line      { Some(p.line_number) }       else { None },
-        depth:     if cfg.same_depth     { Some(el.hierarchy_level) }  else { None },
+        band: if cfg.same_band { Some(p.band) } else { None },
+        column: if cfg.same_column {
+            Some(p.column)
+        } else {
+            None
+        },
+        paragraph: if cfg.same_paragraph {
+            Some(p.paragraph_number)
+        } else {
+            None
+        },
+        line: if cfg.same_line {
+            Some(p.line_number)
+        } else {
+            None
+        },
+        depth: if cfg.same_depth {
+            Some(el.hierarchy_level)
+        } else {
+            None
+        },
     }
 }
 
@@ -350,10 +366,7 @@ impl<'a> NodeTypeClusteringRule<'a> {
             partition_order.len(),
             total_groups,
         );
-        println!(
-            "   ✅ NodeTypeClustering: {} output elements",
-            merged.len(),
-        );
+        println!("   ✅ NodeTypeClustering: {} output elements", merged.len(),);
 
         Ok(merged)
     }
@@ -387,10 +400,22 @@ mod tests {
         }
     }
 
-    fn mk_placement(page: u32, band: u32, column: u32, paragraph: u32, line: u32, y: f32) -> Placement {
+    fn mk_placement(
+        page: u32,
+        band: u32,
+        column: u32,
+        paragraph: u32,
+        line: u32,
+        y: f32,
+    ) -> Placement {
         Placement {
             page_number: page,
-            bounding_box: BoundingBox { x: 0.0, y, width: 100.0, height: 17.7 },
+            bounding_box: BoundingBox {
+                x: 0.0,
+                y,
+                width: 100.0,
+                height: 17.7,
+            },
             band,
             column,
             nr_band_columns: 1,
@@ -423,7 +448,10 @@ mod tests {
 
     /// Direct algorithm invocation — bypasses `RuleEngine` to avoid wiring the
     /// full engine context for a unit test. Mirrors `NodeTypeClusteringRule::apply`.
-    fn run_rule(elements: Vec<ParsedPdfElement>, cfg: &crate::config::NodeTypeClusteringConfig) -> Vec<ParsedPdfElement> {
+    fn run_rule(
+        elements: Vec<ParsedPdfElement>,
+        cfg: &crate::config::NodeTypeClusteringConfig,
+    ) -> Vec<ParsedPdfElement> {
         let pick = |ty: &ParsedElementType| -> &NodeTypeMergeConfig {
             match ty {
                 ParsedElementType::Section => &cfg.section,
@@ -457,12 +485,16 @@ mod tests {
                 };
                 if split {
                     let g = std::mem::take(&mut group);
-                    if let Some(m) = merge_group(g, tcfg) { out.push(m); }
+                    if let Some(m) = merge_group(g, tcfg) {
+                        out.push(m);
+                    }
                 }
                 group.push(el);
             }
             if !group.is_empty() {
-                if let Some(m) = merge_group(group, tcfg) { out.push(m); }
+                if let Some(m) = merge_group(group, tcfg) {
+                    out.push(m);
+                }
             }
         }
         out.sort_by_key(|el| el.reading_order);
@@ -623,7 +655,10 @@ table_line_separator: "\n"
             serde_yaml::from_str(yaml).expect("legacy YAML must deserialize");
         for t in &[&cfg.section, &cfg.paragraph, &cfg.list, &cfg.list_item] {
             assert!(!t.same_line, "legacy default does not require same_line");
-            assert!(t.same_paragraph, "merge_lines=true keys on paragraph_number");
+            assert!(
+                t.same_paragraph,
+                "merge_lines=true keys on paragraph_number"
+            );
             assert!(t.same_band);
             assert!(t.same_column);
             assert!(!t.same_depth);

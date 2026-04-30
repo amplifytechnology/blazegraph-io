@@ -1,5 +1,5 @@
-use crate::types::PreprocessorOutput;
 use crate::cache::GraphCacheKey;
+use crate::types::PreprocessorOutput;
 use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -28,12 +28,21 @@ pub enum CachePoint {
 impl CachePoint {
     /// All cache points in pipeline order.
     pub fn all() -> &'static [CachePoint] {
-        &[CachePoint::C0, CachePoint::C1, CachePoint::C2, CachePoint::C3]
+        &[
+            CachePoint::C0,
+            CachePoint::C1,
+            CachePoint::C2,
+            CachePoint::C3,
+        ]
     }
 
     /// Cache points at and downstream of this point (for cascade operations).
     pub fn cascade(&self) -> Vec<CachePoint> {
-        CachePoint::all().iter().copied().filter(|p| p >= self).collect()
+        CachePoint::all()
+            .iter()
+            .copied()
+            .filter(|p| p >= self)
+            .collect()
     }
 
     /// Directory name for this cache point.
@@ -54,19 +63,26 @@ impl CachePoint {
             "c2" => Ok(Some(CachePoint::C2)),
             "c3" => Ok(Some(CachePoint::C3)),
             "all" => Ok(None), // None = all points
-            _ => Err(anyhow!("Invalid cache point: '{}'. Use c0, c1, c2, c3, or all", s)),
+            _ => Err(anyhow!(
+                "Invalid cache point: '{}'. Use c0, c1, c2, c3, or all",
+                s
+            )),
         }
     }
 }
 
 impl std::fmt::Display for CachePoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", match self {
-            CachePoint::C0 => "C0 (PDF)",
-            CachePoint::C1 => "C1 (XHTML)",
-            CachePoint::C2 => "C2 (Preprocessor)",
-            CachePoint::C3 => "C3 (Graph)",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                CachePoint::C0 => "C0 (PDF)",
+                CachePoint::C1 => "C1 (XHTML)",
+                CachePoint::C2 => "C2 (Preprocessor)",
+                CachePoint::C3 => "C3 (Graph)",
+            }
+        )
     }
 }
 
@@ -105,7 +121,10 @@ impl FreshFrom {
             "c1" => Ok(FreshFrom::C1),
             "c2" => Ok(FreshFrom::C2),
             "c3" => Ok(FreshFrom::C3),
-            _ => Err(anyhow!("Invalid fresh-from value: '{}'. Use c0, c1, c2, or c3", s)),
+            _ => Err(anyhow!(
+                "Invalid fresh-from value: '{}'. Use c0, c1, c2, or c3",
+                s
+            )),
         }
     }
 }
@@ -166,8 +185,15 @@ pub trait DocumentStorage {
     fn store_preprocessor_output(&self, pdf_hash: &str, output: &PreprocessorOutput) -> Result<()>;
 
     // C3: Graph output (config-dependent)
-    fn get_graph_output(&self, cache_key: &GraphCacheKey) -> Result<Option<crate::cache::GraphCacheValue>>;
-    fn store_graph_output(&self, cache_key: &GraphCacheKey, cache_value: &crate::cache::GraphCacheValue) -> Result<()>;
+    fn get_graph_output(
+        &self,
+        cache_key: &GraphCacheKey,
+    ) -> Result<Option<crate::cache::GraphCacheValue>>;
+    fn store_graph_output(
+        &self,
+        cache_key: &GraphCacheKey,
+        cache_value: &crate::cache::GraphCacheValue,
+    ) -> Result<()>;
 
     // Cache management
     fn clear_cache(&self, from_point: Option<CachePoint>) -> Result<CacheClearResult>;
@@ -212,7 +238,11 @@ impl FileStorage {
     }
 
     fn graph_path(&self, cache_key: &GraphCacheKey) -> String {
-        format!("{}/c3-graph/{}.json", self.cache_dir, cache_key.to_cache_hash())
+        format!(
+            "{}/c3-graph/{}.json",
+            self.cache_dir,
+            cache_key.to_cache_hash()
+        )
     }
 
     /// Delete all files in a cache point directory, return count deleted.
@@ -289,7 +319,10 @@ impl DocumentStorage for FileStorage {
     }
 
     // C3: Graph output
-    fn get_graph_output(&self, cache_key: &GraphCacheKey) -> Result<Option<crate::cache::GraphCacheValue>> {
+    fn get_graph_output(
+        &self,
+        cache_key: &GraphCacheKey,
+    ) -> Result<Option<crate::cache::GraphCacheValue>> {
         let path = self.graph_path(cache_key);
         if Path::new(&path).exists() {
             let json_str = fs::read_to_string(path)?;
@@ -301,7 +334,11 @@ impl DocumentStorage for FileStorage {
         }
     }
 
-    fn store_graph_output(&self, cache_key: &GraphCacheKey, cache_value: &crate::cache::GraphCacheValue) -> Result<()> {
+    fn store_graph_output(
+        &self,
+        cache_key: &GraphCacheKey,
+        cache_value: &crate::cache::GraphCacheValue,
+    ) -> Result<()> {
         let path = self.graph_path(cache_key);
         let json_str = serde_json::to_string_pretty(cache_value)
             .map_err(|e| anyhow!("Failed to serialize GraphCacheValue: {}", e))?;
@@ -408,14 +445,41 @@ impl NoOpStorage {
 }
 
 impl DocumentStorage for NoOpStorage {
-    fn get_pdf(&self, _hash: &str) -> Result<Option<Vec<u8>>> { Ok(None) }
-    fn store_pdf(&self, _hash: &str, _data: &[u8]) -> Result<()> { Ok(()) }
-    fn get_xhtml(&self, _pdf_hash: &str) -> Result<Option<String>> { Ok(None) }
-    fn store_xhtml(&self, _pdf_hash: &str, _xhtml: &str) -> Result<()> { Ok(()) }
-    fn get_preprocessor_output(&self, _pdf_hash: &str) -> Result<Option<PreprocessorOutput>> { Ok(None) }
-    fn store_preprocessor_output(&self, _pdf_hash: &str, _output: &PreprocessorOutput) -> Result<()> { Ok(()) }
-    fn get_graph_output(&self, _cache_key: &GraphCacheKey) -> Result<Option<crate::cache::GraphCacheValue>> { Ok(None) }
-    fn store_graph_output(&self, _cache_key: &GraphCacheKey, _cache_value: &crate::cache::GraphCacheValue) -> Result<()> { Ok(()) }
+    fn get_pdf(&self, _hash: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn store_pdf(&self, _hash: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn get_xhtml(&self, _pdf_hash: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn store_xhtml(&self, _pdf_hash: &str, _xhtml: &str) -> Result<()> {
+        Ok(())
+    }
+    fn get_preprocessor_output(&self, _pdf_hash: &str) -> Result<Option<PreprocessorOutput>> {
+        Ok(None)
+    }
+    fn store_preprocessor_output(
+        &self,
+        _pdf_hash: &str,
+        _output: &PreprocessorOutput,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn get_graph_output(
+        &self,
+        _cache_key: &GraphCacheKey,
+    ) -> Result<Option<crate::cache::GraphCacheValue>> {
+        Ok(None)
+    }
+    fn store_graph_output(
+        &self,
+        _cache_key: &GraphCacheKey,
+        _cache_value: &crate::cache::GraphCacheValue,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn clear_cache(&self, _from_point: Option<CachePoint>) -> Result<CacheClearResult> {
         Ok(CacheClearResult { deleted: vec![] })
     }
@@ -483,9 +547,23 @@ mod tests {
 
     #[test]
     fn test_cache_point_cascade() {
-        assert_eq!(CachePoint::C0.cascade(), vec![CachePoint::C0, CachePoint::C1, CachePoint::C2, CachePoint::C3]);
-        assert_eq!(CachePoint::C1.cascade(), vec![CachePoint::C1, CachePoint::C2, CachePoint::C3]);
-        assert_eq!(CachePoint::C2.cascade(), vec![CachePoint::C2, CachePoint::C3]);
+        assert_eq!(
+            CachePoint::C0.cascade(),
+            vec![
+                CachePoint::C0,
+                CachePoint::C1,
+                CachePoint::C2,
+                CachePoint::C3
+            ]
+        );
+        assert_eq!(
+            CachePoint::C1.cascade(),
+            vec![CachePoint::C1, CachePoint::C2, CachePoint::C3]
+        );
+        assert_eq!(
+            CachePoint::C2.cascade(),
+            vec![CachePoint::C2, CachePoint::C3]
+        );
         assert_eq!(CachePoint::C3.cascade(), vec![CachePoint::C3]);
     }
 
@@ -518,7 +596,10 @@ mod tests {
 
         // Clear from C1 should cascade to C2 and C3
         let result = storage.clear_cache(Some(CachePoint::C1)).unwrap();
-        assert!(result.deleted.iter().any(|(p, c)| *p == CachePoint::C1 && *c == 2));
+        assert!(result
+            .deleted
+            .iter()
+            .any(|(p, c)| *p == CachePoint::C1 && *c == 2));
 
         // Verify files are gone
         assert!(storage.get_xhtml("hash1").unwrap().is_none());

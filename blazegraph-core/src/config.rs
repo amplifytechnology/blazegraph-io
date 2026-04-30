@@ -84,7 +84,6 @@ impl Default for NodeTypeClusteringConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeTypeMergeConfig {
     // ── Boundary constraints (split when violated between consecutive elements) ──
-
     /// Require both elements be in the same Tika line (line_number equality).
     #[serde(default)]
     pub same_line: bool,
@@ -105,7 +104,6 @@ pub struct NodeTypeMergeConfig {
     pub same_column: bool,
 
     // ── Safety constraints ──────────────────────────────────────────────────────
-
     /// Require both elements have equal `hierarchy_level`. Prevents a section
     /// header and a sub-section header on the same page from merging just
     /// because they share a band-collapsed bucket.
@@ -120,7 +118,6 @@ pub struct NodeTypeMergeConfig {
     pub max_y_gap: Option<f32>,
 
     // ── Output formatting ───────────────────────────────────────────────────────
-
     /// Separator between merged elements crossing line boundaries when the
     /// element's band has ≤2 columns (prose flows continuously).
     #[serde(default = "default_prose_separator")]
@@ -132,8 +129,12 @@ pub struct NodeTypeMergeConfig {
     pub table_line_separator: String,
 }
 
-fn default_prose_separator() -> String { " ".to_string() }
-fn default_table_separator() -> String { "\n".to_string() }
+fn default_prose_separator() -> String {
+    " ".to_string()
+}
+fn default_table_separator() -> String {
+    "\n".to_string()
+}
 
 impl NodeTypeMergeConfig {
     /// Section default: cross-band merge enabled (multi-line title case), gated
@@ -187,12 +188,15 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
         let value = serde_yaml::Value::deserialize(deserializer)?;
         let mapping = value
             .as_mapping()
-            .ok_or_else(|| serde::de::Error::custom(
-                "node_type_clustering: expected a mapping",
-            ))?;
+            .ok_or_else(|| serde::de::Error::custom("node_type_clustering: expected a mapping"))?;
 
         // If any legacy cascade key is present, route to the migration shim.
-        let legacy_keys = ["merge_segments", "merge_lines", "merge_columns", "merge_bands"];
+        let legacy_keys = [
+            "merge_segments",
+            "merge_lines",
+            "merge_columns",
+            "merge_bands",
+        ];
         let is_legacy = legacy_keys
             .iter()
             .any(|k| mapping.contains_key(serde_yaml::Value::String((*k).to_string())));
@@ -213,18 +217,18 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
                 #[serde(default = "default_table_separator")]
                 table_line_separator: String,
             }
-            let l: LegacyParagraphClustering = serde_yaml::from_value(value)
-                .map_err(serde::de::Error::custom)?;
+            let l: LegacyParagraphClustering =
+                serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
 
             // Translate cascade booleans → constraint set. The cascade rule is:
             // higher levels imply all lower levels. Effective level = highest
             // enabled flag. The constraint that splits on each level boundary
             // is `same_X: true` for the level just above the effective one.
             let unified = NodeTypeMergeConfig {
-                same_line:      l.merge_segments && !l.merge_lines && !l.merge_columns && !l.merge_bands,
-                same_paragraph: l.merge_lines     && !l.merge_columns && !l.merge_bands,
-                same_band:      !l.merge_bands,
-                same_column:    !l.merge_columns && !l.merge_bands,
+                same_line: l.merge_segments && !l.merge_lines && !l.merge_columns && !l.merge_bands,
+                same_paragraph: l.merge_lines && !l.merge_columns && !l.merge_bands,
+                same_band: !l.merge_bands,
+                same_column: !l.merge_columns && !l.merge_bands,
                 same_depth: false,
                 max_y_gap: None,
                 prose_line_separator: l.prose_line_separator,
@@ -368,7 +372,7 @@ impl Default for SectionAndHierarchyConfig {
             small_header_threshold: 0.1,
             min_header_size: 8.5,
             use_bold_indicator: true,
-            bold_size_strict: true,  // Default to strict mode (bold AND larger)
+            bold_size_strict: true, // Default to strict mode (bold AND larger)
             max_depth: 5,
             font_size_tolerance: 0.1,
             enforce_max_depth: true,
@@ -415,7 +419,6 @@ pub struct ElementClusteringConfig {
 fn default_y_tolerance() -> f32 {
     15.0
 }
-
 
 fn default_false() -> bool {
     false
@@ -475,7 +478,6 @@ pub struct ListDetectionConfig {
     /// Y-coordinate tolerance for considering elements on the same line (in points)
     #[serde(default = "default_y_tolerance")]
     pub y_tolerance: f32,
-
 
     /// List item patterns
     /// Bullet point patterns to detect
@@ -538,7 +540,7 @@ pub struct SequentialNumberingConfig {
     /// Allow letter sequences (a, b, c) in addition to numbers
     #[serde(default = "default_true")]
     pub allow_letter_sequences: bool,
-    
+
     /// Maximum gap tolerance between numbers (0 = no gaps allowed)
     #[serde(default = "default_zero")]
     pub max_gap_tolerance: u32,
@@ -558,7 +560,7 @@ pub struct MathematicalContextConfig {
     /// Mathematical symbols to detect
     #[serde(default = "default_mathematical_symbols")]
     pub symbols: Vec<String>,
-    
+
     /// Mathematical terms that indicate context
     #[serde(default = "default_mathematical_terms")]
     pub terms: Vec<String>,
@@ -578,7 +580,7 @@ pub struct HyphenContextConfig {
     /// Strategy for handling hyphens: "reject", "strict", "context_aware"
     #[serde(default = "default_hyphen_strategy")]
     pub strategy: String,
-    
+
     /// Require space after hyphen for valid lists
     #[serde(default = "default_true")]
     pub require_space_after: bool,
@@ -601,7 +603,7 @@ fn default_zero() -> u32 {
 fn default_mathematical_symbols() -> Vec<String> {
     vec![
         "→".to_string(),
-        "←".to_string(), 
+        "←".to_string(),
         "⇒".to_string(),
         "⇐".to_string(),
         "∀".to_string(),
@@ -628,46 +630,46 @@ pub struct ListValidationConfig {
     /// Whether list validation is enabled
     #[serde(default = "default_validation_enabled")]
     pub enabled: bool,
-    
+
     /// Minimum number of items required for a valid list
     #[serde(default = "default_true")]
     pub minimum_size_check: bool,
-    
+
     /// Validate that numbered lists start with "1" (or equivalent first item)
     #[serde(default = "default_true")]
     pub first_item_validation: bool,
-    
+
     /// If using parenthetical numbering (n), must start with (1)
     #[serde(default = "default_true")]
     pub parenthetical_context_check: bool,
-    
+
     // Advanced validation rules (enabled by default)
     #[serde(default = "default_true")]
     pub sequential_numbering_check: bool,
-    
+
     #[serde(default = "default_true")]
     pub mathematical_context_check: bool,
-    
+
     #[serde(default = "default_true")]
     pub hyphen_context_check: bool,
-    
+
     // Rule-specific configurations
     #[serde(default)]
     pub sequential_numbering: SequentialNumberingConfig,
-    
+
     #[serde(default)]
     pub mathematical_context: MathematicalContextConfig,
-    
+
     #[serde(default)]
     pub hyphen_context: HyphenContextConfig,
-    
+
     // Future validation rules (disabled by default)
     #[serde(default = "default_false")]
     pub sequence_pattern_check: bool,
-    
+
     #[serde(default = "default_false")]
     pub content_quality_check: bool,
-    
+
     #[serde(default = "default_false")]
     pub spatial_coherence_check: bool,
 }
@@ -878,7 +880,10 @@ pub struct InvariantToggle {
 
 impl Default for InvariantToggle {
     fn default() -> Self {
-        Self { check: true, correct: true }
+        Self {
+            check: true,
+            correct: true,
+        }
     }
 }
 
@@ -924,25 +929,46 @@ impl Default for SectionDetectionV2Config {
             enforce_max_depth: true,
             starting_section_level: 1,
             inclusion_patterns: vec![
-                r"^\d+\.".to_string(),          // "1.", "2.", ...
-                r"^\d+\.\d+".to_string(),       // "1.1", "3.2", ...
+                r"^\d+\.".to_string(),    // "1.", "2.", ...
+                r"^\d+\.\d+".to_string(), // "1.1", "3.2", ...
                 r"^Chapter\s+\d+".to_string(),
                 r"^Appendix\s+[A-Z]".to_string(),
             ],
             inclusion_max_length: 30,
-            exclusion_patterns: vec![
-                r"^Figure\s".to_string(),
-                r"^Table\s".to_string(),
-            ],
+            exclusion_patterns: vec![r"^Figure\s".to_string(), r"^Table\s".to_string()],
             tiebreaker_keywords: vec![
-                TiebreakerKeyword { name: "part".into(),     pattern: r"(?i)^part\s+[IVXLCDM\d]+".into() },
-                TiebreakerKeyword { name: "chapter".into(),  pattern: r"(?i)^chapter\s+[IVXLCDM\d]+".into() },
-                TiebreakerKeyword { name: "article".into(),  pattern: r"(?i)^article\s+\d+[a-z]?".into() },
-                TiebreakerKeyword { name: "section".into(),  pattern: r"(?i)^section\s+\d+[a-z]?".into() },
-                TiebreakerKeyword { name: "appendix".into(), pattern: r"(?i)^appendix\s+[A-Z\d]+".into() },
-                TiebreakerKeyword { name: "schedule".into(), pattern: r"(?i)^schedule\s+\d+".into() },
-                TiebreakerKeyword { name: "annex".into(),    pattern: r"(?i)^annex\s+[IVX\d]+".into() },
-                TiebreakerKeyword { name: "numbered".into(), pattern: r"^\d+\s+[A-Z]".into() },
+                TiebreakerKeyword {
+                    name: "part".into(),
+                    pattern: r"(?i)^part\s+[IVXLCDM\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "chapter".into(),
+                    pattern: r"(?i)^chapter\s+[IVXLCDM\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "article".into(),
+                    pattern: r"(?i)^article\s+\d+[a-z]?".into(),
+                },
+                TiebreakerKeyword {
+                    name: "section".into(),
+                    pattern: r"(?i)^section\s+\d+[a-z]?".into(),
+                },
+                TiebreakerKeyword {
+                    name: "appendix".into(),
+                    pattern: r"(?i)^appendix\s+[A-Z\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "schedule".into(),
+                    pattern: r"(?i)^schedule\s+\d+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "annex".into(),
+                    pattern: r"(?i)^annex\s+[IVX\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "numbered".into(),
+                    pattern: r"^\d+\s+[A-Z]".into(),
+                },
             ],
         }
     }
@@ -1152,7 +1178,7 @@ impl ParsingConfig {
         let config: ParsingConfig = serde_yaml::from_str(&content)?;
         Ok(config)
     }
-    
+
     /// Load config with fallback to default
     pub fn load_with_fallback(path: Option<&str>) -> Self {
         match path {

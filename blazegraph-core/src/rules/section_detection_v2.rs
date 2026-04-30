@@ -134,10 +134,7 @@ impl HierarchyContext {
             self.stack.pop();
         }
 
-        let top_keyword = self
-            .stack
-            .last()
-            .and_then(|a| a.keyword.as_deref());
+        let top_keyword = self.stack.last().and_then(|a| a.keyword.as_deref());
 
         // Same keyword as effective top → sibling. Replace top's font_size so
         // future deltas measure against the most recent section.
@@ -295,11 +292,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let tiebreaker_regexes = v2
             .tiebreaker_keywords
             .iter()
-            .filter_map(|tk| {
-                Regex::new(&tk.pattern)
-                    .ok()
-                    .map(|re| (tk.name.clone(), re))
-            })
+            .filter_map(|tk| Regex::new(&tk.pattern).ok().map(|re| (tk.name.clone(), re)))
             .collect();
 
         let mut band_extents: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
@@ -368,9 +361,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
             return true;
         }
         let family = element.style_info.font_family.to_lowercase();
-        family.contains("bold")
-            || family.contains("medi")
-            || family.contains("bx")
+        family.contains("bold") || family.contains("medi") || family.contains("bx")
     }
 
     /// Determine isolation as a single geometric question:
@@ -454,11 +445,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let class_name = &element.style_info.class_name;
 
         // Total non-rotated element count = sum of all class_usage_counts values
-        let total: usize = self
-            .font_size_analysis
-            .class_usage_counts
-            .values()
-            .sum();
+        let total: usize = self.font_size_analysis.class_usage_counts.values().sum();
 
         if total == 0 {
             return false;
@@ -709,7 +696,7 @@ mod tests {
     use crate::config::{ParsingConfig, SectionDetectionV2Config};
     use crate::rules::engine::FontSizeAnalysis;
     use crate::types::{
-        BoundingBox, DocumentAnalysis, FontClass, Placement, PdfTextElement, StyleData,
+        BoundingBox, DocumentAnalysis, FontClass, PdfTextElement, Placement, StyleData,
     };
     use std::collections::HashMap;
 
@@ -955,10 +942,7 @@ mod tests {
         let body = 10.0;
         // "rare_font" appears 1/100 times = 1% < rarity_threshold 5% → rare
         let elements = vec![make_element(10.5, false, "rare_font", 0)];
-        let font_analysis = make_font_analysis(
-            body,
-            vec![("rare_font", 1), ("body", 99)],
-        );
+        let font_analysis = make_font_analysis(body, vec![("rare_font", 1), ("body", 99)]);
         let config = make_config(1.0, 5.0, None, 0.80);
         assert!(classify(&elements, &font_analysis, &config));
     }
@@ -1083,8 +1067,7 @@ mod tests {
     /// CR-20 Test 2 — LaTeX "Medi" family detected as bold (NimbusRomNo9L-Medi).
     #[test]
     fn test_bold_detected_via_medi_family() {
-        let element =
-            make_element_with_font(12.0, "normal", "NimbusRomNo9L-Medi", "latex-medi", 0);
+        let element = make_element_with_font(12.0, "normal", "NimbusRomNo9L-Medi", "latex-medi", 0);
         assert!(SectionDetectionV2Rule::is_bold(&element));
     }
 
@@ -1175,7 +1158,10 @@ mod tests {
             &style_data,
         );
         // Index 1 is on page 2; page 1 element must not count as a neighbour
-        assert!(rule.is_isolated(1), "cross-page element must not be a neighbour");
+        assert!(
+            rule.is_isolated(1),
+            "cross-page element must not be a neighbour"
+        );
     }
 
     /// Same page, same (page, band, col), same Y line — line-extent fills column.
@@ -1329,7 +1315,12 @@ mod tests {
             },
             placement: Placement {
                 page_number: 1,
-                bounding_box: BoundingBox { x, y: 0.0, width, height: 12.0 },
+                bounding_box: BoundingBox {
+                    x,
+                    y: 0.0,
+                    width,
+                    height: 12.0,
+                },
                 band: 0,
                 column: 0,
                 nr_band_columns: 1,
@@ -1424,7 +1415,11 @@ mod tests {
     /// the inclusion path.
     #[test]
     fn test_cr26_exclusion_unaffected_by_isolation_gate() {
-        let elements = vec![make_inclusion_element("Figure 3: Architecture", 100.0, 80.0)];
+        let elements = vec![make_inclusion_element(
+            "Figure 3: Architecture",
+            100.0,
+            80.0,
+        )];
         let (config, fa, da, sd, eng) =
             build_pattern_rule_test(&elements, vec![], vec!["^Figure\\s"]);
         let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
@@ -1518,7 +1513,10 @@ mod tests {
         let mut ctx = HierarchyContext::new();
         let d1 = ctx.update_for_section(12.0, None, &cfg);
         let d2 = ctx.update_for_section(12.0, None, &cfg);
-        assert_eq!(d1, d2, "two None-keyword sections at equal font must be siblings");
+        assert_eq!(
+            d1, d2,
+            "two None-keyword sections at equal font must be siblings"
+        );
     }
 
     /// CR-27 Test 5 — `None` after a keyword fires tiebreaker (deeper).
@@ -1529,7 +1527,11 @@ mod tests {
         let mut ctx = HierarchyContext::new();
         let d_chap = ctx.update_for_section(12.0, Some("chapter"), &cfg);
         let d_subtitle = ctx.update_for_section(12.0, None, &cfg);
-        assert_eq!(d_subtitle, d_chap + 1, "subtitle must be one deeper than CHAPTER");
+        assert_eq!(
+            d_subtitle,
+            d_chap + 1,
+            "subtitle must be one deeper than CHAPTER"
+        );
     }
 
     /// CR-27 Test 6 — font-delta still wins when decisive (skips the tiebreaker).
@@ -1539,7 +1541,11 @@ mod tests {
         let mut ctx = HierarchyContext::new();
         let d_title = ctx.update_for_section(24.0, None, &cfg);
         let d_part = ctx.update_for_section(12.0, Some("part"), &cfg);
-        assert_eq!(d_part, d_title + 1, "decisive font-delta still pushes deeper");
+        assert_eq!(
+            d_part,
+            d_title + 1,
+            "decisive font-delta still pushes deeper"
+        );
     }
 
     /// CR-27 Test 7 — full Police Act PART/CHAPTER/numbered sequence.

@@ -170,7 +170,10 @@ mod tests {
         GraphSanityConfig {
             enabled: true,
             invariants: GraphSanityInvariants {
-                depth_consistency: InvariantToggle { check: true, correct: true },
+                depth_consistency: InvariantToggle {
+                    check: true,
+                    correct: true,
+                },
             },
         }
     }
@@ -190,7 +193,10 @@ mod tests {
     fn test_cr28_noop_on_consistent_tree() {
         let (mut graph, _, _) = make_two_node_graph(1);
         let report = apply(&mut graph, &full_correct_config());
-        assert!(report.is_clean(), "consistent tree must produce no diagnostics");
+        assert!(
+            report.is_clean(),
+            "consistent tree must produce no diagnostics"
+        );
     }
 
     /// CR-28 Test 3 — check-only mode preserves original values.
@@ -200,7 +206,10 @@ mod tests {
         let cfg = GraphSanityConfig {
             enabled: true,
             invariants: GraphSanityInvariants {
-                depth_consistency: InvariantToggle { check: true, correct: false },
+                depth_consistency: InvariantToggle {
+                    check: true,
+                    correct: false,
+                },
             },
         };
         let report = apply(&mut graph, &cfg);
@@ -217,7 +226,7 @@ mod tests {
         let orphan_id = Uuid::new_v4();
         let mut orphan = DocumentNode::new_with_id(orphan_id, "Section", "orphan".into());
         orphan.location.semantic.depth = 7; // arbitrary
-        // Note: NOT added to root.children — this is the "orphan" case
+                                            // Note: NOT added to root.children — this is the "orphan" case
         graph.nodes.insert(orphan_id, orphan);
 
         let report = apply(&mut graph, &full_correct_config());
@@ -289,7 +298,10 @@ mod tests {
         // exercised by the broader regression suite.
         let report = apply(&mut graph, &full_correct_config());
         assert!(
-            report.depth_violations.iter().any(|v| v.node_id == paragraph_id),
+            report
+                .depth_violations
+                .iter()
+                .any(|v| v.node_id == paragraph_id),
             "paragraph drift must be detected"
         );
         assert_eq!(

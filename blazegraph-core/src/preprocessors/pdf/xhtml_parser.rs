@@ -36,9 +36,8 @@ use unicode_normalization::UnicodeNormalization;
 /// Extracts raw tag fragments from a span's inner content.
 /// Matches self-closing tags (`<br/>`) and paired open/close tags (`<a href="...">text</a>`).
 /// Valid XHTML guarantees text content is entity-escaped, so any literal `<` is a real tag.
-static RAW_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)(?:<[^>]+/>|<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>)").unwrap()
-});
+static RAW_TAG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)(?:<[^>]+/>|<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>)").unwrap());
 
 static META_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<meta\s+name="([^"]*)"[^>]*content="([^"]*)"[^>]*/?>"#).unwrap()
@@ -70,7 +69,10 @@ pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
         "XHTML parsing complete: {} text elements, {} font classes, {} bookmarks",
         text_elements.len(),
         style_data.font_classes.len(),
-        bookmark_data.as_ref().map(|b| b.sections.len()).unwrap_or(0)
+        bookmark_data
+            .as_ref()
+            .map(|b| b.sections.len())
+            .unwrap_or(0)
     );
 
     Ok(PreprocessorOutput {
@@ -120,7 +122,7 @@ struct ParseContext {
 
     // Span state
     in_span: bool,
-    span_nesting: u32,    // nested <span> depth inside the primary span (0 when in primary)
+    span_nesting: u32, // nested <span> depth inside the primary span (0 when in primary)
     span_start_pos: usize, // byte offset in the source XHTML right after the primary span's `>`
     span_class: String,
     span_bbox: String,
@@ -253,10 +255,9 @@ fn extract_text_elements(
                     }
                     "aside" if ctx.in_page => {
                         ctx.container = Container::Aside;
-                        ctx.current_rotation =
-                            get_attr(&e.attributes(), b"data-rotation")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
+                        ctx.current_rotation = get_attr(&e.attributes(), b"data-rotation")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
                         ctx.current_band = 0;
                         ctx.current_nr_band_columns = 1;
                     }
@@ -316,8 +317,9 @@ fn extract_text_elements(
                         } else {
                             // Closing the primary span: slice inner content, extract raw_tags, emit
                             let end_pos = reader.buffer_position() - 7; // len("</span>") == 7
-                            ctx.span_raw_tags =
-                                extract_raw_tags(xhtml.get(ctx.span_start_pos..end_pos).unwrap_or(""));
+                            ctx.span_raw_tags = extract_raw_tags(
+                                xhtml.get(ctx.span_start_pos..end_pos).unwrap_or(""),
+                            );
                             // Preserve boundary whitespace (collapse internal runs, keep at most one
                             // leading/trailing space) so downstream same-line concatenation can see
                             // whether Tika emitted a separator at the segment join.
@@ -347,9 +349,7 @@ fn extract_text_elements(
                         // Use div_depth to distinguish which </div> closes which container.
                         // Band div was opened at band_div_depth; page div was opened at depth 1.
                         // (When inside a span, </div> is caught by the raw_tags wildcard arm above.)
-                        if ctx.container == Container::Band
-                            && ctx.div_depth == ctx.band_div_depth
-                        {
+                        if ctx.container == Container::Band && ctx.div_depth == ctx.band_div_depth {
                             // Closing the band div
                             ctx.container = Container::None;
                             ctx.current_band = 0;
@@ -399,10 +399,16 @@ fn finalize_page_elements(
     global_reading_order: &mut u32,
 ) {
     page_elements.sort_unstable_by(|a, b| {
-        a.placement.bounding_box
+        a.placement
+            .bounding_box
             .y
             .total_cmp(&b.placement.bounding_box.y)
-            .then_with(|| a.placement.bounding_box.x.total_cmp(&b.placement.bounding_box.x))
+            .then_with(|| {
+                a.placement
+                    .bounding_box
+                    .x
+                    .total_cmp(&b.placement.bounding_box.x)
+            })
     });
     for el in page_elements.iter_mut() {
         el.reading_order = *global_reading_order;
@@ -457,7 +463,12 @@ fn build_element(
         style_info: font_class,
         placement: Placement {
             page_number: ctx.page_number,
-            bounding_box: BoundingBox { x, y, width, height },
+            bounding_box: BoundingBox {
+                x,
+                y,
+                width,
+                height,
+            },
             band: ctx.current_band,
             column: ctx.span_column,
             nr_band_columns: ctx.current_nr_band_columns,
@@ -494,8 +505,7 @@ fn normalize_segment_text(s: &str) -> String {
     if body.is_empty() {
         return String::new();
     }
-    let mut out =
-        String::with_capacity(body.len() + leading as usize + trailing as usize);
+    let mut out = String::with_capacity(body.len() + leading as usize + trailing as usize);
     if leading {
         out.push(' ');
     }

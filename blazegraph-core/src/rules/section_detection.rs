@@ -175,7 +175,11 @@ impl<'a> SectionAndHierarchyDetectionRule<'a> {
                     true // Disabled
                 } else {
                     let non_ws_chars = element.text.chars().filter(|c| !c.is_whitespace()).count();
-                    let alpha_chars = element.text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+                    let alpha_chars = element
+                        .text
+                        .chars()
+                        .filter(|c| c.is_ascii_alphabetic())
+                        .count();
                     let ratio = if non_ws_chars > 0 {
                         alpha_chars as f32 / non_ws_chars as f32
                     } else {

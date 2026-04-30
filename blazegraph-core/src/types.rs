@@ -248,13 +248,11 @@ pub enum DocumentType {
 // ===== ENHANCED GRAPH ANALYTICS STRUCTURES =====
 
 /// Histogram-based token distribution for comprehensive statistical analysis
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenDistribution {
     pub by_node_type: HashMap<String, TokenHistogram>,
     pub overall: TokenHistogram,
 }
-
 
 /// Histogram representation enabling statistical calculations (mean, median, mode, variance)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,13 +289,11 @@ pub struct HistogramBin {
     pub token_sum: usize, // Total tokens in this range
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeTypeDistribution {
     pub counts: HashMap<String, usize>,
     pub percentages: HashMap<String, f32>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepthDistribution {
@@ -362,10 +358,10 @@ pub struct Placement {
 pub struct PdfTextElement {
     pub text: String,
     pub style_info: FontClass,
-    pub placement: Placement,                   // REPLACES: bounding_box, page_number,
-                                                //   paragraph_number, line_number,
-                                                //   segment_number, rotation, band,
-                                                //   column, nr_band_columns
+    pub placement: Placement, // REPLACES: bounding_box, page_number,
+    //   paragraph_number, line_number,
+    //   segment_number, rotation, band,
+    //   column, nr_band_columns
     pub reading_order: u32,
     pub bookmark_match: Option<BookmarkSection>,
     pub token_count: usize,
@@ -441,19 +437,45 @@ impl DocumentMetadata {
     /// Non-None fields from `extracted` overwrite; None fields preserve existing.
     /// page_count overwrites if > 0.
     pub fn merge_extracted(&mut self, extracted: DocumentMetadata) {
-        if extracted.title.is_some() { self.title = extracted.title; }
-        if extracted.author.is_some() { self.author = extracted.author; }
-        if extracted.language.is_some() { self.language = extracted.language; }
-        if extracted.page_count > 0 { self.page_count = extracted.page_count; }
-        if extracted.publisher.is_some() { self.publisher = extracted.publisher; }
-        if extracted.creator_tool.is_some() { self.creator_tool = extracted.creator_tool; }
-        if extracted.producer.is_some() { self.producer = extracted.producer; }
-        if extracted.pdf_version.is_some() { self.pdf_version = extracted.pdf_version; }
-        if extracted.created.is_some() { self.created = extracted.created; }
-        if extracted.modified.is_some() { self.modified = extracted.modified; }
-        if extracted.description.is_some() { self.description = extracted.description; }
-        if extracted.encrypted.is_some() { self.encrypted = extracted.encrypted; }
-        if extracted.has_marked_content.is_some() { self.has_marked_content = extracted.has_marked_content; }
+        if extracted.title.is_some() {
+            self.title = extracted.title;
+        }
+        if extracted.author.is_some() {
+            self.author = extracted.author;
+        }
+        if extracted.language.is_some() {
+            self.language = extracted.language;
+        }
+        if extracted.page_count > 0 {
+            self.page_count = extracted.page_count;
+        }
+        if extracted.publisher.is_some() {
+            self.publisher = extracted.publisher;
+        }
+        if extracted.creator_tool.is_some() {
+            self.creator_tool = extracted.creator_tool;
+        }
+        if extracted.producer.is_some() {
+            self.producer = extracted.producer;
+        }
+        if extracted.pdf_version.is_some() {
+            self.pdf_version = extracted.pdf_version;
+        }
+        if extracted.created.is_some() {
+            self.created = extracted.created;
+        }
+        if extracted.modified.is_some() {
+            self.modified = extracted.modified;
+        }
+        if extracted.description.is_some() {
+            self.description = extracted.description;
+        }
+        if extracted.encrypted.is_some() {
+            self.encrypted = extracted.encrypted;
+        }
+        if extracted.has_marked_content.is_some() {
+            self.has_marked_content = extracted.has_marked_content;
+        }
     }
 }
 
@@ -536,7 +558,8 @@ pub struct ListSequence {
 /// Future candidates: largest font on page 1, first bold text, etc.
 pub fn infer_title(elements: &[ParsedPdfElement]) -> Option<String> {
     // Strategy 1: First section element
-    elements.iter()
+    elements
+        .iter()
         .find(|e| e.element_type == ParsedElementType::Section)
         .map(|e| e.text.trim().to_string())
         .filter(|t| !t.is_empty())
@@ -693,8 +716,8 @@ pub struct ParsedPdfElement {
     pub hierarchy_level: u32,
     pub position: usize,
     pub style_info: FontClass,
-    pub placement: Option<Placement>,            // REPLACES: bounding_box, page_number, paragraph_number
-                                                 // None for non-PDF sources (future HTML/Markdown).
+    pub placement: Option<Placement>, // REPLACES: bounding_box, page_number, paragraph_number
+    // None for non-PDF sources (future HTML/Markdown).
     pub reading_order: u32,
     pub bookmark_match: Option<BookmarkSection>,
     pub token_count: usize,
@@ -704,7 +727,9 @@ impl ParsedPdfElement {
     /// Return the placement for PDF-sourced elements.
     /// Panics with a clear message if called on a non-PDF element (placement is None).
     pub fn pdf_placement(&self) -> &Placement {
-        self.placement.as_ref().expect("PDF-sourced ParsedPdfElement must have placement")
+        self.placement
+            .as_ref()
+            .expect("PDF-sourced ParsedPdfElement must have placement")
     }
 }
 

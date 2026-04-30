@@ -80,7 +80,11 @@ impl TikaJniBackend {
     /// If no heap arguments are provided in `extra_jvm_args`, defaults to:
     /// - `-Xms512m`
     /// - `-Xmx512m`
-    pub fn new_with_args(jre_path: &Path, jar_path: &Path, extra_jvm_args: &[String]) -> Result<Self> {
+    pub fn new_with_args(
+        jre_path: &Path,
+        jar_path: &Path,
+        extra_jvm_args: &[String],
+    ) -> Result<Self> {
         // Validate paths exist
         if !jre_path.exists() {
             return Err(anyhow!("JRE not found at: {}", jre_path.display()));
@@ -135,8 +139,7 @@ impl TikaJniBackend {
             .map_err(|e| anyhow!("Failed to build JVM args: {:?}", e))?;
 
         // Create JVM (only one allowed per process)
-        let jvm =
-            JavaVM::new(jvm_args).map_err(|e| anyhow!("Failed to create JVM: {:?}", e))?;
+        let jvm = JavaVM::new(jvm_args).map_err(|e| anyhow!("Failed to create JVM: {:?}", e))?;
 
         println!("✅ JVM created successfully");
 
