@@ -260,11 +260,23 @@ pub struct SectionDetectionV2Rule<'a> {
     /// consulted by `HierarchyContext` to resolve depth when font-delta is
     /// within tolerance.
     tiebreaker_regexes: Vec<(String, Regex)>,
-    /// Per `(page, band)` x-extent: `(min_x, max_right)` aggregated across all elements
-    /// in that band. Used to derive a stable column width for ratio-based isolation,
-    /// independent of whether the column under inspection has body neighbors.
-    band_extents: HashMap<(u32, u32), (f32, f32)>,
+    /// Per-page x-extent: `(min_x, max_right)` aggregated across all elements
+    /// on the page. Used by `is_isolated` to derive an effective column
+    /// width by dividing the page extent by the number of X-clusters
+    /// detected at the element's Y. Indexed by `(page, 0)` — the second
+    /// key dimension is the legacy `band` field which currently always
+    /// resolves to 0 and is preserved for API compatibility.
+    page_extents: HashMap<u32, (f32, f32)>,
 }
+
+/// Maximum X-gap (in points) within an X-cluster at a given Y. Two
+/// same-Y elements separated by a gap larger than this belong to
+/// distinct visual clusters (e.g., left and right columns of a
+/// 2-column page). Mirrors the gap threshold Tika applies inside a
+/// line for bbox geometry hygiene; chosen to be comfortably larger
+/// than inter-word spacing in justified body text but smaller than
+/// any plausible column gutter (typically ≥ 8pt).
+const X_CLUSTER_GAP_THRESHOLD_PT: f32 = 6.0;
 
 impl<'a> SectionDetectionV2Rule<'a> {
     pub fn new(
@@ -295,12 +307,11 @@ impl<'a> SectionDetectionV2Rule<'a> {
             .filter_map(|tk| Regex::new(&tk.pattern).ok().map(|re| (tk.name.clone(), re)))
             .collect();
 
-        let mut band_extents: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
+        let mut page_extents: HashMap<u32, (f32, f32)> = HashMap::new();
         for e in text_elements {
-            let key = (e.page_number(), e.band());
             let bbox = e.bounding_box();
-            let entry = band_extents
-                .entry(key)
+            let entry = page_extents
+                .entry(e.page_number())
                 .or_insert((f32::INFINITY, f32::NEG_INFINITY));
             entry.0 = entry.0.min(bbox.x);
             entry.1 = entry.1.max(bbox.x + bbox.width);
@@ -316,7 +327,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
             inclusion_regexes,
             exclusion_regexes,
             tiebreaker_regexes,
-            band_extents,
+            page_extents,
         }
     }
 
@@ -367,76 +378,90 @@ impl<'a> SectionDetectionV2Rule<'a> {
     /// Determine isolation as a single geometric question:
     /// **does the visual line this element sits on fill its column?**
     ///
-    /// "Visual line" = all elements in the same `(page, band, column)` whose Y-coordinate
-    /// is within `line_height_tolerance` of `element.bounding_box.y`. Y is ground truth;
-    /// Tika's `data-line` counter is unreliable (resets per `<p>`, so a header and the
-    /// next paragraph's first body line collide on `line=0` even though they're at
-    /// different visual Y).
+    /// Without column metadata from Tika (post layout-reasoning consolidation,
+    /// Tika emits positioned-text primitives only), columns are inferred per-Y
+    /// from glyph geometry. The algorithm:
     ///
-    /// An element alone on its visual line → isolated (no other content sharing the
-    /// baseline). Otherwise compute the union extent of all bboxes on this line and
-    /// compare to `column_width = band_x_extent / nr_band_columns`. A short line in a
-    /// wide column is isolated; a line that fills the column is not (mid-line bold
-    /// emphasis, justified body, or Tika overlay-style spans for inline styling).
+    /// 1. Gather same-Y, same-rotation, same-page neighbors (incl. element)
+    ///    where Y-delta ≤ `line_height_tolerance`. Y is ground truth;
+    ///    Tika's `data-line` counter resets per `<p>` and is unreliable.
+    /// 2. Sort by X and cluster by X-connectivity. A gap larger than
+    ///    `X_CLUSTER_GAP_THRESHOLD_PT` between consecutive bboxes opens a new
+    ///    cluster. This recovers the visual column structure at this Y from
+    ///    geometry alone — a 2-column body row produces 2 clusters; a header
+    ///    sitting alone produces 1.
+    /// 3. The cluster containing the element is its "visual line." If the
+    ///    cluster has only one member (the element itself) → isolated.
+    /// 4. Otherwise compute `line_extent = cluster.max_right - cluster.min_x`
+    ///    and `column_width = page_x_extent / cluster_count`. A short line in
+    ///    an effectively wide column is isolated; a line filling its column
+    ///    is not.
     fn is_isolated(&self, element_idx: usize) -> bool {
         let element = &self.text_elements[element_idx];
         let cfg = &self.config.section_detection_v2;
 
         let page = element.page_number();
-        let band = element.band();
-        let col = element.column();
+        let element_rotation = element.rotation();
         let y = element.bounding_box().y;
         let tol = cfg.line_height_tolerance;
 
-        let mut min_x = element.bounding_box().x;
-        let mut max_right = element.bounding_box().x + element.bounding_box().width;
-        let mut had_line_neighbor = false;
+        // Step 1: gather same-Y same-rotation neighbors on the page.
+        let mut same_y: Vec<(usize, f32, f32)> = Vec::new();
         for (idx, n) in self.text_elements.iter().enumerate() {
-            if idx == element_idx
-                || n.page_number() != page
-                || n.band() != band
-                || n.column() != col
+            if n.page_number() != page
+                || n.rotation() != element_rotation
                 || (n.bounding_box().y - y).abs() >= tol
             {
                 continue;
             }
-            had_line_neighbor = true;
-            let n_left = n.bounding_box().x;
-            let n_right = n.bounding_box().x + n.bounding_box().width;
-            if n_left < min_x {
-                min_x = n_left;
-            }
-            if n_right > max_right {
-                max_right = n_right;
-            }
+            let nx = n.bounding_box().x;
+            let nr = nx + n.bounding_box().width;
+            same_y.push((idx, nx, nr));
         }
 
-        if !had_line_neighbor {
+        // Step 2: sort by X-start, cluster by X-connectivity.
+        same_y.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        let mut clusters: Vec<(f32, f32, usize, bool)> = Vec::new();
+        let mut current: Option<(f32, f32, usize, bool)> = None;
+        for &(idx, nx, nr) in &same_y {
+            let is_self = idx == element_idx;
+            match current {
+                None => current = Some((nx, nr, 1, is_self)),
+                Some((c_min, c_max, c_count, c_self)) => {
+                    if nx - c_max > X_CLUSTER_GAP_THRESHOLD_PT {
+                        clusters.push((c_min, c_max, c_count, c_self));
+                        current = Some((nx, nr, 1, is_self));
+                    } else {
+                        current = Some((c_min, c_max.max(nr), c_count + 1, c_self || is_self));
+                    }
+                }
+            }
+        }
+        if let Some(c) = current {
+            clusters.push(c);
+        }
+
+        // Step 3: locate element's cluster. If alone, isolated.
+        let element_cluster = clusters.iter().find(|c| c.3).copied();
+        let Some((c_min, c_max, c_count, _)) = element_cluster else {
+            return true;
+        };
+        if c_count <= 1 {
             return true;
         }
 
-        let line_extent = max_right - min_x;
-        let column_width = self.column_width_for(page, band, element.placement.nr_band_columns);
-        if column_width <= 0.0 {
+        // Step 4: compare cluster width against effective column width.
+        let line_extent = c_max - c_min;
+        let Some(&(page_min, page_max)) = self.page_extents.get(&page) else {
+            return false;
+        };
+        let page_width = page_max - page_min;
+        if page_width <= 0.0 {
             return false;
         }
+        let column_width = (page_width / clusters.len() as f32).max(1.0);
         line_extent / column_width < cfg.isolation_threshold
-    }
-
-    /// Column width derived from band x-extent divided by `nr_band_columns`.
-    ///
-    /// Uses band extent (not per-column extent) so that a column containing only the
-    /// header still gets a meaningful denominator from sibling columns' content.
-    fn column_width_for(&self, page: u32, band: u32, nr_band_columns: u32) -> f32 {
-        let Some(&(min_x, max_right)) = self.band_extents.get(&(page, band)) else {
-            return 0.0;
-        };
-        let band_width = max_right - min_x;
-        if band_width <= 0.0 {
-            return 0.0;
-        }
-        let nr_cols = nr_band_columns.max(1) as f32;
-        (band_width / nr_cols).max(1.0)
     }
 
     /// Check whether the element's font class is rare in the document.
@@ -960,20 +985,21 @@ mod tests {
     }
 
     /// Test 9 — Region 3: non-isolated bold does NOT promote.
-    /// |delta| ≤ tolerance, bold, column-filling AND has same-line neighbour →
-    /// fails both segment and width-ratio isolation → NOT promoted.
+    /// |delta| ≤ tolerance, bold, with a same-Y X-clustered neighbour whose
+    /// joined extent fills the page → ratio = 1.0 ≥ isolation_threshold →
+    /// NOT isolated → NOT promoted.
     ///
-    /// Constructs an element wide enough to defeat the ratio check
-    /// (text_width=160 in a band of 200 → ratio 0.80 ≥ 0.75) and a same-line
-    /// neighbour at gap=10pt < `isolation_neighbor_gap` (20) to defeat the segment check.
+    /// Neighbour is placed at gap=4pt (well below `X_CLUSTER_GAP_THRESHOLD_PT=6`)
+    /// so the two elements form a single visual cluster, which is what the
+    /// "non-isolated" semantic requires post-strip.
     #[test]
     fn test_region3_non_isolated_bold_does_not_promote() {
         let body = 10.0;
         let mut element = make_element(10.5, true, "body", 3);
         element.placement.bounding_box.width = 160.0;
         let mut neighbour = make_neighbour(3);
-        neighbour.placement.bounding_box.x = 170.0;
-        neighbour.placement.bounding_box.width = 30.0;
+        neighbour.placement.bounding_box.x = 164.0; // gap = 4pt → same cluster
+        neighbour.placement.bounding_box.width = 36.0;
         let elements = vec![element, neighbour];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         let config = make_config(1.0, 5.0, None, 0.80);
@@ -1164,16 +1190,23 @@ mod tests {
         );
     }
 
-    /// Same page, same (page, band, col), same Y line — line-extent fills column.
-    /// Two side-by-side elements at the same Y union to fill the column width →
-    /// ratio ≥ isolation_threshold → not isolated.
+    /// Same page, same Y line — two X-clustered side-by-side elements form
+    /// one visual cluster that fills the page width → ratio = 1.0 ≥ 0.80 →
+    /// NOT isolated.
+    ///
+    /// Gap between elements is 4pt (below `X_CLUSTER_GAP_THRESHOLD_PT=6`)
+    /// so they belong to the same X-cluster.
     #[test]
     fn test_isolation_same_page_same_band_are_neighbours() {
         let elements = vec![
             // Target at x=0, width=80 → right edge at 80
             make_element_on_page(12.0, 1, 0, 0, 0, 0.0),
-            // Neighbour at x=90, width=80 → right edge at 170 (same Y=0)
-            make_element_on_page(12.0, 1, 0, 0, 0, 90.0),
+            // Neighbour at x=84, width=86 → right edge at 170 (same Y, gap=4pt)
+            {
+                let mut e = make_element_on_page(12.0, 1, 0, 0, 0, 84.0);
+                e.placement.bounding_box.width = 86.0;
+                e
+            },
         ];
         let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
         let config = make_config(1.0, 5.0, None, 0.80);
@@ -1188,10 +1221,47 @@ mod tests {
             &font_analysis,
             &style_data,
         );
-        // line_extent = 170, band_x_extent = 170, nr_band_columns=1 → ratio = 1.0 ≥ 0.80
+        // Cluster spans [0, 170], page extent [0, 170], num_clusters=1
+        // → column_width = 170 → ratio = 170/170 = 1.0 ≥ 0.80 → not isolated.
         assert!(
             !rule.is_isolated(0),
-            "same-Y neighbour fills column union → not isolated"
+            "X-clustered same-Y neighbour fills page → not isolated"
+        );
+    }
+
+    /// Same Y, but the "neighbour" sits across a wide X-gap (40pt apart).
+    /// Post-strip semantics: the gap puts them in distinct visual clusters,
+    /// so the target element is alone in its cluster and counts as isolated
+    /// — even though the original (page, band, column) filter would have
+    /// merged them. Captures the new geometry-driven behavior.
+    #[test]
+    fn test_isolation_wide_x_gap_treats_neighbour_as_separate_cluster() {
+        let elements = vec![
+            // Target at x=0, width=80 (left "column")
+            make_element_on_page(12.0, 1, 0, 0, 0, 0.0),
+            // Neighbour at x=120, width=80 (right "column", gap=40pt)
+            {
+                let mut e = make_element_on_page(12.0, 1, 0, 0, 0, 120.0);
+                e.placement.bounding_box.width = 80.0;
+                e
+            },
+        ];
+        let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
+        let config = make_config(1.0, 5.0, None, 0.80);
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            &elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        assert!(
+            rule.is_isolated(0),
+            "wide-X-gap neighbour belongs to a different visual cluster → target is isolated"
         );
     }
 

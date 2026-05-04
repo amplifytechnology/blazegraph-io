@@ -5,18 +5,25 @@
 //!
 //! The Blazegraph XHTML format includes:
 //! - Page divs with data-page attributes
-//! - Bands: `<div class="band" data-band="N" data-columns="K">` — Y-band containers
+//! - Per-page meta: `<div class="page-meta" data-page data-width data-height />`
 //! - Asides: `<aside data-rotation="N">` — rotated content (e.g., arxiv sidebars)
-//! - Spans with data-bbox, data-line, data-segment, data-column attributes
+//! - Paragraphs (`<p>`) wrapping body lines as a parsing convenience
+//! - Spans with data-bbox, data-line, data-segment attributes
 //! - CSS font classes in <style> block
 //! - Document metadata in <meta> tags
 //! - Bookmarks/TOC in <ul> structure
 //!
+//! Note: `<div class="band">` and `data-column` were emitted by Tika prior to
+//! the layout-reasoning consolidation flow (2026-05-03). Tika no longer emits
+//! either; structural reasoning lives on the Rust side. The Placement fields
+//! `band`, `column`, `nr_band_columns` survive on PdfTextElement but are now
+//! always populated with defaults (0, 0, 1).
+//!
 //! Parser approach: quick-xml pull-parser in event mode. A lightweight state
-//! machine tracks the current page, band context, and aside/rotation context
-//! as the parser walks the event stream. This avoids the fragility of regex
-//! on nested XHTML and naturally handles context propagation (band → span,
-//! aside → span) without building a full DOM.
+//! machine tracks the current page and aside/rotation context as the parser
+//! walks the event stream. This avoids the fragility of regex on nested XHTML
+//! and naturally handles context propagation (aside → span) without building
+//! a full DOM.
 //!
 //! quick-xml was chosen because it is already a workspace dependency, is
 //! widely used in the Rust ecosystem, and supports pull-mode parsing with
@@ -92,7 +99,6 @@ pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
 enum Container {
     None,
     Aside,
-    Band,
 }
 
 /// State machine context threaded through the event loop.
@@ -100,18 +106,12 @@ struct ParseContext {
     // Page-level
     in_page: bool,
     page_number: u32,
-    // div nesting depth: 1 = page div open, 2 = band div open inside page, etc.
+    // div nesting depth: 1 = page div open, deeper values are nested children.
     // Used to correctly identify which </div> closes which container.
     div_depth: usize,
 
     // Structural container (mutually exclusive at the immediate child-of-page level)
     container: Container,
-    // div_depth at which the current band opened — so we know which </div> closes it
-    band_div_depth: usize,
-
-    // Band state (valid when container == Band)
-    current_band: u32,
-    current_nr_band_columns: u32,
 
     // Aside/rotation state (valid when container == Aside)
     current_rotation: i32,
@@ -128,7 +128,6 @@ struct ParseContext {
     span_bbox: String,
     span_line: u32,
     span_segment: u32,
-    span_column: u32,
     span_text: String,
     span_raw_tags: Vec<String>,
 }
@@ -140,9 +139,6 @@ impl ParseContext {
             page_number: 0,
             div_depth: 0,
             container: Container::None,
-            band_div_depth: 0,
-            current_band: 0,
-            current_nr_band_columns: 1,
             current_rotation: 0,
             in_paragraph: false,
             paragraph_number: 0,
@@ -153,7 +149,6 @@ impl ParseContext {
             span_bbox: String::new(),
             span_line: 0,
             span_segment: 0,
-            span_column: 0,
             span_text: String::new(),
             span_raw_tags: vec![],
         }
@@ -167,7 +162,6 @@ impl ParseContext {
         self.span_bbox.clear();
         self.span_line = 0;
         self.span_segment = 0;
-        self.span_column = 0;
         self.span_text.clear();
         self.span_raw_tags.clear();
     }
@@ -233,33 +227,16 @@ fn extract_text_elements(
                             ctx.in_page = true;
                             ctx.page_number += 1;
                             ctx.container = Container::None;
-                            ctx.band_div_depth = 0;
-                            ctx.current_band = 0;
-                            ctx.current_nr_band_columns = 1;
-                            ctx.current_rotation = 0;
-                        } else if class == "band" && ctx.in_page {
-                            ctx.container = Container::Band;
-                            ctx.band_div_depth = ctx.div_depth;
-                            ctx.current_band = get_attr(&e.attributes(), b"data-band")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                            ctx.current_nr_band_columns =
-                                get_attr(&e.attributes(), b"data-columns")
-                                    .and_then(|v| v.parse().ok())
-                                    .unwrap_or(1);
-                            // Rotation resets when we enter a band (aside is sibling, not ancestor)
                             ctx.current_rotation = 0;
                         }
-                        // other divs (e.g., inside a band) are tracked by div_depth but
-                        // do not change container state.
+                        // Other divs (page-meta, any nested) are tracked by
+                        // div_depth but do not change container state.
                     }
                     "aside" if ctx.in_page => {
                         ctx.container = Container::Aside;
                         ctx.current_rotation = get_attr(&e.attributes(), b"data-rotation")
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(0);
-                        ctx.current_band = 0;
-                        ctx.current_nr_band_columns = 1;
                     }
                     "p" if ctx.in_page => {
                         ctx.in_paragraph = true;
@@ -282,9 +259,6 @@ fn extract_text_elements(
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(0);
                             ctx.span_segment = get_attr(&e.attributes(), b"data-segment")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                            ctx.span_column = get_attr(&e.attributes(), b"data-column")
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(0);
                             ctx.span_text.clear();
@@ -347,15 +321,9 @@ fn extract_text_elements(
                     }
                     "div" if !ctx.in_span => {
                         // Use div_depth to distinguish which </div> closes which container.
-                        // Band div was opened at band_div_depth; page div was opened at depth 1.
+                        // Page div was opened at depth 1.
                         // (When inside a span, </div> is caught by the raw_tags wildcard arm above.)
-                        if ctx.container == Container::Band && ctx.div_depth == ctx.band_div_depth {
-                            // Closing the band div
-                            ctx.container = Container::None;
-                            ctx.current_band = 0;
-                            ctx.current_nr_band_columns = 1;
-                            ctx.band_div_depth = 0;
-                        } else if ctx.in_page && ctx.div_depth == 1 {
+                        if ctx.in_page && ctx.div_depth == 1 {
                             // Closing the page div (outermost page div is at depth 1)
                             ctx.in_page = false;
                         }
@@ -469,9 +437,14 @@ fn build_element(
                 width,
                 height,
             },
-            band: ctx.current_band,
-            column: ctx.span_column,
-            nr_band_columns: ctx.current_nr_band_columns,
+            // Band/column abstractions are deferred to a follow-on flow that
+            // recovers column structure on the Rust side from doc-level
+            // geometry. Defaults here keep the Placement struct API stable
+            // for downstream consumers; section detection v2 no longer
+            // depends on these fields (see is_isolated, X-cluster geometry).
+            band: 0,
+            column: 0,
+            nr_band_columns: 1,
             line_number: ctx.span_line,
             segment_number: ctx.span_segment,
             rotation: ctx.current_rotation,

@@ -460,39 +460,13 @@ mod breadcrumbs {
 }
 
 // ============================================================================
-// XHTML parser enrichment tests — Block 01 (CR-10, CR-15, CR-16, CR-17)
+// XHTML parser enrichment tests
 // ============================================================================
-
-#[test]
-fn test_parser_band_and_column_propagation() {
-    let xhtml = r#"<html><head>
-<style>.f1 { font-family: Helvetica; font-size: 12.0px; font-style: normal; font-weight: normal; color: #000000; }</style>
-</head><body>
-<div class="page" data-page="0">
-  <div class="band" data-band="0" data-columns="2">
-    <p><span class="f1" data-bbox="10.0,100.0,100.0,12.0" data-line="0" data-segment="0" data-column="0">Left column</span></p>
-    <p><span class="f1" data-bbox="210.0,100.0,100.0,12.0" data-line="0" data-segment="0" data-column="1">Right column</span></p>
-  </div>
-  <div class="band" data-band="1" data-columns="1">
-    <p><span class="f1" data-bbox="10.0,200.0,300.0,12.0" data-line="0" data-segment="0" data-column="0">Single column</span></p>
-  </div>
-</div>
-</body></html>"#;
-    let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
-    let e = &output.text_elements;
-    assert_eq!(e.len(), 3);
-    assert_eq!(e[0].placement.band, 0);
-    assert_eq!(e[0].placement.nr_band_columns, 2);
-    assert_eq!(e[0].placement.column, 0);
-    assert_eq!(e[1].placement.band, 0);
-    assert_eq!(e[1].placement.nr_band_columns, 2);
-    assert_eq!(e[1].placement.column, 1);
-    assert_eq!(e[2].placement.band, 1);
-    assert_eq!(e[2].placement.nr_band_columns, 1);
-    assert_eq!(e[2].placement.column, 0);
-    assert!(e.iter().all(|el| el.placement.rotation == 0));
-    assert!(e.iter().all(|el| el.raw_tags.is_empty()));
-}
+//
+// Tika emits positioned-text primitives only after the layout-reasoning
+// consolidation flow (2026-05-03) — no <div class="band">, no data-column.
+// The parser preserves the Placement.band / column / nr_band_columns fields
+// for API stability but always populates them with defaults (0, 0, 1).
 
 #[test]
 fn test_parser_rotation_from_aside() {
@@ -501,11 +475,9 @@ fn test_parser_rotation_from_aside() {
 </head><body>
 <div class="page" data-page="0">
   <aside data-rotation="90">
-    <p><span class="f1" data-bbox="10.0,100.0,100.0,20.0" data-line="0" data-segment="0" data-column="0">Rotated sidebar</span></p>
+    <p><span class="f1" data-bbox="10.0,100.0,100.0,20.0" data-line="0" data-segment="0">Rotated sidebar</span></p>
   </aside>
-  <div class="band" data-band="0" data-columns="1">
-    <p><span class="f1" data-bbox="10.0,200.0,300.0,12.0" data-line="0" data-segment="0" data-column="0">Body text</span></p>
-  </div>
+  <p><span class="f1" data-bbox="10.0,200.0,300.0,12.0" data-line="0" data-segment="0">Body text</span></p>
 </div>
 </body></html>"#;
     let output = xhtml_parser::parse_xhtml(xhtml).expect("parse failed");
@@ -556,7 +528,7 @@ fn test_parser_raw_tags_anchor() {
 }
 
 #[test]
-fn test_integration_rfc_quic_bands_and_columns() {
+fn test_integration_rfc_quic_post_strip_defaults() {
     let path = format!(
         "{}/../../cache/c1-xhtml/7b1ea3317b5bea95f28cb546fdb925e2dcd66eb0cee2c02ceb66d9772ec927f2.xhtml",
         env!("CARGO_MANIFEST_DIR")
@@ -565,13 +537,21 @@ fn test_integration_rfc_quic_bands_and_columns() {
         .expect("Pre-populated XHTML not found — see worktree setup in handoff (rfc-quic)");
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
+    assert!(!e.is_empty(), "rfc-quic parses to non-empty element list");
+    // Post layout-reasoning consolidation: Tika emits no bands or columns, so
+    // every element resolves to the Placement defaults. The fields survive on
+    // the struct for API stability; section detection no longer depends on them.
     assert!(
-        e.iter().any(|el| el.placement.band > 0),
-        "expected multiple bands"
+        e.iter().all(|el| el.placement.band == 0),
+        "all elements default band=0 post-strip"
     );
     assert!(
-        e.iter().any(|el| el.placement.nr_band_columns > 1),
-        "expected at least one multi-col band"
+        e.iter().all(|el| el.placement.nr_band_columns == 1),
+        "all elements default nr_band_columns=1 post-strip"
+    );
+    assert!(
+        e.iter().all(|el| el.placement.column == 0),
+        "all elements default column=0 post-strip"
     );
     assert!(
         e.iter().all(|el| el.placement.rotation == 0),
