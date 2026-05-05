@@ -1,7 +1,8 @@
 use super::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
+use crate::analytics::DocumentAnalysis;
 use crate::config::{ParsingConfig, SectionAndHierarchyConfig};
 use crate::types::*;
-use crate::types::{DocumentAnalysis, PdfTextElement, StyleData};
+use crate::types::{PdfTextElement, StyleData};
 use anyhow::Result;
 
 // SectionAndHierarchyDetectionRule - detects sections and assigns contextual hierarchy levels to all elements
@@ -136,7 +137,7 @@ impl<'a> SectionAndHierarchyDetectionRule<'a> {
                     // Strict mode: bold AND larger than typical content
                     self.config.section_and_hierarchy.use_bold_indicator
                         && is_bold
-                        && font_size > self.document_analysis.most_common_font_size
+                        && font_size > self.document_analysis.font.most_common_font_size
                 } else {
                     // Permissive mode: bold OR larger (original behavior)
                     self.config.section_and_hierarchy.use_bold_indicator && is_bold

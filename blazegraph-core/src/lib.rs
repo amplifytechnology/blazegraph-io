@@ -15,6 +15,7 @@ pub mod storage;
 pub mod types;
 
 // Re-export main types and functions for easy use
+pub use analytics::DocumentAnalysis;
 pub use config::ParsingConfig;
 pub use graphs::NodeIdGenerator;
 pub use preprocessors::{PdfPreprocessor, Preprocessor, TikaPreprocessor};

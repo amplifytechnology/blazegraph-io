@@ -1,3 +1,7 @@
+use crate::analytics::{
+    AnalysisBuilder, DocumentAnalysis, FontStatsBuilder, GeometryStatsBuilder, PageStatsBuilder,
+    Statistic,
+};
 use crate::cache::{self, GraphCacheKey};
 use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
@@ -190,7 +194,13 @@ impl DocumentProcessor {
         };
 
         // --- Stages 2-5: Classification → Rules → Graph → Post-processing ---
-        let graph = self.rules_and_graph(&preprocessor_output, config, &id_gen, &mut profiler)?;
+        let graph = self.rules_and_graph(
+            &preprocessor_output,
+            config,
+            &id_gen,
+            &pdf_hash,
+            &mut profiler,
+        )?;
 
         if enable_profiling {
             profiler.print_summary();
@@ -237,6 +247,7 @@ impl DocumentProcessor {
     ) -> Result<PipelineStages> {
         let input_path_ref = Path::new(input_path);
         let pdf_bytes = std::fs::read(input_path_ref)?;
+        let pdf_hash = calculate_pdf_hash(&pdf_bytes);
 
         // Stage 1a: PDF → XHTML (always fresh for diagnostics)
         let xhtml = self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)?;
@@ -251,8 +262,10 @@ impl DocumentProcessor {
 
         // Stage 2: Classification + Rules → ParsedElements
         let classification = self.classifier.classify(&preprocessor_output)?;
-        let document_analysis =
-            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
+        let document_analysis = run_analytics(&preprocessor_output.text_elements);
+        if config.dump_analytics {
+            dump_stats(&*self.storage, &pdf_hash, &document_analysis)?;
+        }
 
         let parsed_elements = if config.minimal_parse {
             self.rule_engine
@@ -290,7 +303,6 @@ impl DocumentProcessor {
             .document_info
             .document_metadata
             .merge_extracted(preprocessor_output.metadata);
-        graph.document_info.document_analysis = document_analysis;
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
@@ -371,6 +383,7 @@ impl DocumentProcessor {
         preprocessor_output: &PreprocessorOutput,
         config: &ParsingConfig,
         id_gen: &NodeIdGenerator,
+        pdf_hash: &str,
         profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
         // Classification
@@ -378,10 +391,15 @@ impl DocumentProcessor {
             self.classifier.classify(preprocessor_output)
         })?;
 
-        // Document analysis (used by rules + stored in DocumentInfo)
-        let document_analysis = profiler.time_step("Document Analysis", || {
-            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements)
+        // Document analytics pre-pass (read by rules; sidecar-dumped to
+        // `{cache_dir}/stat/<name>/<pdf_hash>.json` when `config.dump_analytics`).
+        // No longer persisted into graph.json — that field went away with schema 0.4.0.
+        let document_analysis = profiler.time_step("Document Analytics", || {
+            run_analytics(&preprocessor_output.text_elements)
         });
+        if config.dump_analytics {
+            dump_stats(&*self.storage, pdf_hash, &document_analysis)?;
+        }
 
         // Rule processing
         let parsed_elements = if config.minimal_parse {
@@ -425,7 +443,6 @@ impl DocumentProcessor {
             .document_info
             .document_metadata
             .merge_extracted(preprocessor_output.metadata.clone());
-        graph.document_info.document_analysis = document_analysis;
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data.clone();
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
@@ -433,4 +450,41 @@ impl DocumentProcessor {
 
         Ok(graph)
     }
+}
+
+/// Run the document-analytics pre-pass over a slice of text elements.
+///
+/// Single-pass walk: dispatches each element to every enabled stat kind via
+/// `AnalysisBuilder`, then finalizes in dependency order. Output is consumed
+/// in pipeline memory by downstream rules and (when `dump_analytics`) written
+/// to per-stat sidecar files via [`dump_stats`].
+fn run_analytics(text_elements: &[PdfTextElement]) -> DocumentAnalysis {
+    let mut builder = AnalysisBuilder::new();
+    for element in text_elements {
+        builder.observe(element);
+    }
+    builder.finalize()
+}
+
+/// Per-stat sidecar dump. One JSON file per stat kind under
+/// `{cache_dir}/stat/<Statistic::NAME>/<pdf_hash>.json`. Folder-per-stat
+/// scoping (Marcus, Block 05) lets future stat kinds (RegionStats,
+/// PageOutlier, …) drop in without colliding. The full composite is the
+/// in-memory shape; the sidecar splits it for grep-ability and per-stat diff
+/// against Python prototype outputs.
+fn dump_stats(
+    storage: &dyn DocumentStorage,
+    pdf_hash: &str,
+    analysis: &DocumentAnalysis,
+) -> Result<()> {
+    let font_json = serde_json::to_string_pretty(&analysis.font)?;
+    storage.store_stat(pdf_hash, FontStatsBuilder::NAME, &font_json)?;
+
+    let geometry_json = serde_json::to_string_pretty(&analysis.geometry)?;
+    storage.store_stat(pdf_hash, GeometryStatsBuilder::NAME, &geometry_json)?;
+
+    let page_stats_json = serde_json::to_string_pretty(&analysis.page_stats)?;
+    storage.store_stat(pdf_hash, PageStatsBuilder::NAME, &page_stats_json)?;
+
+    Ok(())
 }

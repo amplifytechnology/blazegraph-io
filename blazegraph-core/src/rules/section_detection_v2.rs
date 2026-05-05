@@ -13,6 +13,7 @@
 /// - Rotated elements are always classified as non-section (belt-and-suspenders on top
 ///   of Block 02's statistical filter).
 use super::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
+use crate::analytics::DocumentAnalysis;
 use crate::config::{ParsingConfig, SectionDetectionV2Config};
 use crate::types::*;
 use anyhow::Result;
@@ -718,11 +719,10 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::DocumentAnalysis;
     use crate::config::{ParsingConfig, SectionDetectionV2Config};
     use crate::rules::engine::FontSizeAnalysis;
-    use crate::types::{
-        BoundingBox, DocumentAnalysis, FontClass, PdfTextElement, Placement, StyleData,
-    };
+    use crate::types::{BoundingBox, FontClass, PdfTextElement, Placement, StyleData};
     use std::collections::HashMap;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -849,15 +849,10 @@ mod tests {
     }
 
     fn make_document_analysis() -> DocumentAnalysis {
-        DocumentAnalysis {
-            font_size_counts: HashMap::new(),
-            font_family_counts: HashMap::new(),
-            bold_counts: (0, 0),
-            italic_counts: (0, 0),
-            most_common_font_size: 10.0,
-            most_common_font_family: "TestFont".to_string(),
-            all_font_sizes: vec![],
-        }
+        // Rules do not read DocumentAnalysis fields in tests (the parameter is
+        // threaded through but unused by V2 — see `_document_analysis` on the
+        // rule struct). Default is sufficient.
+        DocumentAnalysis::default()
     }
 
     /// Build a `SectionDetectionV2Rule` and call `classify_pass1` on index 0.

@@ -12,20 +12,11 @@ impl Default for DocumentGraph {
 impl DocumentGraph {
     /// Create a new graph with a deterministic root ID.
     pub fn new_with_root(root_id: NodeId) -> Self {
-        use crate::types::{DocumentAnalysis, DocumentInfo, DocumentMetadata};
+        use crate::types::{DocumentInfo, DocumentMetadata};
 
         let document_info = DocumentInfo {
             root_id,
             document_metadata: DocumentMetadata::default(),
-            document_analysis: DocumentAnalysis {
-                font_size_counts: std::collections::HashMap::new(),
-                font_family_counts: std::collections::HashMap::new(),
-                bold_counts: (0, 0),
-                italic_counts: (0, 0),
-                most_common_font_size: 12.0,
-                most_common_font_family: "unknown".to_string(),
-                all_font_sizes: Vec::new(),
-            },
             bookmark_data: None,
         };
 
@@ -38,21 +29,12 @@ impl DocumentGraph {
 
     /// Create a new graph with a random UUIDv4 root ID (legacy).
     pub fn new() -> Self {
-        use crate::types::{DocumentAnalysis, DocumentInfo, DocumentMetadata};
+        use crate::types::{DocumentInfo, DocumentMetadata};
         use uuid::Uuid;
 
         let document_info = DocumentInfo {
             root_id: Uuid::new_v4(),
             document_metadata: DocumentMetadata::default(),
-            document_analysis: DocumentAnalysis {
-                font_size_counts: std::collections::HashMap::new(),
-                font_family_counts: std::collections::HashMap::new(),
-                bold_counts: (0, 0),
-                italic_counts: (0, 0),
-                most_common_font_size: 12.0,
-                most_common_font_family: "unknown".to_string(),
-                all_font_sizes: Vec::new(),
-            },
             bookmark_data: None,
         };
 

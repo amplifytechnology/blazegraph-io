@@ -195,6 +195,14 @@ pub trait DocumentStorage {
         cache_value: &crate::cache::GraphCacheValue,
     ) -> Result<()>;
 
+    /// Sidecar dump for one analytics-stat-kind output. Path:
+    /// `{cache_dir}/stat/<stat_name>/<pdf_hash>.json`. Per-stat scoping (one
+    /// folder per `Statistic::NAME`) lets future stat kinds (RegionStats,
+    /// PageOutlier, etc.) drop in without colliding. This is *not* a pipeline
+    /// cache: nothing reads it back during processing — it exists for offline
+    /// data-science tooling (Python prototype diff, calibration sweeps).
+    fn store_stat(&self, pdf_hash: &str, stat_name: &str, json: &str) -> Result<()>;
+
     // Cache management
     fn clear_cache(&self, from_point: Option<CachePoint>) -> Result<CacheClearResult>;
 }
@@ -346,6 +354,15 @@ impl DocumentStorage for FileStorage {
         Ok(())
     }
 
+    // Sidecar: per-stat analytics dump
+    fn store_stat(&self, pdf_hash: &str, stat_name: &str, json: &str) -> Result<()> {
+        let dir = format!("{}/stat/{}", self.cache_dir, stat_name);
+        fs::create_dir_all(&dir)?;
+        let path = format!("{dir}/{pdf_hash}.json");
+        fs::write(path, json)?;
+        Ok(())
+    }
+
     // Cache management: cascading clear
     fn clear_cache(&self, from_point: Option<CachePoint>) -> Result<CacheClearResult> {
         let points_to_clear: Vec<CachePoint> = match from_point {
@@ -478,6 +495,9 @@ impl DocumentStorage for NoOpStorage {
         _cache_key: &GraphCacheKey,
         _cache_value: &crate::cache::GraphCacheValue,
     ) -> Result<()> {
+        Ok(())
+    }
+    fn store_stat(&self, _pdf_hash: &str, _stat_name: &str, _json: &str) -> Result<()> {
         Ok(())
     }
     fn clear_cache(&self, _from_point: Option<CachePoint>) -> Result<CacheClearResult> {

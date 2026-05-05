@@ -262,7 +262,7 @@ pub struct NodeTypeClusteringRule<'a> {
     text_elements: &'a [crate::types::PdfTextElement],
     config: &'a ParsingConfig,
     #[allow(dead_code)]
-    document_analysis: &'a crate::types::DocumentAnalysis,
+    document_analysis: &'a crate::analytics::DocumentAnalysis,
     #[allow(dead_code)]
     font_size_analysis: &'a FontSizeAnalysis,
     #[allow(dead_code)]
@@ -274,7 +274,7 @@ impl<'a> NodeTypeClusteringRule<'a> {
         engine: &'a super::engine::RuleEngine,
         text_elements: &'a [crate::types::PdfTextElement],
         config: &'a ParsingConfig,
-        document_analysis: &'a crate::types::DocumentAnalysis,
+        document_analysis: &'a crate::analytics::DocumentAnalysis,
         font_size_analysis: &'a FontSizeAnalysis,
         style_data: &'a crate::types::StyleData,
     ) -> Self {

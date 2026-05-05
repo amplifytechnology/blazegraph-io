@@ -55,15 +55,17 @@ pub struct DocumentInfo {
     pub root_id: NodeId,
     /// Metadata extracted from the source format (title, author, page count, etc.)
     pub document_metadata: DocumentMetadata,
-    /// Analysis computed from text elements (font distributions, style stats)
-    pub document_analysis: DocumentAnalysis,
     /// PDF bookmarks/table of contents (if available in the source PDF)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark_data: Option<BookmarkData>,
 }
 /// The schema version stamped on every graph output.
 /// Bump this when the output shape changes.
-pub const SCHEMA_VERSION: &str = "0.3.0";
+///
+/// 0.4.0 — Block 05 of the document-analytics flow: dropped `document_info.document_analysis`.
+/// Analytics live in pipeline memory + sidecar dumps under `cache/stat/<name>/<hash>.json`,
+/// not in the graph output schema.
+pub const SCHEMA_VERSION: &str = "0.4.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -563,104 +565,6 @@ pub fn infer_title(elements: &[ParsedPdfElement]) -> Option<String> {
         .find(|e| e.element_type == ParsedElementType::Section)
         .map(|e| e.text.trim().to_string())
         .filter(|t| !t.is_empty())
-}
-
-/// Document analysis meta-attributes calculated from text elements
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentAnalysis {
-    /// Count of each exact font size found in the document
-    pub font_size_counts: HashMap<String, usize>, // Use String for JSON compatibility
-    /// Count of each font family found in the document
-    pub font_family_counts: HashMap<String, usize>,
-    /// Count of bold vs non-bold text elements (bold_count, non_bold_count)
-    pub bold_counts: (usize, usize),
-    /// Count of italic vs non-italic text elements (italic_count, non_italic_count)
-    pub italic_counts: (usize, usize),
-
-    /// Most frequently occurring font size in the document
-    pub most_common_font_size: f32,
-    /// Most frequently occurring font family in the document
-    pub most_common_font_family: String,
-    /// All font sizes found, sorted for analysis
-    pub all_font_sizes: Vec<f32>,
-}
-
-impl DocumentAnalysis {
-    /// Create document analysis from text elements
-    pub fn analyze_text_elements(text_elements: &[PdfTextElement]) -> Self {
-        let mut font_size_counts: HashMap<String, usize> = HashMap::new();
-        let mut font_family_counts: HashMap<String, usize> = HashMap::new();
-        let mut bold_count = 0;
-        let mut non_bold_count = 0;
-        let mut italic_count = 0;
-        let mut non_italic_count = 0;
-        let mut font_sizes = Vec::new();
-
-        for element in text_elements {
-            // Exclude rotated elements (rotation != 0) from font hierarchy statistics.
-            // Rotated content (e.g. arxiv sidebar at rotation=90) corrupts most_common_font_size
-            // and potential_header_sizes with non-body-flow sizes. CR-10 / Block 02.
-            if element.rotation() != 0 {
-                continue;
-            }
-
-            let style = &element.style_info;
-
-            // Count font sizes
-            let size_key = format!("{:.1}", style.font_size);
-            *font_size_counts.entry(size_key).or_insert(0) += 1;
-            font_sizes.push(style.font_size);
-
-            // Count font families
-            *font_family_counts
-                .entry(style.font_family.clone())
-                .or_insert(0) += 1;
-
-            // Count bold/non-bold
-            let is_bold = style.font_weight.to_lowercase().contains("bold");
-            if is_bold {
-                bold_count += 1;
-            } else {
-                non_bold_count += 1;
-            }
-
-            // Count italic/non-italic
-            let is_italic = style.font_style.to_lowercase().contains("italic");
-            if is_italic {
-                italic_count += 1;
-            } else {
-                non_italic_count += 1;
-            }
-        }
-
-        // Find most common font size
-        let most_common_font_size = font_size_counts
-            .iter()
-            .max_by_key(|(_, &count)| count)
-            .and_then(|(size_str, _)| size_str.parse::<f32>().ok())
-            .unwrap_or(12.0);
-
-        // Find most common font family
-        let most_common_font_family = font_family_counts
-            .iter()
-            .max_by_key(|(_, &count)| count)
-            .map(|(family, _)| family.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Sort and deduplicate font sizes for analysis
-        font_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        font_sizes.dedup();
-
-        Self {
-            font_size_counts,
-            font_family_counts,
-            bold_counts: (bold_count, non_bold_count),
-            italic_counts: (italic_count, non_italic_count),
-            most_common_font_size,
-            most_common_font_family,
-            all_font_sizes: font_sizes,
-        }
-    }
 }
 
 // ===== GRAPH ANALYTICS IMPLEMENTATION =====

@@ -51,6 +51,13 @@ pub struct ParsingConfig {
     /// in check + correct mode).
     #[serde(default)]
     pub graph_sanity: GraphSanityConfig,
+    /// When true, the analytics pre-pass writes one JSON file per stat kind to
+    /// `{cache_dir}/stat/<stat_name>/<pdf_hash>.json` after finalization. This is
+    /// a sidecar for offline tooling — not a pipeline cache (output is not read
+    /// back). Default `true` for development; flip off in production where the
+    /// extra writes are unwanted.
+    #[serde(default = "default_true")]
+    pub dump_analytics: bool,
 }
 
 // ─── NodeTypeClustering config (CR-29; was ParagraphClustering) ───────────
@@ -1060,6 +1067,7 @@ impl ConfigManager {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         };
         self.configs
             .insert(DocumentType::AcademicPaper, academic_config);
@@ -1114,6 +1122,7 @@ impl ConfigManager {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         };
         self.configs
             .insert(DocumentType::LegalContract, legal_config);
@@ -1161,6 +1170,7 @@ impl ConfigManager {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         }
     }
 }
@@ -1223,6 +1233,7 @@ impl Default for ParsingConfig {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         }
     }
 }
