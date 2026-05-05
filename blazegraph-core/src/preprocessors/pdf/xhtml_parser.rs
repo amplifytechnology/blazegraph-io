@@ -106,6 +106,14 @@ struct ParseContext {
     // Page-level
     in_page: bool,
     page_number: u32,
+    /// Dimensions of the current page in PDF points, sourced from the
+    /// `<div class="page-meta" data-width data-height />` self-closing
+    /// tag emitted by Tika as part of the layout-reasoning consolidation
+    /// flow. Reset to 0.0 on each new `<div class="page">`. Stays 0.0 if
+    /// the page-meta tag is absent (older Tika output) — downstream
+    /// analytics treats 0.0 as "unknown" and falls back to bbox-extent.
+    current_page_width: f32,
+    current_page_height: f32,
     // div nesting depth: 1 = page div open, deeper values are nested children.
     // Used to correctly identify which </div> closes which container.
     div_depth: usize,
@@ -137,6 +145,8 @@ impl ParseContext {
         ParseContext {
             in_page: false,
             page_number: 0,
+            current_page_width: 0.0,
+            current_page_height: 0.0,
             div_depth: 0,
             container: Container::None,
             current_rotation: 0,
@@ -228,9 +238,14 @@ fn extract_text_elements(
                             ctx.page_number += 1;
                             ctx.container = Container::None;
                             ctx.current_rotation = 0;
+                            // Reset page dims; will be repopulated by the
+                            // child <div class="page-meta" .../> if present.
+                            ctx.current_page_width = 0.0;
+                            ctx.current_page_height = 0.0;
                         }
-                        // Other divs (page-meta, any nested) are tracked by
-                        // div_depth but do not change container state.
+                        // Other divs (page-meta as Start, any nested) are
+                        // tracked by div_depth but do not change container
+                        // state. page-meta is normally self-closing (Empty).
                     }
                     "aside" if ctx.in_page => {
                         ctx.container = Container::Aside;
@@ -269,7 +284,21 @@ fn extract_text_elements(
                 }
             }
 
-            Ok(Event::Empty(_)) => {}
+            Ok(Event::Empty(ref e)) => {
+                let tag_name = e.name();
+                let tag_str = std::str::from_utf8(tag_name.as_ref()).unwrap_or("");
+                if tag_str == "div" && ctx.in_page {
+                    let class = get_attr(&e.attributes(), b"class").unwrap_or_default();
+                    if class == "page-meta" {
+                        ctx.current_page_width = get_attr(&e.attributes(), b"data-width")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0.0);
+                        ctx.current_page_height = get_attr(&e.attributes(), b"data-height")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0.0);
+                    }
+                }
+            }
 
             Ok(Event::Text(ref e)) => {
                 // Capture direct text of the primary span (not text inside nested tags).
@@ -449,6 +478,8 @@ fn build_element(
             segment_number: ctx.span_segment,
             rotation: ctx.current_rotation,
             paragraph_number: ctx.paragraph_number,
+            page_width: ctx.current_page_width,
+            page_height: ctx.current_page_height,
         },
         reading_order: 0, // Assigned later in finalize_page_elements
         bookmark_match,

@@ -444,6 +444,8 @@ mod tests {
                 segment_number: 0,
                 rotation,
                 paragraph_number: 0,
+                page_width: 0.0,
+                page_height: 0.0,
             },
             reading_order: 0,
             bookmark_match: None,

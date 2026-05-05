@@ -743,6 +743,8 @@ mod tests {
             segment_number: 0,
             rotation,
             paragraph_number: 0,
+            page_width: 0.0,
+            page_height: 0.0,
         }
     }
 
@@ -802,6 +804,8 @@ mod tests {
                 segment_number: 1,
                 rotation: 0,
                 paragraph_number: 0,
+                page_width: 0.0,
+                page_height: 0.0,
             },
             reading_order: 1,
             bookmark_match: None,
@@ -1145,6 +1149,8 @@ mod tests {
                 segment_number: 0,
                 rotation: 0,
                 paragraph_number: 0,
+                page_width: 0.0,
+                page_height: 0.0,
             },
             reading_order: 0,
             bookmark_match: None,
@@ -1393,6 +1399,8 @@ mod tests {
                 segment_number: 0,
                 rotation: 0,
                 paragraph_number: 0,
+                page_width: 0.0,
+                page_height: 0.0,
             },
             reading_order: 0,
             bookmark_match: None,

@@ -21,7 +21,10 @@ pub mod statistic;
 
 pub use builder::{AnalysisBuilder, DocumentAnalysis};
 pub use font::{FontStats, FontStatsBuilder, FontStatsConfig};
-pub use geometry::{BandGeometry, GeometryStats, GeometryStatsBuilder, PageGeometry, YRange};
+pub use geometry::{
+    ColumnLayout, DensityGrid, GeometryDiagnostic, GeometryStats, GeometryStatsBuilder,
+    GeometryStatsConfig, PageDimensions,
+};
 pub use page_stats::{
     BandStats, ColumnStats, PageStats, PageStatsBuilder, PageStatsPerPage, ZoneStats,
 };

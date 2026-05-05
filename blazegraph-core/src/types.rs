@@ -354,6 +354,21 @@ pub struct Placement {
     /// Tika's paragraph number within the page (per-page counter, reset each page).
     /// This is a Y-gap heuristic — reliable for clean prose, less so for math/list content.
     pub paragraph_number: u32,
+
+    /// Width of the source PDF page in points. Sourced from Tika's
+    /// `<div class="page-meta" data-width=…>` (added by Tika as part of
+    /// the layout-reasoning consolidation flow). Carried on every
+    /// element so analytics can size per-page heatmaps without a
+    /// per-page side-channel.
+    /// `#[serde(default)]` keeps c2-preprocessor caches written before
+    /// this field existed deserializable; the value is 0.0 in that case
+    /// and consumers should treat 0.0 as "unknown".
+    #[serde(default)]
+    pub page_width: f32,
+
+    /// Height of the source PDF page in points. See `page_width`.
+    #[serde(default)]
+    pub page_height: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

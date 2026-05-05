@@ -423,6 +423,8 @@ mod tests {
             segment_number: 0,
             rotation: 0,
             paragraph_number: paragraph,
+            page_width: 0.0,
+            page_height: 0.0,
         }
     }
 
