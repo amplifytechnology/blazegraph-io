@@ -255,6 +255,9 @@ impl GraphBuilder {
                 crate::types::ParsedElementType::List => GroupType::Paragraph,
                 crate::types::ParsedElementType::ListItem => GroupType::Paragraph,
                 crate::types::ParsedElementType::Paragraph => GroupType::Paragraph,
+                crate::types::ParsedElementType::Header => GroupType::Header,
+                crate::types::ParsedElementType::Footer => GroupType::Footer,
+                crate::types::ParsedElementType::Margin => GroupType::Margin,
             };
 
             groups.push(ElementGroup {
@@ -310,6 +313,9 @@ impl GraphBuilder {
                 crate::types::ParsedElementType::List => "List",
                 crate::types::ParsedElementType::ListItem => "ListItem",
                 crate::types::ParsedElementType::Paragraph => "Paragraph",
+                crate::types::ParsedElementType::Header => "Header",
+                crate::types::ParsedElementType::Footer => "Footer",
+                crate::types::ParsedElementType::Margin => "Margin",
             };
 
             let placement = first_element.pdf_placement();
@@ -323,6 +329,9 @@ impl GraphBuilder {
             let node_type = match group.group_type {
                 GroupType::Section => "Section",
                 GroupType::Paragraph => "Paragraph",
+                GroupType::Header => "Header",
+                GroupType::Footer => "Footer",
+                GroupType::Margin => "Margin",
             };
             (node_type, None)
         }

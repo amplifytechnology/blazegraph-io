@@ -256,7 +256,10 @@ impl<'a> SpatialClusteringRule<'a> {
             ParsedElementType::Section => &self.config.spatial_clustering.sections,
             ParsedElementType::Paragraph
             | ParsedElementType::List
-            | ParsedElementType::ListItem => &self.config.spatial_clustering.paragraphs,
+            | ParsedElementType::ListItem
+            | ParsedElementType::Header
+            | ParsedElementType::Footer
+            | ParsedElementType::Margin => &self.config.spatial_clustering.paragraphs,
         }
     }
 

@@ -620,6 +620,19 @@ impl<'a> SectionDetectionV2Rule<'a> {
         hierarchy_context: &mut HierarchyContext,
         current_element: &ParsedPdfElement,
     ) -> (ParsedElementType, u32) {
+        // Header / Footer / Margin elements are pre-classified at the
+        // PdfTextElement → ParsedPdfElement boundary from
+        // `placement.region_label` (Block 07). Skip section detection on them
+        // so running headers, footers, and out-of-region marginalia never get
+        // promoted to Section.
+        if matches!(
+            current_element.element_type,
+            ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
+        ) {
+            let content_level = hierarchy_context.get_content_level();
+            return (current_element.element_type.clone(), content_level);
+        }
+
         let element = &self.text_elements[element_idx];
 
         // Pass 1
@@ -658,7 +671,9 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
                 .iter()
                 .enumerate()
                 .map(|(i, te)| ParsedPdfElement {
-                    element_type: ParsedElementType::Paragraph,
+                    element_type: ParsedElementType::from_region_label(
+                        te.placement.region_label.as_deref(),
+                    ),
                     text: te.text.clone(),
                     hierarchy_level: 3,
                     position: i,
@@ -1730,5 +1745,80 @@ mod tests {
         // want after a fix):
         //   assert_eq!(d_wrap, 3, "wrap-line should remain at section depth (continuation)");
         //   assert_eq!(body_depth, 4, "body should be one level under the section");
+    }
+
+    // ── Block 07 — Header / Footer / Margin classification skip ───────────────
+
+    /// Build a `PdfTextElement` whose font size and isolation would otherwise
+    /// promote it to Section under the Region 1 path (`test_region1_auto_promotes`
+    /// is the canonical positive case). Caller chooses the `region_label` to
+    /// drive the Block 07 boundary classifier.
+    fn make_section_sized_element(region_label: Option<&str>) -> PdfTextElement {
+        let mut el = make_element(16.0, false, "body", 0);
+        el.placement.region_label = region_label.map(str::to_string);
+        el
+    }
+
+    /// Apply `SectionDetectionV2Rule` over a freshly-bootstrapped element list
+    /// (the bootstrap path picks `element_type` from `region_label`) and return
+    /// the resulting element types in order.
+    fn run_apply_bootstrap(text_elements: &[PdfTextElement]) -> Vec<ParsedElementType> {
+        let body = 10.0;
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None, 0.80);
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let engine = RuleEngine::new().expect("engine");
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            text_elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        rule.apply(Vec::new())
+            .expect("apply succeeds")
+            .into_iter()
+            .map(|e| e.element_type)
+            .collect()
+    }
+
+    /// Block 07 — `H-*` region label is preserved through section detection.
+    /// The element has section-promoting geometry (16pt vs 10pt body, isolated)
+    /// so without the skip guard it would land as `Section`.
+    #[test]
+    fn block07_header_label_skips_section_promotion() {
+        let text_elements = vec![make_section_sized_element(Some("H-1"))];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Header]);
+    }
+
+    /// Block 07 — `F-*` region label is preserved through section detection.
+    #[test]
+    fn block07_footer_label_skips_section_promotion() {
+        let text_elements = vec![make_section_sized_element(Some("F-2"))];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Footer]);
+    }
+
+    /// Block 07 — orphan element (region_label = None) classifies as Margin and
+    /// is skipped by section detection. Sidebar marginalia / rotated content /
+    /// elements outside any Region tree leaf land here.
+    #[test]
+    fn block07_orphan_label_skips_section_promotion() {
+        let text_elements = vec![make_section_sized_element(None)];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Margin]);
+    }
+
+    /// Block 07 — body leaf labels (`"1"`, `"2-1"`, …) follow the normal
+    /// section-detection path. This is the regression check for the guard:
+    /// the `H-` / `F-` prefix gate must not catch body labels.
+    #[test]
+    fn block07_body_leaf_label_still_promotes_to_section() {
+        let text_elements = vec![make_section_sized_element(Some("2-1"))];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Section]);
     }
 }

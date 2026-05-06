@@ -705,7 +705,11 @@ fn make_v2_element(
             segment_number: 0,
             rotation,
             paragraph_number: 0,
-            region_label: None,
+            // Default to a body leaf label so the synthetic fixture lands as
+            // body content (`ParsedElementType::Paragraph` at the conversion
+            // boundary). Tests that exercise Block 07 orphan / header /
+            // footer behavior override this after construction.
+            region_label: Some("1".to_string()),
             page_width: 0.0,
             page_height: 0.0,
         },
@@ -1082,8 +1086,12 @@ fn v2_test6_figure_caption_is_demoted() {
 /// Rotated element (rotation=90) is never a section, regardless of visual properties.
 #[test]
 fn v2_test7_rotated_element_is_never_section() {
-    // 20pt bold — rotation=90 → must be Paragraph
-    let text_elements = vec![make_v2_element(
+    // 20pt bold — rotation=90. Rotated content is excluded from
+    // `body_element_indices` by `analytics::reading_order::tag_and_resort`,
+    // so its `region_label` stays `None` → `ParsedElementType::Margin` at the
+    // conversion boundary, and Block 07's classify guard skips section
+    // detection. Either way it must never become a Section.
+    let mut text_elements = vec![make_v2_element(
         "sidebar",
         "arxiv 2017.09",
         20.0,
@@ -1093,6 +1101,9 @@ fn v2_test7_rotated_element_is_never_section() {
         10.0,
         200.0,
     )];
+    // Override the body-default fixture label: rotated elements have no
+    // region label in the post-Block-06b contract.
+    text_elements[0].placement.region_label = None;
 
     let font_analysis = make_font_analysis(10.0, &[("sidebar", 1)]);
     let config = make_v2_config(SectionDetectionV2Config::default());
@@ -1114,8 +1125,8 @@ fn v2_test7_rotated_element_is_never_section() {
 
     assert_eq!(
         result[0].element_type,
-        ParsedElementType::Paragraph,
-        "Rotated element (rotation=90) must never be classified as Section"
+        ParsedElementType::Margin,
+        "Rotated element (rotation=90, no region_label) lands as Margin and is skipped by section detection"
     );
 }
 
@@ -1144,7 +1155,11 @@ fn placement_fields_accessible_via_struct() {
     assert_eq!(element.placement.segment_number, 0);
     assert_eq!(element.placement.rotation, 90);
     assert_eq!(element.placement.paragraph_number, 0);
-    assert_eq!(element.placement.region_label, None);
+    // Block 07: `make_v2_element` defaults `region_label` to a body leaf
+    // label so the synthetic fixture flows through section detection as
+    // body content. Tests that exercise orphan / header / footer behavior
+    // override this after construction.
+    assert_eq!(element.placement.region_label, Some("1".to_string()));
     // Accessor methods agree with direct field reads
     assert_eq!(element.rotation(), 90);
     assert_eq!(element.line_number(), 3);

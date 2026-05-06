@@ -70,7 +70,14 @@ pub struct DocumentInfo {
 /// `Placement.column`, `Placement.nr_band_columns` (zeroed out since the
 /// Block 1 layout-reasoning consolidation); added `Placement.region_label`
 /// for region tree leaf annotation produced by `analytics::reading_order::tag_and_resort`.
-pub const SCHEMA_VERSION: &str = "0.5.0";
+///
+/// 0.5.1 — Block 07 header/footer/margin classification: added `Header`,
+/// `Footer`, `Margin` variants to `ParsedElementType` (and matching
+/// `GroupType` variants). Element type is assigned at the
+/// `PdfTextElement` → `ParsedPdfElement` boundary from `region_label`
+/// (`H-*` → Header, `F-*` → Footer, `None` → Margin, body leaf labels →
+/// Paragraph). Section detection skips Header / Footer / Margin.
+pub const SCHEMA_VERSION: &str = "0.5.1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -613,6 +620,9 @@ pub struct ElementGroup {
 pub enum GroupType {
     Section,
     Paragraph,
+    Header,
+    Footer,
+    Margin,
 }
 /// Complete output from document preprocessing
 ///
@@ -663,4 +673,92 @@ pub enum ParsedElementType {
     Paragraph,
     List,
     ListItem,
+    Header,
+    Footer,
+    Margin,
+}
+
+impl ParsedElementType {
+    /// Initial element type derived from a region label produced by
+    /// `analytics::reading_order::tag_and_resort`.
+    ///
+    /// - `Some("H-*")` → `Header` (running header element)
+    /// - `Some("F-*")` → `Footer` (running footer element)
+    /// - `None` → `Margin` (orphan: sidebar / rotated / out-of-region content)
+    /// - any other label (body leaf path like `"1"`, `"2-1"`, `"2-4-1"`) → `Paragraph`
+    pub fn from_region_label(label: Option<&str>) -> Self {
+        match label {
+            Some(l) if l.starts_with("H-") => Self::Header,
+            Some(l) if l.starts_with("F-") => Self::Footer,
+            Some(_) => Self::Paragraph,
+            None => Self::Margin,
+        }
+    }
+}
+
+#[cfg(test)]
+mod parsed_element_type_tests {
+    use super::ParsedElementType;
+
+    #[test]
+    fn header_label_maps_to_header() {
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("H-1")),
+            ParsedElementType::Header
+        );
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("H-12")),
+            ParsedElementType::Header
+        );
+    }
+
+    #[test]
+    fn footer_label_maps_to_footer() {
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("F-1")),
+            ParsedElementType::Footer
+        );
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("F-3")),
+            ParsedElementType::Footer
+        );
+    }
+
+    #[test]
+    fn body_leaf_label_maps_to_paragraph() {
+        // Region tree leaf paths from `analytics::reading_order` —
+        // depth-first DF order on the per-page Region tree.
+        for label in ["1", "2-1", "2-4-1", "10"] {
+            assert_eq!(
+                ParsedElementType::from_region_label(Some(label)),
+                ParsedElementType::Paragraph,
+                "label {label:?} should map to Paragraph",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_label_maps_to_margin() {
+        // `region_label = None` covers orphans: rotated content, sidebar
+        // marginalia, elements outside any region tree leaf, pages with
+        // no Region tree (e.g., NonBody pages where xy_cut bailed).
+        assert_eq!(
+            ParsedElementType::from_region_label(None),
+            ParsedElementType::Margin
+        );
+    }
+
+    #[test]
+    fn header_footer_prefix_is_strict() {
+        // A label that merely contains "H-" or "F-" mid-string is a body
+        // leaf path, not a header / footer. Only the leading prefix counts.
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("1-H-2")),
+            ParsedElementType::Paragraph
+        );
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("Hello")),
+            ParsedElementType::Paragraph
+        );
+    }
 }

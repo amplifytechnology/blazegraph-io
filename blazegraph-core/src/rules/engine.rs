@@ -521,8 +521,12 @@ impl RuleEngine {
                 continue;
             }
 
-            let paragraph_element = ParsedPdfElement {
-                element_type: ParsedElementType::Paragraph,
+            let element_type = ParsedElementType::from_region_label(
+                text_element.placement.region_label.as_deref(),
+            );
+
+            let parsed_element = ParsedPdfElement {
+                element_type,
                 text: text_element.text.trim().to_string(),
                 hierarchy_level: 1, // All elements start at level 1 for base conversion
                 position,
@@ -533,7 +537,7 @@ impl RuleEngine {
                 token_count: text_element.token_count,
             };
 
-            elements.push(paragraph_element);
+            elements.push(parsed_element);
         }
 
         elements

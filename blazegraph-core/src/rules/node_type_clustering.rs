@@ -294,6 +294,15 @@ impl<'a> NodeTypeClusteringRule<'a> {
             ParsedElementType::Paragraph => &cfg.paragraph,
             ParsedElementType::List => &cfg.list,
             ParsedElementType::ListItem => &cfg.list_item,
+            // Block 07 — rule is `enabled: false` in the active config and
+            // its band/column-based partitioning is awaiting a region-aware
+            // redesign (see ignored tests in this file). Header / Footer /
+            // Margin currently fall through to the paragraph config so they
+            // compile; the redesign will give them their own config keys
+            // alongside the new region_label-aware equivalence key.
+            ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin => {
+                &cfg.paragraph
+            }
         }
     }
 
@@ -447,6 +456,9 @@ mod tests {
                 ParsedElementType::Paragraph => &cfg.paragraph,
                 ParsedElementType::List => &cfg.list,
                 ParsedElementType::ListItem => &cfg.list_item,
+                ParsedElementType::Header
+                | ParsedElementType::Footer
+                | ParsedElementType::Margin => &cfg.paragraph,
             }
         };
 
