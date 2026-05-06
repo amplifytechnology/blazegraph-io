@@ -4,6 +4,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 
+use crate::analytics::font::FontStats;
 use crate::analytics::geometry::GeometryStats;
 use crate::types::PdfTextElement;
 
@@ -44,6 +45,13 @@ pub trait Statistic {
 /// Stat kinds that have no dependencies receive an effectively-empty context.
 #[derive(Debug, Default)]
 pub struct FinalizationContext<'a> {
+    /// Finalized font stats, available to stats finalized after font. `None`
+    /// if finalization order has not yet reached font, or if font stats are
+    /// disabled by config. Geometry's per-page footer walk reads this to use
+    /// the document-level body size as the body-row threshold rather than a
+    /// per-page median (which is fragile when Tika's per-segment span
+    /// granularity differs from PyMuPDF's per-glyph-cluster granularity).
+    pub font: Option<&'a FontStats>,
     /// Finalized geometry, available to stats finalized after geometry. `None`
     /// if finalization order has not yet reached geometry, or if geometry
     /// stats are disabled by config.

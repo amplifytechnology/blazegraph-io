@@ -47,11 +47,20 @@ impl AnalysisBuilder {
         let empty_ctx = FinalizationContext::default();
         let font = self.font.finalize(&empty_ctx);
 
-        // Geometry has no dependencies.
-        let geometry = self.geometry.finalize(&empty_ctx);
+        // Geometry depends on the finalized FontStats — its per-page footer
+        // walk reads the document-level body size instead of a fragile
+        // per-page median. See `find_per_page_footer_line` in geometry.rs
+        // for the rationale.
+        let geometry_ctx = FinalizationContext {
+            font: Some(&font),
+            geometry: None,
+        };
+        let geometry = self.geometry.finalize(&geometry_ctx);
 
-        // PageStats depends on the finalized GeometryStats.
+        // PageStats depends on the finalized GeometryStats and reads font
+        // for the same reason geometry does.
         let page_ctx = FinalizationContext {
+            font: Some(&font),
             geometry: Some(&geometry),
         };
         let page_stats = self.page_stats.finalize(&page_ctx);

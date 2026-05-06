@@ -354,8 +354,20 @@ impl Statistic for GeometryStatsBuilder {
         }
     }
 
-    fn finalize(self, _ctx: &FinalizationContext<'_>) -> Self::Output {
-        finalize_geometry(self.pages, &self.config)
+    fn finalize(self, ctx: &FinalizationContext<'_>) -> Self::Output {
+        // Pull the document-level body-size signal from FontStats when it has
+        // observations. The default FontStats value (12.0) on an empty
+        // document is not meaningful — guard with a `font_size_counts`
+        // non-empty check so synthetic tests (which don't run FontStats)
+        // and empty docs both fall back to the per-page median.
+        let doc_body_size = ctx.font.and_then(|f| {
+            if f.font_size_counts.is_empty() {
+                None
+            } else {
+                Some(f.most_common_font_size)
+            }
+        });
+        finalize_geometry(self.pages, &self.config, doc_body_size)
     }
 }
 
@@ -363,7 +375,11 @@ impl Statistic for GeometryStatsBuilder {
 // Finalization orchestrator
 // ---------------------------------------------------------------------------
 
-fn finalize_geometry(pages: Vec<PageAccumulator>, config: &GeometryStatsConfig) -> GeometryStats {
+fn finalize_geometry(
+    pages: Vec<PageAccumulator>,
+    config: &GeometryStatsConfig,
+    doc_body_size: Option<f32>,
+) -> GeometryStats {
     if pages.is_empty() {
         return GeometryStats::default();
     }
@@ -414,6 +430,7 @@ fn finalize_geometry(pages: Vec<PageAccumulator>, config: &GeometryStatsConfig) 
                 footer.line,
                 config.per_page_tolerance,
                 config.min_token_size,
+                doc_body_size,
             )
         })
         .collect();
@@ -889,14 +906,23 @@ fn find_column_layout(
 
 /// Per-page footer detection by font-size transition. Walking UP from
 /// `doc_footer_y`, find the first row where the average token font_size
-/// meets the page-median (within `tolerance`). That row is body; the
-/// per-page footer line is one row below it. Ported from
+/// meets the body-size threshold (within `tolerance`). That row is body;
+/// the per-page footer line is one row below it. Ported from
 /// `find_per_page_footer_line`.
+///
+/// `doc_body_size` is the document-level body size from FontStats — used as
+/// the body reference when available. Falls back to the per-page median
+/// when `None` (e.g. synthetic tests, or when FontStats is disabled). The
+/// document-level reference is more robust on documents where the page's
+/// median is dragged down by abundant non-body content (academic papers
+/// with long footnote blocks, where Tika's per-segment span granularity
+/// over-counts 8/9pt fragments and pulls the median below body size).
 fn find_per_page_footer_line(
     page: &PageAccumulator,
     doc_footer_y: usize,
     tolerance: f32,
     min_token_size: f32,
+    doc_body_size: Option<f32>,
 ) -> Option<f32> {
     let elements: Vec<&TokenForGeometry> = page
         .tokens
@@ -913,16 +939,30 @@ fn find_per_page_footer_line(
     }
     let middle = height / 2;
 
-    // Per-page median over per-token font sizes.
-    let mut sizes: Vec<f32> = elements.iter().map(|t| t.font_size).collect();
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_size = if sizes.len() % 2 == 1 {
-        sizes[sizes.len() / 2]
-    } else {
-        let mid = sizes.len() / 2;
-        (sizes[mid - 1] + sizes[mid]) / 2.0
-    };
-    let threshold = median_size - tolerance;
+    // Body-size reference: prefer the document-level signal from FontStats;
+    // fall back to the per-page median when unavailable.
+    let body_size = doc_body_size.unwrap_or_else(|| {
+        let mut sizes: Vec<f32> = elements.iter().map(|t| t.font_size).collect();
+        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if sizes.len() % 2 == 1 {
+            sizes[sizes.len() / 2]
+        } else {
+            let mid = sizes.len() / 2;
+            (sizes[mid - 1] + sizes[mid]) / 2.0
+        }
+    });
+    let threshold = body_size - tolerance;
+    if threshold <= 0.0 {
+        // Degenerate: no usable size gradient. Hits when Tika reports
+        // uniform nominal `font_size=1.0` (common for CELEX-style legal
+        // PDFs where the embedded font metrics don't expose real point
+        // sizes). The per-page footer algorithm depends on a body→footer
+        // size transition; without one, every content row passes the
+        // threshold and the result is meaningless. Returning `None`
+        // matches the established "no detectable body" contract —
+        // consumers fall back to `doc_footer_y`.
+        return None;
+    }
 
     // Per-row token-size aggregates: each token contributes once per row
     // its bbox covers (floor..ceil).
@@ -940,11 +980,21 @@ fn find_per_page_footer_line(
     }
 
     // Walk UP from doc_footer_y, skip empty rows, stop at first body row.
+    //
+    // Strict `>` (vs the Python prototype's `>=`): when Tika's per-segment
+    // span granularity drives the body-size reference downward by one pt
+    // (e.g. attention's most_common_font_size=9 because Tika overcounts 9pt
+    // body fragments vs PyMuPDF's per-glyph clusters), a tied threshold
+    // would admit footer rows that share that one-pt margin. Strict `>`
+    // requires body rows to be measurably above the body-size − tolerance
+    // band; Tika 9pt body still passes (9 > 8) but Tika 8pt footers do not
+    // (8 > 8 is false). Body rows that genuinely sit at exactly threshold
+    // are extremely rare in real corpus data.
     let mut y = doc_footer_y.min(height.saturating_sub(1));
     while y >= middle {
         if row_counts[y] > 0 {
             let avg = (row_sums[y] / row_counts[y] as f64) as f32;
-            if avg >= threshold {
+            if avg > threshold {
                 return Some((y + 1) as f32);
             }
         }
