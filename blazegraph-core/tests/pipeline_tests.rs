@@ -472,8 +472,9 @@ mod breadcrumbs {
 //
 // Tika emits positioned-text primitives only after the layout-reasoning
 // consolidation flow (2026-05-03) — no <div class="band">, no data-column.
-// The parser preserves the Placement.band / column / nr_band_columns fields
-// for API stability but always populates them with defaults (0, 0, 1).
+// The legacy Placement.band / column / nr_band_columns fields were dropped
+// in schema 0.5.0 (Block 06b). Region tagging now lives on
+// `Placement.region_label`, set by `analytics::reading_order::tag_and_resort`.
 
 #[test]
 fn test_parser_rotation_from_aside() {
@@ -509,9 +510,7 @@ fn test_parser_old_format_defaults() {
     assert!(!output.text_elements.is_empty());
     for el in &output.text_elements {
         assert_eq!(el.placement.rotation, 0, "default rotation");
-        assert_eq!(el.placement.column, 0, "default column");
-        assert_eq!(el.placement.band, 0, "default band");
-        assert_eq!(el.placement.nr_band_columns, 1, "default nr_band_columns");
+        assert_eq!(el.placement.region_label, None, "default region_label");
         assert!(el.raw_tags.is_empty(), "default raw_tags");
     }
 }
@@ -545,20 +544,13 @@ fn test_integration_rfc_quic_post_strip_defaults() {
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
     assert!(!e.is_empty(), "rfc-quic parses to non-empty element list");
-    // Post layout-reasoning consolidation: Tika emits no bands or columns, so
-    // every element resolves to the Placement defaults. The fields survive on
-    // the struct for API stability; section detection no longer depends on them.
+    // Post layout-reasoning consolidation: Tika emits no bands or columns. The
+    // legacy band/column/nr_band_columns fields were dropped in schema 0.5.0;
+    // `region_label` lands later via `tag_and_resort` and is None at this
+    // stage of the pipeline (parser output, pre-analytics).
     assert!(
-        e.iter().all(|el| el.placement.band == 0),
-        "all elements default band=0 post-strip"
-    );
-    assert!(
-        e.iter().all(|el| el.placement.nr_band_columns == 1),
-        "all elements default nr_band_columns=1 post-strip"
-    );
-    assert!(
-        e.iter().all(|el| el.placement.column == 0),
-        "all elements default column=0 post-strip"
+        e.iter().all(|el| el.placement.region_label.is_none()),
+        "parser leaves region_label = None; tagging happens post-analytics"
     );
     assert!(
         e.iter().all(|el| el.placement.rotation == 0),
@@ -584,10 +576,6 @@ fn test_integration_attention_rotation() {
     assert!(
         e.iter().any(|el| el.placement.rotation == 0),
         "attention has non-rotated body text"
-    );
-    assert!(
-        e.iter().any(|el| el.placement.band > 0),
-        "attention has multiple bands"
     );
 }
 
@@ -615,13 +603,11 @@ fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextEleme
                 width: 100.0,
                 height: font_size,
             },
-            band: 0,
-            column: 0,
-            nr_band_columns: 1,
             line_number: 0,
             segment_number: 0,
             rotation,
             paragraph_number: 0,
+            region_label: None,
             page_width: 0.0,
             page_height: 0.0,
         },
@@ -685,7 +671,7 @@ fn analyze_font_sizes_excludes_rotated() {
 
 /// Build a PdfTextElement with full control over all fields relevant to V2.
 /// `text`, `font_size`, `font_weight` ("bold" or "normal"), `rotation`, `line_number`,
-/// `band`, `column`, `x`, `width` (bbox), and `class_name`.
+/// `x`, `width` (bbox), and `class_name`.
 #[allow(clippy::too_many_arguments)]
 fn make_v2_element(
     class_name: &str,
@@ -694,8 +680,6 @@ fn make_v2_element(
     font_weight: &str, // "bold" or "normal"
     rotation: i32,
     line_number: u32,
-    band: u32,
-    column: u32,
     x: f32,
     width: f32,
 ) -> PdfTextElement {
@@ -717,13 +701,11 @@ fn make_v2_element(
                 width,
                 height: font_size,
             },
-            band,
-            column,
-            nr_band_columns: 1,
             line_number,
             segment_number: 0,
             rotation,
             paragraph_number: 0,
+            region_label: None,
             page_width: 0.0,
             page_height: 0.0,
         },
@@ -788,8 +770,6 @@ fn v2_test1_dispatched_and_detects_section() {
         "bold",
         0,
         1,
-        0,
-        0,
         10.0,
         100.0,
     )];
@@ -801,8 +781,6 @@ fn v2_test1_dispatched_and_detects_section() {
             "normal",
             0,
             (i as u32) + 2,
-            0,
-            0,
             10.0,
             300.0,
         ));
@@ -848,7 +826,7 @@ fn v2_test1_dispatched_and_detects_section() {
 fn v2_test2_size_only_strong_candidate_is_section() {
     // header class is rare: 1 out of total 101 elements (< 5% threshold)
     let mut text_elements = vec![make_v2_element(
-        "h_rare", "Abstract", 18.0, "normal", 0, 1, 0, 0, 10.0, 80.0,
+        "h_rare", "Abstract", 18.0, "normal", 0, 1, 10.0, 80.0,
     )];
     for i in 0..100usize {
         text_elements.push(make_v2_element(
@@ -858,8 +836,6 @@ fn v2_test2_size_only_strong_candidate_is_section() {
             "normal",
             0,
             (i as u32) + 2,
-            0,
-            0,
             10.0,
             300.0,
         ));
@@ -909,12 +885,10 @@ fn v2_test3_bold_inline_emphasis_is_not_section() {
             "normal",
             0,
             5,
-            0,
-            0,
             10.0,
             100.0,
         ),
-        make_v2_element("body_bold", "Note:", 10.0, "bold", 0, 5, 0, 0, 115.0, 40.0),
+        make_v2_element("body_bold", "Note:", 10.0, "bold", 0, 5, 115.0, 40.0),
         make_v2_element(
             "body",
             "this is inline emphasis.",
@@ -922,8 +896,6 @@ fn v2_test3_bold_inline_emphasis_is_not_section() {
             "normal",
             0,
             5,
-            0,
-            0,
             160.0,
             200.0,
         ),
@@ -973,8 +945,6 @@ fn v2_test4_bold_isolated_at_body_size_is_section() {
         "bold",
         0,
         3,
-        0,
-        0,
         10.0,
         60.0,
     )];
@@ -986,8 +956,6 @@ fn v2_test4_bold_isolated_at_body_size_is_section() {
             "normal",
             0,
             (i as u32) + 4,
-            0,
-            0,
             10.0,
             300.0,
         ));
@@ -1036,8 +1004,6 @@ fn v2_test5_numbered_subsection_pattern_promotes_weak() {
         "normal",
         0,
         1,
-        0,
-        0,
         10.0,
         150.0,
     )];
@@ -1084,8 +1050,6 @@ fn v2_test6_figure_caption_is_demoted() {
         "bold",
         0,
         1,
-        0,
-        0,
         10.0,
         200.0,
     )];
@@ -1126,8 +1090,6 @@ fn v2_test7_rotated_element_is_never_section() {
         "bold",
         90,
         1,
-        0,
-        0,
         10.0,
         200.0,
     )];
@@ -1161,7 +1123,7 @@ fn v2_test7_rotated_element_is_never_section() {
 // Block 05a: Placement struct — structural migration test
 // ============================================================================
 
-/// Confirm that all 9 spatial fields round-trip correctly through the Placement struct.
+/// Confirm that the Placement struct fields round-trip correctly post-schema-0.5.0.
 /// This test verifies the structural migration is complete and nothing was silently dropped.
 #[test]
 fn placement_fields_accessible_via_struct() {
@@ -1172,25 +1134,19 @@ fn placement_fields_accessible_via_struct() {
         "bold",
         90,
         3,
-        2,
-        1,
         42.5,
         120.0,
     );
     assert_eq!(element.placement.page_number, 0);
     assert_eq!(element.placement.bounding_box.x, 42.5);
     assert_eq!(element.placement.bounding_box.width, 120.0);
-    assert_eq!(element.placement.band, 2);
-    assert_eq!(element.placement.column, 1);
-    assert_eq!(element.placement.nr_band_columns, 1);
     assert_eq!(element.placement.line_number, 3);
     assert_eq!(element.placement.segment_number, 0);
     assert_eq!(element.placement.rotation, 90);
     assert_eq!(element.placement.paragraph_number, 0);
+    assert_eq!(element.placement.region_label, None);
     // Accessor methods agree with direct field reads
     assert_eq!(element.rotation(), 90);
-    assert_eq!(element.band(), 2);
-    assert_eq!(element.column(), 1);
     assert_eq!(element.line_number(), 3);
     assert_eq!(element.page_number(), 0);
     assert_eq!(element.bounding_box().x, 42.5);
@@ -1206,21 +1162,10 @@ fn v2_test8_hierarchy_levels_assigned_correctly() {
     // All are well above body (10pt) → strong candidates → sections.
     // Each is alone on its line → isolated.
     let text_elements = vec![
-        make_v2_element("h1", "Chapter One", 16.0, "bold", 0, 1, 0, 0, 10.0, 100.0),
-        make_v2_element("h2", "Section 1.1", 13.0, "bold", 0, 2, 0, 0, 10.0, 80.0),
-        make_v2_element(
-            "h3",
-            "Subsection 1.1.1",
-            11.0,
-            "bold",
-            0,
-            3,
-            0,
-            0,
-            10.0,
-            120.0,
-        ),
-        make_v2_element("h1", "Chapter Two", 16.0, "bold", 0, 4, 0, 0, 10.0, 100.0),
+        make_v2_element("h1", "Chapter One", 16.0, "bold", 0, 1, 10.0, 100.0),
+        make_v2_element("h2", "Section 1.1", 13.0, "bold", 0, 2, 10.0, 80.0),
+        make_v2_element("h3", "Subsection 1.1.1", 11.0, "bold", 0, 3, 10.0, 120.0),
+        make_v2_element("h1", "Chapter Two", 16.0, "bold", 0, 4, 10.0, 100.0),
     ];
 
     let font_analysis = make_font_analysis(10.0, &[("h1", 2), ("h2", 1), ("h3", 1)]);

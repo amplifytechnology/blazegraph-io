@@ -65,7 +65,12 @@ pub struct DocumentInfo {
 /// 0.4.0 — Block 05 of the document-analytics flow: dropped `document_info.document_analysis`.
 /// Analytics live in pipeline memory + sidecar dumps under `cache/stat/<name>/<hash>.json`,
 /// not in the graph output schema.
-pub const SCHEMA_VERSION: &str = "0.4.0";
+///
+/// 0.5.0 — Block 06b reading-order resort: dropped legacy `Placement.band`,
+/// `Placement.column`, `Placement.nr_band_columns` (zeroed out since the
+/// Block 1 layout-reasoning consolidation); added `Placement.region_label`
+/// for region tree leaf annotation produced by `analytics::reading_order::tag_and_resort`.
+pub const SCHEMA_VERSION: &str = "0.5.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -333,15 +338,6 @@ pub struct Placement {
     /// Bounding box on the PDF page.
     pub bounding_box: BoundingBox,
 
-    /// 0-indexed Y-band container index on the page (CR-16).
-    pub band: u32,
-
-    /// 0-indexed column identity within the band (CR-15).
-    pub column: u32,
-
-    /// Number of columns in this band (CR-16). Values > 2 suggest table-like content.
-    pub nr_band_columns: u32,
-
     /// 0-indexed line number within the paragraph. From `data-line` on span.
     pub line_number: u32,
 
@@ -354,6 +350,26 @@ pub struct Placement {
     /// Tika's paragraph number within the page (per-page counter, reset each page).
     /// This is a Y-gap heuristic — reliable for clean prose, less so for math/list content.
     pub paragraph_number: u32,
+
+    /// Region tree leaf label this element belongs to. Set by Block 06b
+    /// (`analytics::reading_order::tag_and_resort`) when the analytics
+    /// pre-pass runs. Values:
+    ///   - `Some("1")`, `Some("2-1")`, etc. — body element in the named
+    ///     Region tree leaf (depth-first reading-order path from
+    ///     `RegionStats.per_page[…].root`).
+    ///   - `Some("H-1")`, `Some("H-2")`, … — header element (y-asc within
+    ///     the page's headers above `geometry.header_y`).
+    ///   - `Some("F-1")`, `Some("F-2")`, … — footer element (y-asc within
+    ///     the page's footers below `geometry.doc_footer_y`).
+    ///   - `None` — orphan element (within body Y range but outside the
+    ///     body X range — marginalia, sidebar). Placed at the end of the
+    ///     page's reading order in original Tika sequence.
+    ///
+    /// Internal pipeline state — not a public schema field. Optional via
+    /// `#[serde(default)]` so caches that predate this field deserialize
+    /// cleanly with `region_label = None`.
+    #[serde(default)]
+    pub region_label: Option<String>,
 
     /// Width of the source PDF page in points. Sourced from Tika's
     /// `<div class="page-meta" data-width=…>` (added by Tika as part of
@@ -377,8 +393,7 @@ pub struct PdfTextElement {
     pub style_info: FontClass,
     pub placement: Placement, // REPLACES: bounding_box, page_number,
     //   paragraph_number, line_number,
-    //   segment_number, rotation, band,
-    //   column, nr_band_columns
+    //   segment_number, rotation
     pub reading_order: u32,
     pub bookmark_match: Option<BookmarkSection>,
     pub token_count: usize,
@@ -403,16 +418,6 @@ impl PdfTextElement {
     /// Text rotation in degrees.
     pub fn rotation(&self) -> i32 {
         self.placement.rotation
-    }
-
-    /// Band index from enclosing band div.
-    pub fn band(&self) -> u32 {
-        self.placement.band
-    }
-
-    /// Column index within the band.
-    pub fn column(&self) -> u32 {
-        self.placement.column
     }
 
     /// 0-indexed line number within the paragraph.

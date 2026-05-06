@@ -15,9 +15,11 @@
 //!
 //! Note: `<div class="band">` and `data-column` were emitted by Tika prior to
 //! the layout-reasoning consolidation flow (2026-05-03). Tika no longer emits
-//! either; structural reasoning lives on the Rust side. The Placement fields
-//! `band`, `column`, `nr_band_columns` survive on PdfTextElement but are now
-//! always populated with defaults (0, 0, 1).
+//! either; structural reasoning lives on the Rust side. The legacy Placement
+//! fields `band`, `column`, `nr_band_columns` were dropped in schema 0.5.0
+//! (Block 06b — reading-order resort); region tagging is now produced post-
+//! analytics via `analytics::reading_order::tag_and_resort` and lives on
+//! `Placement.region_label`.
 //!
 //! Parser approach: quick-xml pull-parser in event mode. A lightweight state
 //! machine tracks the current page and aside/rotation context as the parser
@@ -466,18 +468,11 @@ fn build_element(
                 width,
                 height,
             },
-            // Band/column abstractions are deferred to a follow-on flow that
-            // recovers column structure on the Rust side from doc-level
-            // geometry. Defaults here keep the Placement struct API stable
-            // for downstream consumers; section detection v2 no longer
-            // depends on these fields (see is_isolated, X-cluster geometry).
-            band: 0,
-            column: 0,
-            nr_band_columns: 1,
             line_number: ctx.span_line,
             segment_number: ctx.span_segment,
             rotation: ctx.current_rotation,
             paragraph_number: ctx.paragraph_number,
+            region_label: None,
             page_width: ctx.current_page_width,
             page_height: ctx.current_page_height,
         },

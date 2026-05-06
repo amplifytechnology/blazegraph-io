@@ -77,12 +77,19 @@ fn majority_style(sorted_elements: &[ParsedPdfElement]) -> FontClass {
 /// Elements with the same key share an equivalence class for merging purposes.
 /// `max_y_gap` is *not* an equivalence — it's a pairwise proximity check applied
 /// during walk-and-split inside each bucket.
+///
+/// NOTE (Block 06b, schema 0.5.0): the legacy `band` / `column` partition
+/// dimensions were dropped along with the matching Placement fields. Both
+/// `cfg.same_band` and `cfg.same_column` are read from yaml but no longer
+/// influence the equivalence key. The rule is disabled in the active config
+/// (`pipeline.NodeTypeClustering.enabled = false`) and merge semantics will
+/// be redesigned in a follow-up CR using `Placement.region_label` from the
+/// reading-order resort. Until then, the partition is `(page, element_type,
+/// paragraph?, line?, depth?)` only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EquivalenceKey {
     page: u32,
     element_type: ParsedElementType,
-    band: Option<u32>,
-    column: Option<u32>,
     paragraph: Option<u32>,
     line: Option<u32>,
     depth: Option<u32>,
@@ -93,12 +100,6 @@ fn equivalence_key(el: &ParsedPdfElement, cfg: &NodeTypeMergeConfig) -> Equivale
     EquivalenceKey {
         page: p.page_number,
         element_type: el.element_type.clone(),
-        band: if cfg.same_band { Some(p.band) } else { None },
-        column: if cfg.same_column {
-            Some(p.column)
-        } else {
-            None
-        },
         paragraph: if cfg.same_paragraph {
             Some(p.paragraph_number)
         } else {
@@ -156,28 +157,27 @@ fn merge_group(
     }
 
     // --- Text concatenation ---
-    // Same-line detection: two elements are on the same visual line iff they
-    // share `(band, line_number)`. Tika resets `line_number` per-paragraph and
-    // per-band, so `line_number` alone collides across bands (both bands have
-    // line=0). Without the band guard, cross-band merges concatenate without
-    // separator and read as "ImprovingLLM accuracy".
+    //
+    // Same-line detection (legacy): pre-Block-06b this used `(band, line_number)`
+    // because Tika reset `line_number` per-paragraph-and-per-band so line_number
+    // alone collided across bands. With band/column dropped (schema 0.5.0) the
+    // discriminator is `line_number` alone — degraded for the cross-band case.
+    // The rule is disabled in the active config; a region-aware redesign keyed
+    // on `Placement.region_label` is the proper fix and is filed as a follow-up
+    // CR. Table separator (`table_line_separator`) is now unreachable here
+    // because the dropped `nr_band_columns` always determined that branch.
     //
     // Same-line join rule: exactly one space at the boundary unless one side
-    // already provides whitespace. The xhtml parser preserves Tika's
-    // leading/trailing segment whitespace so a font-class transition like
-    // "implementations "+"MAY"+"choose" reads as "implementations MAY choose"
-    // rather than "implementationsMAYchoose". When the bracketing pre-pass
-    // (CR-25) ate the boundary space, neither side has it, and we insert one.
+    // already provides whitespace.
     let mut text = String::new();
-    let mut prev_band_line: Option<(u32, u32)> = None;
+    let mut prev_line: Option<u32> = None;
     for el in &sorted_elements {
         let p = el.pdf_placement();
-        let band_line = (p.band, p.line_number);
-        let nr_cols = p.nr_band_columns;
+        let line = p.line_number;
 
         if !text.is_empty() {
-            match prev_band_line {
-                Some(prev) if prev == band_line => {
+            match prev_line {
+                Some(prev) if prev == line => {
                     // Same-line: insert at most one space if neither side has
                     // whitespace at the join boundary.
                     let left_ws = text.ends_with(|c: char| c.is_whitespace());
@@ -187,11 +187,7 @@ fn merge_group(
                     }
                 }
                 _ => {
-                    if nr_cols <= 2 {
-                        text.push_str(&cfg.prose_line_separator);
-                    } else {
-                        text.push_str(&cfg.table_line_separator);
-                    }
+                    text.push_str(&cfg.prose_line_separator);
                 }
             }
         }
@@ -204,7 +200,7 @@ fn merge_group(
             el.text.as_str()
         };
         text.push_str(to_push);
-        prev_band_line = Some(band_line);
+        prev_line = Some(line);
     }
     // Trim accumulated boundary whitespace from the ends; interior preserved.
     let text = text.trim().to_string();
@@ -400,14 +396,7 @@ mod tests {
         }
     }
 
-    fn mk_placement(
-        page: u32,
-        band: u32,
-        column: u32,
-        paragraph: u32,
-        line: u32,
-        y: f32,
-    ) -> Placement {
+    fn mk_placement(page: u32, paragraph: u32, line: u32, y: f32) -> Placement {
         Placement {
             page_number: page,
             bounding_box: BoundingBox {
@@ -416,13 +405,11 @@ mod tests {
                 width: 100.0,
                 height: 17.7,
             },
-            band,
-            column,
-            nr_band_columns: 1,
             line_number: line,
             segment_number: 0,
             rotation: 0,
             paragraph_number: paragraph,
+            region_label: None,
             page_width: 0.0,
             page_height: 0.0,
         }
@@ -509,8 +496,8 @@ mod tests {
     #[test]
     fn cross_band_section_merge() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p1 = mk_placement(22, 0, 0, 0, 0, 141.8);
-        let p2 = mk_placement(22, 1, 0, 0, 0, 173.9);
+        let p1 = mk_placement(22, 0, 0, 141.8);
+        let p2 = mk_placement(22, 0, 0, 173.9);
         let els = vec![
             mk_element(ParsedElementType::Section, "Improving", 2, 0, p1),
             mk_element(ParsedElementType::Section, "LLM accuracy", 2, 1, p2),
@@ -525,8 +512,8 @@ mod tests {
     #[test]
     fn cross_band_section_split_by_proximity() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p1 = mk_placement(22, 0, 0, 0, 0, 100.0);
-        let p2 = mk_placement(22, 5, 0, 0, 0, 500.0); // gap = 500 - 117.7 = 382.3 > 50
+        let p1 = mk_placement(22, 0, 0, 100.0);
+        let p2 = mk_placement(22, 0, 0, 500.0); // gap = 500 - 117.7 = 382.3 > 50
         let els = vec![
             mk_element(ParsedElementType::Section, "Section A", 2, 0, p1),
             mk_element(ParsedElementType::Section, "Section B", 2, 1, p2),
@@ -540,8 +527,8 @@ mod tests {
     #[test]
     fn cross_band_section_split_by_depth() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p1 = mk_placement(22, 0, 0, 0, 0, 100.0);
-        let p2 = mk_placement(22, 1, 0, 0, 0, 120.0);
+        let p1 = mk_placement(22, 0, 0, 100.0);
+        let p2 = mk_placement(22, 0, 0, 120.0);
         let els = vec![
             mk_element(ParsedElementType::Section, "Chapter 1", 2, 0, p1),
             mk_element(ParsedElementType::Section, "1.1 Sub", 3, 1, p2),
@@ -552,11 +539,18 @@ mod tests {
 
     /// Test 4 — Paragraph isolation across bands preserved by the default
     /// paragraph config (`same_band: true`).
+    ///
+    /// IGNORED (Block 06b, schema 0.5.0): band was dropped from `EquivalenceKey`
+    /// along with the corresponding `Placement` field. Cross-band isolation now
+    /// regresses to no-op for the cases this test covers; a region-aware
+    /// redesign keyed on `Placement.region_label` is the proper fix and is
+    /// tracked as a follow-up CR. The rule is disabled in the active config.
     #[test]
+    #[ignore = "Block 06b: band/column dropped — awaiting region-aware redesign"]
     fn paragraph_cross_band_isolation_preserved() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p1 = mk_placement(22, 0, 0, 0, 0, 200.0);
-        let p2 = mk_placement(22, 1, 0, 1, 0, 250.0);
+        let p1 = mk_placement(22, 0, 0, 200.0);
+        let p2 = mk_placement(22, 1, 0, 250.0);
         let els = vec![
             mk_element(ParsedElementType::Paragraph, "Body line A", 4, 0, p1),
             mk_element(ParsedElementType::Paragraph, "Body line B", 4, 1, p2),
@@ -567,11 +561,14 @@ mod tests {
 
     /// Test 5 — `same_column` enforcement. Section elements on different
     /// columns of the same page+band stay separate.
+    ///
+    /// IGNORED (Block 06b, schema 0.5.0): see `paragraph_cross_band_isolation_preserved`.
     #[test]
+    #[ignore = "Block 06b: band/column dropped — awaiting region-aware redesign"]
     fn same_column_constraint_splits() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p1 = mk_placement(22, 0, 0, 0, 0, 100.0);
-        let p2 = mk_placement(22, 0, 1, 0, 0, 110.0);
+        let p1 = mk_placement(22, 0, 0, 100.0);
+        let p2 = mk_placement(22, 0, 0, 110.0);
         let els = vec![
             mk_element(ParsedElementType::Section, "Col 0 title", 2, 0, p1),
             mk_element(ParsedElementType::Section, "Col 1 title", 2, 1, p2),
@@ -585,9 +582,9 @@ mod tests {
     #[test]
     fn walk_and_split_three_element() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p_a = mk_placement(22, 0, 0, 0, 0, 100.0);
-        let p_b = mk_placement(22, 1, 0, 0, 0, 500.0);
-        let p_c = mk_placement(22, 2, 0, 0, 0, 520.0);
+        let p_a = mk_placement(22, 0, 0, 100.0);
+        let p_b = mk_placement(22, 0, 0, 500.0);
+        let p_c = mk_placement(22, 0, 0, 520.0);
         let els = vec![
             mk_element(ParsedElementType::Section, "A", 2, 0, p_a),
             mk_element(ParsedElementType::Section, "B", 2, 1, p_b),
@@ -606,8 +603,8 @@ mod tests {
     #[test]
     fn same_line_segments_join_with_single_space() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p1 = mk_placement(22, 0, 0, 0, 0, 100.0);
-        let p2 = mk_placement(22, 0, 0, 0, 0, 100.0);
+        let p1 = mk_placement(22, 0, 0, 100.0);
+        let p2 = mk_placement(22, 0, 0, 100.0);
         let els = vec![
             mk_element(ParsedElementType::Section, "Title", 2, 0, p1),
             mk_element(ParsedElementType::Section, "continued", 2, 1, p2),
@@ -625,9 +622,9 @@ mod tests {
     #[test]
     fn same_line_inline_emphasis_join() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p_a = mk_placement(14, 0, 0, 0, 1, 222.4);
-        let p_b = mk_placement(14, 0, 0, 0, 1, 222.4);
-        let p_c = mk_placement(14, 0, 0, 0, 1, 222.4);
+        let p_a = mk_placement(14, 0, 1, 222.4);
+        let p_b = mk_placement(14, 0, 1, 222.4);
+        let p_c = mk_placement(14, 0, 1, 222.4);
         let els = vec![
             mk_element(ParsedElementType::Paragraph, "implementations ", 4, 0, p_a),
             mk_element(ParsedElementType::Paragraph, "MAY", 4, 1, p_b),

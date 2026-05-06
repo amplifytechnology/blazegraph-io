@@ -727,7 +727,7 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    fn make_placement(band: u32, column: u32, line_number: u32, rotation: i32) -> Placement {
+    fn make_placement(line_number: u32, rotation: i32) -> Placement {
         Placement {
             page_number: 1,
             bounding_box: BoundingBox {
@@ -736,13 +736,11 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
             },
-            band,
-            column,
-            nr_band_columns: 1,
             line_number,
             segment_number: 0,
             rotation,
             paragraph_number: 0,
+            region_label: None,
             page_width: 0.0,
             page_height: 0.0,
         }
@@ -769,7 +767,7 @@ mod tests {
                 font_weight,
                 color: "#000000".to_string(),
             },
-            placement: make_placement(0, 0, line_number, 0),
+            placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
             token_count: 1,
@@ -797,13 +795,11 @@ mod tests {
                     width: 50.0,
                     height: 12.0,
                 },
-                band: 0,
-                column: 0,
-                nr_band_columns: 1,
                 line_number,
                 segment_number: 1,
                 rotation: 0,
                 paragraph_number: 0,
+                region_label: None,
                 page_width: 0.0,
                 page_height: 0.0,
             },
@@ -1074,7 +1070,7 @@ mod tests {
                 font_weight: font_weight.to_string(),
                 color: "#000000".to_string(),
             },
-            placement: make_placement(0, 0, line_number, 0),
+            placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
             token_count: 1,
@@ -1115,12 +1111,10 @@ mod tests {
 
     // ── CR-21 tests — page-scoped band matching ────────────────────────────────
 
-    /// Build a PdfTextElement with an explicit page number, x position, band, column, line.
+    /// Build a PdfTextElement with an explicit page number, x position, line.
     fn make_element_on_page(
         font_size: f32,
         page_number: u32,
-        band: u32,
-        column: u32,
         line_number: u32,
         x: f32,
     ) -> PdfTextElement {
@@ -1142,13 +1136,11 @@ mod tests {
                     width: 80.0,
                     height: 12.0,
                 },
-                band,
-                column,
-                nr_band_columns: 1,
                 line_number,
                 segment_number: 0,
                 rotation: 0,
                 paragraph_number: 0,
+                region_label: None,
                 page_width: 0.0,
                 page_height: 0.0,
             },
@@ -1166,9 +1158,9 @@ mod tests {
     fn test_isolation_cross_page_same_band_not_neighbours() {
         let elements = vec![
             // Page 1 — same band/col/line, x=110 (would create gap=10 → not isolated if counted)
-            make_element_on_page(12.0, 1, 0, 0, 0, 110.0),
+            make_element_on_page(12.0, 1, 0, 110.0),
             // Page 2 — the target we're classifying, x=0
-            make_element_on_page(12.0, 2, 0, 0, 0, 0.0),
+            make_element_on_page(12.0, 2, 0, 0.0),
         ];
         let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
         // isolation_neighbor_gap = 20: a gap of 10 would be < 20 → not isolated
@@ -1201,10 +1193,10 @@ mod tests {
     fn test_isolation_same_page_same_band_are_neighbours() {
         let elements = vec![
             // Target at x=0, width=80 → right edge at 80
-            make_element_on_page(12.0, 1, 0, 0, 0, 0.0),
+            make_element_on_page(12.0, 1, 0, 0.0),
             // Neighbour at x=84, width=86 → right edge at 170 (same Y, gap=4pt)
             {
-                let mut e = make_element_on_page(12.0, 1, 0, 0, 0, 84.0);
+                let mut e = make_element_on_page(12.0, 1, 0, 84.0);
                 e.placement.bounding_box.width = 86.0;
                 e
             },
@@ -1239,10 +1231,10 @@ mod tests {
     fn test_isolation_wide_x_gap_treats_neighbour_as_separate_cluster() {
         let elements = vec![
             // Target at x=0, width=80 (left "column")
-            make_element_on_page(12.0, 1, 0, 0, 0, 0.0),
+            make_element_on_page(12.0, 1, 0, 0.0),
             // Neighbour at x=120, width=80 (right "column", gap=40pt)
             {
-                let mut e = make_element_on_page(12.0, 1, 0, 0, 0, 120.0);
+                let mut e = make_element_on_page(12.0, 1, 0, 120.0);
                 e.placement.bounding_box.width = 80.0;
                 e
             },
@@ -1273,11 +1265,11 @@ mod tests {
     #[test]
     fn test_line_extent_isolated_when_alone_on_y_line() {
         // Header at y=490, x=108, width=145 (≈ "3.1 Encoder and Decoder Stacks")
-        let mut header = make_element_on_page(9.0, 3, 2, 0, 0, 108.0);
+        let mut header = make_element_on_page(9.0, 3, 0, 108.0);
         header.placement.bounding_box.y = 490.0;
         header.placement.bounding_box.width = 145.0;
         // Body line below at y=510, fills column. Defines band x-extent.
-        let mut body = make_element_on_page(9.0, 3, 2, 0, 0, 108.0);
+        let mut body = make_element_on_page(9.0, 3, 0, 108.0);
         body.placement.bounding_box.y = 510.0;
         body.placement.bounding_box.width = 402.0;
         let elements = vec![header, body];
@@ -1306,11 +1298,11 @@ mod tests {
     #[test]
     fn test_line_extent_rejects_overlapping_inline_span() {
         // Base-font line at y=300 spanning the whole column
-        let mut base = make_element_on_page(9.0, 1, 0, 0, 0, 108.0);
+        let mut base = make_element_on_page(9.0, 1, 0, 108.0);
         base.placement.bounding_box.y = 300.0;
         base.placement.bounding_box.width = 400.0;
         // Overlapping inline-styled span at same Y, narrow
-        let mut overlay = make_element_on_page(9.0, 1, 0, 0, 0, 200.0);
+        let mut overlay = make_element_on_page(9.0, 1, 0, 200.0);
         overlay.placement.bounding_box.y = 300.0;
         overlay.placement.bounding_box.width = 30.0;
         let elements = vec![overlay, base];
@@ -1344,9 +1336,9 @@ mod tests {
     fn test_isolation_introduction_scenario() {
         let elements = vec![
             // Page 1 watermark-like element
-            make_element_on_page(11.0, 1, 0, 0, 0, 124.0),
+            make_element_on_page(11.0, 1, 0, 124.0),
             // Page 2 "1 Introduction"
-            make_element_on_page(11.0, 2, 0, 0, 0, 108.0),
+            make_element_on_page(11.0, 2, 0, 108.0),
         ];
         let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
         let config = make_config(1.0, 5.0, None, 0.80);
@@ -1392,13 +1384,11 @@ mod tests {
                     width,
                     height: 12.0,
                 },
-                band: 0,
-                column: 0,
-                nr_band_columns: 1,
                 line_number: 0,
                 segment_number: 0,
                 rotation: 0,
                 paragraph_number: 0,
+                region_label: None,
                 page_width: 0.0,
                 page_height: 0.0,
             },
