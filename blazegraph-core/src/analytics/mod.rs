@@ -17,6 +17,7 @@ pub mod font;
 pub mod geometry;
 pub mod page_roles;
 pub mod page_stats;
+pub mod reading_order;
 pub mod region;
 pub mod repetition;
 pub mod statistic;
@@ -31,6 +32,7 @@ pub use page_roles::{classify_page_roles, PageRoleKind, PageRolesConfig};
 pub use page_stats::{
     PageSignature, PageStats, PageStatsBuilder, PageStatsConfig, RegionSignature,
 };
+pub use reading_order::tag_and_resort;
 pub use region::{
     CutAxis, PageRegionDiagnostic, PageRegions, Region, RegionBox, RegionStats, RegionStatsBuilder,
     RegionStatsConfig,

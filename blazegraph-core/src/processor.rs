@@ -257,8 +257,10 @@ impl DocumentProcessor {
         let preprocessor_output = self
             .preprocessor
             .parse_markup_to_preprocessor_output(&xhtml)?;
-        let text_elements = preprocessor_output.text_elements.clone();
-        println!("📋 Stage 1b: {} TextElements captured", text_elements.len());
+        println!(
+            "📋 Stage 1b: {} TextElements captured",
+            preprocessor_output.text_elements.len()
+        );
 
         // Stage 2: Classification + Rules → ParsedElements
         let classification = self.classifier.classify(&preprocessor_output)?;
@@ -267,16 +269,24 @@ impl DocumentProcessor {
             dump_stats(&*self.storage, &pdf_hash, &document_analysis)?;
         }
 
+        // Reading-order resort + region tagging (Block 06b). Capture the
+        // post-resort stream as the canonical Stage 1b snapshot — this is
+        // the version that flows into rules and carries `region_label`.
+        let text_elements = crate::analytics::tag_and_resort(
+            preprocessor_output.text_elements.clone(),
+            &document_analysis,
+        );
+        let resorted_elements = text_elements.clone();
+
         let parsed_elements = if config.minimal_parse {
             self.rule_engine
-                .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
+                .convert_text_elements_to_parsed(&resorted_elements)
         } else {
-            let font_size_analysis = self.rule_engine.analyze_font_sizes(
-                &preprocessor_output.text_elements,
-                &preprocessor_output.style_data,
-            );
+            let font_size_analysis = self
+                .rule_engine
+                .analyze_font_sizes(&resorted_elements, &preprocessor_output.style_data);
             self.rule_engine.apply_rules_with_config(
-                &preprocessor_output.text_elements,
+                &resorted_elements,
                 &classification,
                 &document_analysis,
                 &font_size_analysis,
@@ -401,22 +411,33 @@ impl DocumentProcessor {
             dump_stats(&*self.storage, pdf_hash, &document_analysis)?;
         }
 
+        // Reading-order resort + region tagging (Block 06b). Annotates each
+        // element with its Region tree leaf label and reorders the stream so
+        // multi-column pages no longer interleave columns. Owned-clone of
+        // `text_elements` because PreprocessorOutput is borrowed immutably
+        // here; the cost is one Vec clone per document, negligible vs the
+        // rules / graph-build work that follows.
+        let text_elements = profiler.time_step("Reading-Order Resort", || {
+            crate::analytics::tag_and_resort(
+                preprocessor_output.text_elements.clone(),
+                &document_analysis,
+            )
+        });
+
         // Rule processing
         let parsed_elements = if config.minimal_parse {
             println!("🔄 Minimal parse mode — skipping rule processing");
             self.rule_engine
-                .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
+                .convert_text_elements_to_parsed(&text_elements)
         } else {
             let font_size_analysis = profiler.time_step("Font Analysis", || {
-                self.rule_engine.analyze_font_sizes(
-                    &preprocessor_output.text_elements,
-                    &preprocessor_output.style_data,
-                )
+                self.rule_engine
+                    .analyze_font_sizes(&text_elements, &preprocessor_output.style_data)
             });
 
             profiler.time_step("Rules Processing", || {
                 self.rule_engine.apply_rules_with_config(
-                    &preprocessor_output.text_elements,
+                    &text_elements,
                     &classification,
                     &document_analysis,
                     &font_size_analysis,
