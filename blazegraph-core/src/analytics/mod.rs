@@ -27,7 +27,7 @@ pub use geometry::{
     GeometryStatsConfig, PageDimensions,
 };
 pub use page_stats::{
-    BandStats, ColumnStats, PageStats, PageStatsBuilder, PageStatsPerPage, ZoneStats,
+    PageSignature, PageStats, PageStatsBuilder, PageStatsConfig, RegionSignature,
 };
 pub use region::{
     CutAxis, PageRegionDiagnostic, PageRegions, Region, RegionBox, RegionStats, RegionStatsBuilder,

@@ -6,6 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::analytics::font::FontStats;
 use crate::analytics::geometry::GeometryStats;
+use crate::analytics::region::RegionStats;
 use crate::types::PdfTextElement;
 
 /// A single statistic kind that can observe text elements during the analytics
@@ -56,4 +57,9 @@ pub struct FinalizationContext<'a> {
     /// if finalization order has not yet reached geometry, or if geometry
     /// stats are disabled by config.
     pub geometry: Option<&'a GeometryStats>,
+    /// Finalized region trees, available to stats finalized after region.
+    /// `None` if finalization order has not yet reached region, or if
+    /// RegionStats produced no per-page entries (e.g., no GeometryStats).
+    /// PageStats consumes this to attach per-leaf `RegionSignature`s.
+    pub region: Option<&'a RegionStats>,
 }

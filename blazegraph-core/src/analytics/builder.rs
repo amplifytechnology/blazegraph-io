@@ -41,10 +41,10 @@ impl AnalysisBuilder {
     }
 
     /// Finalize all stat kinds in dependency order and produce a
-    /// [`DocumentAnalysis`]. Font and geometry have no cross-stat
-    /// dependencies; page_stats depends on the finalized geometry, so the
-    /// geometry output is threaded into the context for the page_stats
-    /// finalization.
+    /// [`DocumentAnalysis`]. Order: `font → geometry → region → page_stats`.
+    /// Font has no cross-stat dependencies; geometry reads font; region
+    /// reads geometry; page_stats reads font, geometry, and region (it
+    /// attaches per-leaf `RegionSignature`s to the per-page Region trees).
     pub fn finalize(self) -> DocumentAnalysis {
         // Font has no dependencies.
         let empty_ctx = FinalizationContext::default();
@@ -57,23 +57,26 @@ impl AnalysisBuilder {
         let geometry_ctx = FinalizationContext {
             font: Some(&font),
             geometry: None,
+            region: None,
         };
         let geometry = self.geometry.finalize(&geometry_ctx);
-
-        // PageStats depends on the finalized GeometryStats and reads font
-        // for the same reason geometry does.
-        let page_ctx = FinalizationContext {
-            font: Some(&font),
-            geometry: Some(&geometry),
-        };
-        let page_stats = self.page_stats.finalize(&page_ctx);
 
         // RegionStats depends on GeometryStats (body box + column dividers).
         let region_ctx = FinalizationContext {
             font: Some(&font),
             geometry: Some(&geometry),
+            region: None,
         };
         let region = self.region.finalize(&region_ctx);
+
+        // PageStats depends on font + geometry (heatmap) + region (the
+        // per-page Region trees its per-leaf signatures attach to).
+        let page_ctx = FinalizationContext {
+            font: Some(&font),
+            geometry: Some(&geometry),
+            region: Some(&region),
+        };
+        let page_stats = self.page_stats.finalize(&page_ctx);
 
         DocumentAnalysis {
             font,
