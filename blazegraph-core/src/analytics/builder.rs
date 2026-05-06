@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analytics::font::{FontStats, FontStatsBuilder};
 use crate::analytics::geometry::{GeometryStats, GeometryStatsBuilder};
+use crate::analytics::page_roles::{classify_page_roles, PageRolesConfig};
 use crate::analytics::page_stats::{PageStats, PageStatsBuilder};
 use crate::analytics::region::{RegionStats, RegionStatsBuilder};
 use crate::analytics::statistic::{FinalizationContext, Statistic};
@@ -76,7 +77,13 @@ impl AnalysisBuilder {
             geometry: Some(&geometry),
             region: Some(&region),
         };
-        let page_stats = self.page_stats.finalize(&page_ctx);
+        let mut page_stats = self.page_stats.finalize(&page_ctx);
+
+        // Page-roles classifier (Block 06) — analytics post-pass that
+        // assigns each PageSignature.role and the derived body_pages
+        // extent on PageStats. Runs unconditionally; downstream rules
+        // pull `body_start_page` / `body_end_page` for filtering.
+        classify_page_roles(&mut page_stats, &PageRolesConfig::default());
 
         DocumentAnalysis {
             font,

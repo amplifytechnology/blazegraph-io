@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::analytics::page_roles::PageRoleKind;
 use crate::analytics::region::{PageRegions, Region, RegionBox};
 use crate::analytics::statistic::{FinalizationContext, Statistic};
 use crate::types::{BoundingBox, PdfTextElement};
@@ -37,6 +38,16 @@ pub struct PageStats {
     /// its `page_number` and `region_label` so consumers can group by page
     /// and resolve back to the matching leaf in `RegionStats.per_page[…].root`.
     pub regions: Vec<RegionSignature>,
+    /// Inclusive 1-indexed body extent: pages `[body_start_page,
+    /// body_end_page]` are classified as `Body`. `0` in either field means
+    /// "no body detected" (e.g., empty document, classifier didn't run, or
+    /// every page failed the body test). Populated by the page-roles
+    /// classifier (`analytics::page_roles`) at the tail of
+    /// `AnalysisBuilder::finalize`.
+    #[serde(default)]
+    pub body_start_page: u32,
+    #[serde(default)]
+    pub body_end_page: u32,
 }
 
 /// Whole-page primitives. Composition is computed across all non-rotated
@@ -69,6 +80,13 @@ pub struct PageSignature {
     /// Coefficient of variation of inter-Y-peak gaps. Lower = more regular
     /// vertical spacing. 0.0 when fewer than 3 peaks.
     pub y_peak_cv: f32,
+
+    /// Page role assigned by `analytics::page_roles`. `None` until the
+    /// classifier runs (or if the classifier was disabled). Downstream
+    /// rules filter via this — e.g., section detection skips pages whose
+    /// role is `NonBody`.
+    #[serde(default)]
+    pub role: Option<PageRoleKind>,
 }
 
 /// Per-region signature. The unit downstream classifiers reason about.
@@ -304,6 +322,7 @@ impl Statistic for PageStatsBuilder {
                 heatmap_fit,
                 n_peaks_y,
                 y_peak_cv,
+                role: None,
             });
 
             // Per-region signatures: only if RegionStats has an entry for
@@ -346,7 +365,12 @@ impl Statistic for PageStatsBuilder {
             }
         }
 
-        PageStats { pages, regions }
+        PageStats {
+            pages,
+            regions,
+            body_start_page: 0,
+            body_end_page: 0,
+        }
     }
 }
 

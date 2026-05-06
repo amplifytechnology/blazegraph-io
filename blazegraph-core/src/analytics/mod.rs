@@ -15,6 +15,7 @@
 pub mod builder;
 pub mod font;
 pub mod geometry;
+pub mod page_roles;
 pub mod page_stats;
 pub mod region;
 pub mod repetition;
@@ -26,6 +27,7 @@ pub use geometry::{
     ColumnLayout, DensityGrid, GeometryDiagnostic, GeometryStats, GeometryStatsBuilder,
     GeometryStatsConfig, PageDimensions,
 };
+pub use page_roles::{classify_page_roles, PageRoleKind, PageRolesConfig};
 pub use page_stats::{
     PageSignature, PageStats, PageStatsBuilder, PageStatsConfig, RegionSignature,
 };
