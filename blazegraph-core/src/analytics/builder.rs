@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::analytics::font::{FontStats, FontStatsBuilder};
 use crate::analytics::geometry::{GeometryStats, GeometryStatsBuilder};
 use crate::analytics::page_stats::{PageStats, PageStatsBuilder};
+use crate::analytics::region::{RegionStats, RegionStatsBuilder};
 use crate::analytics::statistic::{FinalizationContext, Statistic};
 use crate::types::PdfTextElement;
 
@@ -21,6 +22,7 @@ pub struct AnalysisBuilder {
     pub font: FontStatsBuilder,
     pub geometry: GeometryStatsBuilder,
     pub page_stats: PageStatsBuilder,
+    pub region: RegionStatsBuilder,
 }
 
 impl AnalysisBuilder {
@@ -35,6 +37,7 @@ impl AnalysisBuilder {
         self.font.observe(element);
         self.geometry.observe(element);
         self.page_stats.observe(element);
+        self.region.observe(element);
     }
 
     /// Finalize all stat kinds in dependency order and produce a
@@ -65,10 +68,18 @@ impl AnalysisBuilder {
         };
         let page_stats = self.page_stats.finalize(&page_ctx);
 
+        // RegionStats depends on GeometryStats (body box + column dividers).
+        let region_ctx = FinalizationContext {
+            font: Some(&font),
+            geometry: Some(&geometry),
+        };
+        let region = self.region.finalize(&region_ctx);
+
         DocumentAnalysis {
             font,
             geometry,
             page_stats,
+            region,
         }
     }
 }
@@ -82,4 +93,5 @@ pub struct DocumentAnalysis {
     pub font: FontStats,
     pub geometry: GeometryStats,
     pub page_stats: PageStats,
+    pub region: RegionStats,
 }

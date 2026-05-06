@@ -16,6 +16,7 @@ pub mod builder;
 pub mod font;
 pub mod geometry;
 pub mod page_stats;
+pub mod region;
 pub mod repetition;
 pub mod statistic;
 
@@ -27,6 +28,10 @@ pub use geometry::{
 };
 pub use page_stats::{
     BandStats, ColumnStats, PageStats, PageStatsBuilder, PageStatsPerPage, ZoneStats,
+};
+pub use region::{
+    CutAxis, PageRegionDiagnostic, PageRegions, Region, RegionBox, RegionStats, RegionStatsBuilder,
+    RegionStatsConfig,
 };
 pub use repetition::{RepetitionMap, RepetitionRecord, YBucket};
 pub use statistic::{FinalizationContext, Statistic};

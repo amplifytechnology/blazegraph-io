@@ -1,6 +1,6 @@
 use crate::analytics::{
     AnalysisBuilder, DocumentAnalysis, FontStatsBuilder, GeometryStatsBuilder, PageStatsBuilder,
-    Statistic,
+    RegionStatsBuilder, Statistic,
 };
 use crate::cache::{self, GraphCacheKey};
 use crate::classifier::DocumentClassifier;
@@ -485,6 +485,9 @@ fn dump_stats(
 
     let page_stats_json = serde_json::to_string_pretty(&analysis.page_stats)?;
     storage.store_stat(pdf_hash, PageStatsBuilder::NAME, &page_stats_json)?;
+
+    let region_json = serde_json::to_string_pretty(&analysis.region)?;
+    storage.store_stat(pdf_hash, RegionStatsBuilder::NAME, &region_json)?;
 
     Ok(())
 }
