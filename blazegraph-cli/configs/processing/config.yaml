@@ -32,35 +32,26 @@ pipeline:
       enabled: false
 section_detection_v2:
   # Font size tolerance (points). Defines the ±tolerance band around body size.
-  # delta < -tolerance → REJECT; |delta| ≤ tolerance → Region 3 (at-body);
-  # tolerance < delta ≤ structural_size_margin → Region 2; delta > margin → Region 1 (auto).
+  # delta < -tolerance             → REJECT
+  # |delta| ≤ tolerance            → R3 (at-body): bold AND isolated_in_leaf
+  # tolerance < delta ≤ margin     → R2 (medium): bold OR  isolated_in_leaf
+  # delta > structural_size_margin → R1 (large):  auto-promote
   font_size_tolerance: 0.1
 
-  # Points above body at which size alone promotes (Region 1 threshold: body + margin).
-  structural_size_margin: 1.5
+  # Points above body at which size alone promotes (R1 threshold: body + margin).
+  # 4pt is a clear visual hierarchy break — 9pt body → 13pt header on RFC-style
+  # docs, 10pt → 14pt+ on academic papers. Below 4pt the size signal is weaker
+  # and we lean on auxiliary signals in R2 (`bold OR isolated_in_leaf`).
+  # Calibrated against the 6-PDF corpus delta distribution (Block 09, 2026-05-07).
+  structural_size_margin: 4.0
 
-  # Proportional alternative: when set, Region 1 threshold = body * ratio (overrides margin).
+  # Proportional alternative: when set, R1 threshold = body * ratio (overrides margin).
   structural_size_ratio: ~ # None
 
-  # Y-coordinate tolerance (points) for grouping bboxes onto the same visual line.
-  # Smaller than typical inter-line spacing (~13pt at 9pt body) so consecutive lines
-  # do not merge. Y is ground truth — we deliberately ignore Tika's `data-line` counter
-  # because it resets per `<p>` and so collides across paragraphs in the same band.
+  # Y-coordinate tolerance (points) for grouping bboxes onto the same visual line
+  # within a Region tree leaf (used by `is_isolated_in_leaf` to identify
+  # same-Y neighbors and check their bold-ness).
   line_height_tolerance: 3.0
-
-  # Column-width ratio: line_extent / column_width < this → isolated.
-  # `line_extent` is the union of all bboxes sharing (page, band, column) at this Y.
-  # `column_width = band_x_extent / nr_band_columns`. Real headers on their own line
-  # score 0.2–0.5; lines containing body or mid-line emphasis fill the column at ≥0.85.
-  # NOTE: 0.80 is calibrated against attention-page-3 "3.2 Attention" (ratio 0.789)
-  # where Tika fabricates a 5-column band on a single-column page, deflating col_width.
-  # Statistical-page-geometry (handoff) will override nr_band_columns with the
-  # document-dominant count so this threshold can drop toward 0.6 once column
-  # inference is trustworthy.
-  isolation_threshold: 0.80
-
-  # Font class frequency below this ratio is considered "rare" (structural).
-  font_rarity_threshold: 0.00
 
   # Minimum alphabetic character ratio — filters math symbols and noise.
   # 0.7 keeps short numbered headers like "3.2 Attention" (9 alpha / 12 non-ws = 0.75)

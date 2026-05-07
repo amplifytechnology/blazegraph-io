@@ -790,35 +790,27 @@ impl Default for SizeEnforcerConfig {
     }
 }
 
-/// Configuration for the V2 section detection rule.
-/// V2 uses a candidate-then-refine pipeline that composes size, bold, isolation,
-/// and font-rarity signals rather than gating them sequentially.
+/// Configuration for the V2 section detection rule (V3 algorithm — Block 09).
+///
+/// Three-tier piecewise classifier on `delta = font_size - body_size` plus
+/// pre-gates (rotation, alpha-ratio) and pattern refinement (inclusion /
+/// exclusion regex) as a backup. Isolation is leaf-based, consulting the
+/// `Placement.region_label` set by `analytics::reading_order::tag_and_resort`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionDetectionV2Config {
-    /// Column-width ratio below which a visual line is considered isolated.
-    /// `line_extent / column_width < this` → isolated. The line extent is the union
-    /// of all bboxes sharing the candidate's `(page, band, column)` and Y-coordinate
-    /// (within `line_height_tolerance`). Short lines in wide columns are isolated;
-    /// lines that fill the column (mid-line emphasis, justified body, Tika overlay
-    /// spans for inline styling) are not.
-    pub isolation_threshold: f32,
-
-    /// Y-coordinate tolerance (points) for grouping bboxes onto the same visual line.
-    /// Two elements within `|Δy| < this` in the same `(page, band, column)` are
-    /// considered to be on the same baseline. Defaults to a value smaller than typical
-    /// inter-line spacing so consecutive lines do not merge.
+    /// Y-coordinate tolerance (points) for grouping bboxes onto the same
+    /// visual line. Two elements within `|Δy| < this` in the same Region
+    /// tree leaf are considered to be on the same baseline. Defaults to a
+    /// value smaller than typical inter-line spacing so consecutive lines
+    /// do not merge.
     pub line_height_tolerance: f32,
-
-    /// Frequency ratio (0.0–1.0) below which a font class is "rare".
-    /// class_usage / total_non_rotated_elements < this → rare.
-    pub font_rarity_threshold: f32,
 
     /// Font-size tolerance (points). Defines the symmetric ±tolerance band around body size.
     ///
-    /// - `delta < -tolerance` → REJECT (below-body noise).
-    /// - `|delta| ≤ tolerance` → Region 3 (at-body band): needs isolated AND (bold OR rare).
-    /// - `tolerance < delta ≤ structural_size_margin` → Region 2 (moderate): needs bold OR isolated.
-    /// - `delta > structural_size_margin` → Region 1 (large): auto-promote unconditionally.
+    /// - `delta < -tolerance`             → REJECT (below-body noise).
+    /// - `|delta| ≤ tolerance`            → R3 (at-body band): needs bold AND isolated_in_leaf.
+    /// - `tolerance < delta ≤ structural_size_margin` → R2 (medium): needs bold OR isolated_in_leaf.
+    /// - `delta > structural_size_margin` → R1 (large): auto-promote unconditionally.
     pub font_size_tolerance: f32,
 
     /// Size margin (points) above body text at which size alone confirms structural role.
@@ -925,11 +917,9 @@ impl Default for GraphSanityConfig {
 impl Default for SectionDetectionV2Config {
     fn default() -> Self {
         Self {
-            isolation_threshold: 0.80,
             line_height_tolerance: 3.0,
-            font_rarity_threshold: 0.05,
             font_size_tolerance: 0.1,
-            structural_size_margin: 5.0,
+            structural_size_margin: 4.0,
             structural_size_ratio: None,
             min_alpha_ratio: 0.5,
             max_depth: 6,

@@ -697,7 +697,10 @@ fn make_v2_element(
             page_number: 0,
             bounding_box: BoundingBox {
                 x,
-                y: 0.0,
+                // Y derived from `line_number` so distinct lines have
+                // distinct Y. V3 isolation reads Y geometry, not Tika's
+                // per-paragraph `data-line` counter.
+                y: (line_number as f32) * 14.0,
                 width,
                 height: font_size,
             },
