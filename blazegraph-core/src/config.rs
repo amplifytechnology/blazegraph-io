@@ -72,6 +72,9 @@ pub struct NodeTypeClusteringConfig {
     pub paragraph: NodeTypeMergeConfig,
     pub list: NodeTypeMergeConfig,
     pub list_item: NodeTypeMergeConfig,
+    pub header: NodeTypeMergeConfig,
+    pub footer: NodeTypeMergeConfig,
+    pub margin: NodeTypeMergeConfig,
 }
 
 impl Default for NodeTypeClusteringConfig {
@@ -81,6 +84,9 @@ impl Default for NodeTypeClusteringConfig {
             paragraph: NodeTypeMergeConfig::default_paragraph(),
             list: NodeTypeMergeConfig::default_paragraph(),
             list_item: NodeTypeMergeConfig::default_paragraph(),
+            header: NodeTypeMergeConfig::default_header_footer(),
+            footer: NodeTypeMergeConfig::default_header_footer(),
+            margin: NodeTypeMergeConfig::default_margin(),
         }
     }
 }
@@ -96,19 +102,40 @@ pub struct NodeTypeMergeConfig {
     pub same_line: bool,
 
     /// Require both elements be in the same Tika paragraph (paragraph_number equality).
-    /// `true` is the conservative prose-safe default.
+    /// `true` is the conservative prose-safe default for body prose; `false` for
+    /// Section (a multi-paragraph bold title in one leaf is still one Section).
     #[serde(default)]
     pub same_paragraph: bool,
 
-    /// Require both elements be in the same Tika band (band equality).
-    /// `false` allows cross-band merge — the multi-line section title case.
+    /// Drop `region_label` from the equivalence key for this element type.
+    /// `true` collapses all elements of this type within a page into one bucket
+    /// regardless of which Region tree leaf they sit in. Default `false` keeps
+    /// region as a partition dimension; flipped on by Header / Footer defaults
+    /// (per-page running header / footer is one logical unit).
     #[serde(default)]
-    pub same_band: bool,
+    pub ignore_region_label: bool,
 
-    /// Require both elements be in the same Tika column (column equality).
-    /// `true` for almost everything — cross-column merging scrambles reading order.
-    #[serde(default = "default_true")]
-    pub same_column: bool,
+    /// Stopgap for Tika's row-keyed `paragraph_number` in 2-column body layout
+    /// (see [CR-38](docs/P2/core/change-requests/CR-38-bbox-based-paragraph-detection.md)).
+    ///
+    /// When `Some(n)`, a pre-scan counts distinct `paragraph_number`s per
+    /// `(page, element_type, region_label)`. If the count is `>= n` for a
+    /// region, `paragraph_number` is dropped from the key for that region —
+    /// the whole region collapses into one bucket. Catches the gpt2-style
+    /// failure mode where Tika emits one `<p>` per visual row across both
+    /// columns, leaving each column-region with one `paragraph_number` per
+    /// line.
+    ///
+    /// **Tradeoff:** when the threshold fires, real within-column paragraph
+    /// breaks are lost. CR-38 replaces this heuristic with bbox-derived
+    /// paragraph detection (modal body X + indent rule + Y-gap distribution),
+    /// which preserves paragraph structure in 2-column layouts. This knob is
+    /// the Block 10 ship-it pragma; CR-38 is the structurally-correct fix.
+    ///
+    /// `None` disables the fallback (clustering uses `paragraph_number`
+    /// directly).
+    #[serde(default)]
+    pub region_overflow_threshold: Option<u32>,
 
     // ── Safety constraints ──────────────────────────────────────────────────────
     /// Require both elements have equal `hierarchy_level`. Prevents a section
@@ -144,32 +171,74 @@ fn default_table_separator() -> String {
 }
 
 impl NodeTypeMergeConfig {
-    /// Section default: cross-band merge enabled (multi-line title case), gated
-    /// on depth equality and proximity to prevent unrelated section collapse.
+    /// Section default: within-region merge with depth equality + proximity. A
+    /// multi-line bold chapter title in one Region tree leaf at one depth is one
+    /// Section regardless of how Tika sliced paragraphs across the bands.
     pub fn default_section() -> Self {
         Self {
             same_line: false,
             same_paragraph: false,
-            same_band: false,
-            same_column: true,
+            ignore_region_label: false,
             same_depth: true,
             max_y_gap: Some(50.0),
+            region_overflow_threshold: None,
             prose_line_separator: " ".to_string(),
             table_line_separator: "\n".to_string(),
         }
     }
 
-    /// Paragraph (and List / ListItem) default: conservative prose-safe.
-    /// Tika's paragraph_number is the reliable cluster signal; no cross-band
-    /// merging.
+    /// Paragraph (and List / ListItem) default: within-region, with Tika
+    /// paragraph_number as the within-region granularity refinement. This
+    /// solves the small-margin "whole page = one leaf" failure mode where
+    /// region alone is too coarse — paragraph_number gives the within-leaf
+    /// Y-gap clustering Tika has already computed.
+    ///
+    /// `region_overflow_threshold: Some(10)` catches Tika's row-keyed
+    /// paragraph_number in 2-column body layouts (see CR-38). When a
+    /// `(page, region_label)` produces ≥10 distinct paragraph_numbers,
+    /// paragraph_number is dropped and the region collapses to one bucket.
     pub fn default_paragraph() -> Self {
         Self {
             same_line: false,
             same_paragraph: true,
-            same_band: true,
-            same_column: true,
+            ignore_region_label: false,
             same_depth: false,
             max_y_gap: None,
+            region_overflow_threshold: Some(10),
+            prose_line_separator: " ".to_string(),
+            table_line_separator: "\n".to_string(),
+        }
+    }
+
+    /// Header / Footer default: collapse all per-page H-N / F-N labels into
+    /// one bucket per (page, type). Per-page running headers and footers are
+    /// one logical unit — different `H-N` indices are just multiple fragments
+    /// of the same chrome row.
+    pub fn default_header_footer() -> Self {
+        Self {
+            same_line: false,
+            same_paragraph: false,
+            ignore_region_label: true,
+            same_depth: false,
+            max_y_gap: None,
+            region_overflow_threshold: None,
+            prose_line_separator: " ".to_string(),
+            table_line_separator: "\n".to_string(),
+        }
+    }
+
+    /// Margin default: keep `region_label` as a partition dimension. A sidebar
+    /// block and a page-edge marginal note are different logical units even
+    /// though they're both Margin; merging within one Margin region is fine,
+    /// merging across is not.
+    pub fn default_margin() -> Self {
+        Self {
+            same_line: false,
+            same_paragraph: false,
+            ignore_region_label: false,
+            same_depth: false,
+            max_y_gap: None,
+            region_overflow_threshold: None,
             prose_line_separator: " ".to_string(),
             table_line_separator: "\n".to_string(),
         }
@@ -209,6 +278,12 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             .any(|k| mapping.contains_key(serde_yaml::Value::String((*k).to_string())));
 
         if is_legacy {
+            // Legacy `paragraph_clustering:` block. The four cascade booleans
+            // (merge_segments / merge_lines / merge_columns / merge_bands) are
+            // translated to the constraint subset that survives Block 06b's
+            // band/column drop: only `same_line` and `same_paragraph` carry
+            // information now. `merge_columns` / `merge_bands` are silently
+            // ignored (no equivalent in the region-aware world).
             #[derive(Deserialize)]
             struct LegacyParagraphClustering {
                 #[serde(default = "default_true")]
@@ -216,8 +291,10 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
                 #[serde(default = "default_true")]
                 merge_lines: bool,
                 #[serde(default)]
+                #[allow(dead_code)]
                 merge_columns: bool,
                 #[serde(default)]
+                #[allow(dead_code)]
                 merge_bands: bool,
                 #[serde(default = "default_prose_separator")]
                 prose_line_separator: String,
@@ -227,17 +304,13 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             let l: LegacyParagraphClustering =
                 serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
 
-            // Translate cascade booleans → constraint set. The cascade rule is:
-            // higher levels imply all lower levels. Effective level = highest
-            // enabled flag. The constraint that splits on each level boundary
-            // is `same_X: true` for the level just above the effective one.
             let unified = NodeTypeMergeConfig {
-                same_line: l.merge_segments && !l.merge_lines && !l.merge_columns && !l.merge_bands,
-                same_paragraph: l.merge_lines && !l.merge_columns && !l.merge_bands,
-                same_band: !l.merge_bands,
-                same_column: !l.merge_columns && !l.merge_bands,
+                same_line: l.merge_segments && !l.merge_lines,
+                same_paragraph: l.merge_lines,
+                ignore_region_label: false,
                 same_depth: false,
                 max_y_gap: None,
+                region_overflow_threshold: None,
                 prose_line_separator: l.prose_line_separator,
                 table_line_separator: l.table_line_separator,
             };
@@ -245,7 +318,10 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
                 section: unified.clone(),
                 paragraph: unified.clone(),
                 list: unified.clone(),
-                list_item: unified,
+                list_item: unified.clone(),
+                header: NodeTypeMergeConfig::default_header_footer(),
+                footer: NodeTypeMergeConfig::default_header_footer(),
+                margin: NodeTypeMergeConfig::default_margin(),
             });
         }
 
@@ -261,6 +337,12 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             list: NodeTypeMergeConfig,
             #[serde(default = "NodeTypeMergeConfig::default_paragraph")]
             list_item: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_header_footer")]
+            header: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_header_footer")]
+            footer: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_margin")]
+            margin: NodeTypeMergeConfig,
         }
         let n: NewShape = serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -268,6 +350,9 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             paragraph: n.paragraph,
             list: n.list,
             list_item: n.list_item,
+            header: n.header,
+            footer: n.footer,
+            margin: n.margin,
         })
     }
 }

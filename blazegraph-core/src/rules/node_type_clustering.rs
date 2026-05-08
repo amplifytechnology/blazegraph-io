@@ -16,8 +16,10 @@
 //!
 //! 3. Constraints are orthogonal "must match between consecutive elements"
 //!    predicates configured per element type via `NodeTypeMergeConfig`:
-//!    `same_line`, `same_paragraph`, `same_band`, `same_column`, `same_depth`,
-//!    `max_y_gap`. Adding a new constraint is a drop-in.
+//!    `same_line`, `same_paragraph`, `same_depth`, `max_y_gap`, plus the
+//!    region-aware `ignore_region_label` toggle (drops region from the key —
+//!    used for Header / Footer where per-page running chrome is one unit).
+//!    Adding a new constraint is a drop-in.
 
 use super::engine::{FontSizeAnalysis, ParseRule};
 use crate::config::{NodeTypeMergeConfig, ParsingConfig};
@@ -78,29 +80,51 @@ fn majority_style(sorted_elements: &[ParsedPdfElement]) -> FontClass {
 /// `max_y_gap` is *not* an equivalence — it's a pairwise proximity check applied
 /// during walk-and-split inside each bucket.
 ///
-/// NOTE (Block 06b, schema 0.5.0): the legacy `band` / `column` partition
-/// dimensions were dropped along with the matching Placement fields. Both
-/// `cfg.same_band` and `cfg.same_column` are read from yaml but no longer
-/// influence the equivalence key. The rule is disabled in the active config
-/// (`pipeline.NodeTypeClustering.enabled = false`) and merge semantics will
-/// be redesigned in a follow-up CR using `Placement.region_label` from the
-/// reading-order resort. Until then, the partition is `(page, element_type,
-/// paragraph?, line?, depth?)` only.
+/// `region` carries `Placement.region_label` (Block 06b's reading-order resort
+/// substrate) when `cfg.ignore_region_label = false`. Header / Footer defaults
+/// flip the toggle to drop region from the key so all `H-N` / `F-N` indices on
+/// a page collapse into one running-chrome bucket. Orphans (`region_label =
+/// None`) are bucketed as singletons by synthesizing a unique discriminator
+/// from `reading_order` — the invariant is that reading_order should always
+/// assign a region (B-X / H-X / F-X / M-X), but the defensive synthesis means
+/// any straggler stays a no-op rather than collapsing with other orphans.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EquivalenceKey {
     page: u32,
     element_type: ParsedElementType,
+    region: Option<RegionDiscriminator>,
     paragraph: Option<u32>,
     line: Option<u32>,
     depth: Option<u32>,
 }
 
-fn equivalence_key(el: &ParsedPdfElement, cfg: &NodeTypeMergeConfig) -> EquivalenceKey {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RegionDiscriminator {
+    Labeled(String),
+    /// Per-element singleton for orphan elements (`region_label = None`).
+    /// Carries `reading_order` so each orphan lands in its own bucket.
+    Orphan(u32),
+}
+
+fn equivalence_key(
+    el: &ParsedPdfElement,
+    cfg: &NodeTypeMergeConfig,
+    drop_paragraph: bool,
+) -> EquivalenceKey {
     let p = el.pdf_placement();
+    let region = if cfg.ignore_region_label {
+        None
+    } else {
+        Some(match &p.region_label {
+            Some(label) => RegionDiscriminator::Labeled(label.clone()),
+            None => RegionDiscriminator::Orphan(el.reading_order),
+        })
+    };
     EquivalenceKey {
         page: p.page_number,
         element_type: el.element_type.clone(),
-        paragraph: if cfg.same_paragraph {
+        region,
+        paragraph: if cfg.same_paragraph && !drop_paragraph {
             Some(p.paragraph_number)
         } else {
             None
@@ -116,6 +140,63 @@ fn equivalence_key(el: &ParsedPdfElement, cfg: &NodeTypeMergeConfig) -> Equivale
             None
         },
     }
+}
+
+/// `(page, element_type, region_label)` — used by the overflow pre-scan to
+/// count distinct `paragraph_number`s per region.
+type RegionScopeKey = (u32, ParsedElementType, Option<String>);
+
+/// Pre-scan: identify regions where Tika's `paragraph_number` is so fragmented
+/// that it should be dropped from the equivalence key (treat the region as if
+/// `same_paragraph: false`).
+///
+/// **CR-38 stopgap.** This is a heuristic for Tika's row-keyed `paragraph_number`
+/// in 2-column body layouts. The structurally-correct fix (geometry-derived
+/// paragraph detection from bbox data) is filed as CR-38; this knob is the
+/// Block 10 ship-it pragma. When the threshold fires, real within-column
+/// paragraph breaks are lost — accepted tradeoff until CR-38 lands.
+///
+/// Returns the set of `(page, element_type, region_label)` triples that
+/// exceeded their type's threshold.
+fn compute_overflow_regions<'c>(
+    elements: &[ParsedPdfElement],
+    cfg_for_type: impl Fn(&ParsedElementType) -> &'c NodeTypeMergeConfig,
+) -> std::collections::HashSet<RegionScopeKey> {
+    let mut paragraphs_per_region: HashMap<RegionScopeKey, std::collections::HashSet<u32>> =
+        HashMap::new();
+
+    for el in elements {
+        let type_cfg = cfg_for_type(&el.element_type);
+        // Only types with same_paragraph + region_overflow_threshold set can
+        // overflow — the heuristic is meaningless otherwise.
+        if !type_cfg.same_paragraph || type_cfg.region_overflow_threshold.is_none() {
+            continue;
+        }
+        let p = el.pdf_placement();
+        let key: RegionScopeKey = (
+            p.page_number,
+            el.element_type.clone(),
+            p.region_label.clone(),
+        );
+        paragraphs_per_region
+            .entry(key)
+            .or_default()
+            .insert(p.paragraph_number);
+    }
+
+    paragraphs_per_region
+        .into_iter()
+        .filter_map(|(key, set)| {
+            let type_cfg = cfg_for_type(&key.1);
+            type_cfg.region_overflow_threshold.and_then(|t| {
+                if set.len() >= t as usize {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
 }
 
 /// Pairwise proximity check between consecutive elements in a bucket. Only
@@ -158,14 +239,14 @@ fn merge_group(
 
     // --- Text concatenation ---
     //
-    // Same-line detection (legacy): pre-Block-06b this used `(band, line_number)`
-    // because Tika reset `line_number` per-paragraph-and-per-band so line_number
-    // alone collided across bands. With band/column dropped (schema 0.5.0) the
-    // discriminator is `line_number` alone — degraded for the cross-band case.
-    // The rule is disabled in the active config; a region-aware redesign keyed
-    // on `Placement.region_label` is the proper fix and is filed as a follow-up
-    // CR. Table separator (`table_line_separator`) is now unreachable here
-    // because the dropped `nr_band_columns` always determined that branch.
+    // Same-line detection: `line_number` alone is the discriminator. Within a
+    // bucket the equivalence key has already constrained things to one
+    // `(page, region_label)` (or one `(page, type)` for H/F when
+    // `ignore_region_label`), so Tika's per-paragraph-and-per-band line_number
+    // reset doesn't collide here — the bucket is already inside one logical
+    // structural unit. Table separator (`table_line_separator`) is currently
+    // unreachable; preserved as a knob for future per-region column-count
+    // detection.
     //
     // Same-line join rule: exactly one space at the boundary unless one side
     // already provides whitespace.
@@ -294,15 +375,9 @@ impl<'a> NodeTypeClusteringRule<'a> {
             ParsedElementType::Paragraph => &cfg.paragraph,
             ParsedElementType::List => &cfg.list,
             ParsedElementType::ListItem => &cfg.list_item,
-            // Block 07 — rule is `enabled: false` in the active config and
-            // its band/column-based partitioning is awaiting a region-aware
-            // redesign (see ignored tests in this file). Header / Footer /
-            // Margin currently fall through to the paragraph config so they
-            // compile; the redesign will give them their own config keys
-            // alongside the new region_label-aware equivalence key.
-            ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin => {
-                &cfg.paragraph
-            }
+            ParsedElementType::Header => &cfg.header,
+            ParsedElementType::Footer => &cfg.footer,
+            ParsedElementType::Margin => &cfg.margin,
         }
     }
 
@@ -314,16 +389,35 @@ impl<'a> NodeTypeClusteringRule<'a> {
             return Ok(elements);
         }
 
+        // Pre-scan for the CR-38 paragraph-overflow stopgap: regions where
+        // Tika's row-keyed `paragraph_number` produces too many singleton
+        // buckets (gpt2-style 2-column body) drop `paragraph_number` from
+        // the key.
+        let overflow_regions = compute_overflow_regions(&elements, |ty| self.cfg_for_type(cfg, ty));
+        if !overflow_regions.is_empty() {
+            println!(
+                "   ↪️  NodeTypeClustering: {} region(s) hit paragraph-overflow threshold (CR-38 fallback active)",
+                overflow_regions.len()
+            );
+        }
+
         // Build the equivalence key per element using the per-type config.
-        // Equality constraints (same_band, same_column, same_paragraph,
-        // same_line, same_depth) are baked into the key. Only `max_y_gap` is
+        // Equality constraints (region_label, same_paragraph, same_line,
+        // same_depth) are baked into the key. Only `max_y_gap` is
         // non-equivalence and is handled by walk-and-split inside each bucket.
         let mut partition_order: Vec<EquivalenceKey> = Vec::new();
         let mut buckets: HashMap<EquivalenceKey, Vec<ParsedPdfElement>> = HashMap::new();
 
         for el in elements {
             let type_cfg = self.cfg_for_type(cfg, &el.element_type);
-            let key = equivalence_key(&el, type_cfg);
+            let p = el.pdf_placement();
+            let region_scope: RegionScopeKey = (
+                p.page_number,
+                el.element_type.clone(),
+                p.region_label.clone(),
+            );
+            let drop_paragraph = overflow_regions.contains(&region_scope);
+            let key = equivalence_key(&el, type_cfg, drop_paragraph);
             if !buckets.contains_key(&key) {
                 partition_order.push(key.clone());
             }
@@ -406,6 +500,18 @@ mod tests {
     }
 
     fn mk_placement(page: u32, paragraph: u32, line: u32, y: f32) -> Placement {
+        // Default region_label "1" — single body region. Tests that need
+        // distinct regions use `mk_placement_in_region`.
+        mk_placement_in_region(page, paragraph, line, y, Some("1"))
+    }
+
+    fn mk_placement_in_region(
+        page: u32,
+        paragraph: u32,
+        line: u32,
+        y: f32,
+        region_label: Option<&str>,
+    ) -> Placement {
         Placement {
             page_number: page,
             bounding_box: BoundingBox {
@@ -418,7 +524,7 @@ mod tests {
             segment_number: 0,
             rotation: 0,
             paragraph_number: paragraph,
-            region_label: None,
+            region_label: region_label.map(str::to_string),
             page_width: 0.0,
             page_height: 0.0,
         }
@@ -456,17 +562,25 @@ mod tests {
                 ParsedElementType::Paragraph => &cfg.paragraph,
                 ParsedElementType::List => &cfg.list,
                 ParsedElementType::ListItem => &cfg.list_item,
-                ParsedElementType::Header
-                | ParsedElementType::Footer
-                | ParsedElementType::Margin => &cfg.paragraph,
+                ParsedElementType::Header => &cfg.header,
+                ParsedElementType::Footer => &cfg.footer,
+                ParsedElementType::Margin => &cfg.margin,
             }
         };
 
+        let overflow_regions = compute_overflow_regions(&elements, pick);
         let mut buckets: HashMap<EquivalenceKey, Vec<ParsedPdfElement>> = HashMap::new();
         let mut order: Vec<EquivalenceKey> = Vec::new();
         for el in elements {
             let tcfg = pick(&el.element_type);
-            let key = equivalence_key(&el, tcfg);
+            let p = el.pdf_placement();
+            let region_scope: RegionScopeKey = (
+                p.page_number,
+                el.element_type.clone(),
+                p.region_label.clone(),
+            );
+            let drop_paragraph = overflow_regions.contains(&region_scope);
+            let key = equivalence_key(&el, tcfg, drop_paragraph);
             if !buckets.contains_key(&key) {
                 order.push(key.clone());
             }
@@ -549,17 +663,11 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// Test 4 — Paragraph isolation across bands preserved by the default
-    /// paragraph config (`same_band: true`).
-    ///
-    /// IGNORED (Block 06b, schema 0.5.0): band was dropped from `EquivalenceKey`
-    /// along with the corresponding `Placement` field. Cross-band isolation now
-    /// regresses to no-op for the cases this test covers; a region-aware
-    /// redesign keyed on `Placement.region_label` is the proper fix and is
-    /// tracked as a follow-up CR. The rule is disabled in the active config.
+    /// Test 4 — Paragraph cross-paragraph isolation preserved. The paragraph
+    /// default keeps `same_paragraph: true`, so two Paragraph elements with
+    /// different `paragraph_number` in the same region stay distinct.
     #[test]
-    #[ignore = "Block 06b: band/column dropped — awaiting region-aware redesign"]
-    fn paragraph_cross_band_isolation_preserved() {
+    fn paragraph_cross_paragraph_isolation_preserved() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
         let p1 = mk_placement(22, 0, 0, 200.0);
         let p2 = mk_placement(22, 1, 0, 250.0);
@@ -571,19 +679,18 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// Test 5 — `same_column` enforcement. Section elements on different
-    /// columns of the same page+band stay separate.
-    ///
-    /// IGNORED (Block 06b, schema 0.5.0): see `paragraph_cross_band_isolation_preserved`.
+    /// Test 5 — `region_label` partition splits. Section elements in different
+    /// Region tree leaves on the same page stay separate even when their other
+    /// placement fields are identical. Region is the new primary structural
+    /// axis (Block 10 — replaces the legacy band/column gate).
     #[test]
-    #[ignore = "Block 06b: band/column dropped — awaiting region-aware redesign"]
-    fn same_column_constraint_splits() {
+    fn same_region_label_constraint_splits() {
         let cfg = crate::config::NodeTypeClusteringConfig::default();
-        let p1 = mk_placement(22, 0, 0, 100.0);
-        let p2 = mk_placement(22, 0, 0, 110.0);
+        let p1 = mk_placement_in_region(22, 0, 0, 100.0, Some("1"));
+        let p2 = mk_placement_in_region(22, 0, 0, 110.0, Some("2"));
         let els = vec![
-            mk_element(ParsedElementType::Section, "Col 0 title", 2, 0, p1),
-            mk_element(ParsedElementType::Section, "Col 1 title", 2, 1, p2),
+            mk_element(ParsedElementType::Section, "Region 1 title", 2, 0, p1),
+            mk_element(ParsedElementType::Section, "Region 2 title", 2, 1, p2),
         ];
         let out = run_rule(els, &cfg);
         assert_eq!(out.len(), 2);
@@ -648,10 +755,10 @@ mod tests {
     }
 
     /// Test 8 — Migration shim: legacy YAML deserializes into per-type configs
-    /// matching the equivalent constraint set. `merge_lines: true` (the prior
-    /// default) keys partitions on `(page, band, column, paragraph_number,
-    /// element_type)`, so the equivalent constraint set is `same_paragraph,
-    /// same_band, same_column` all true.
+    /// matching the surviving constraint subset. `merge_lines: true` (the prior
+    /// default) translates to `same_paragraph: true` on the body types.
+    /// `merge_bands` / `merge_columns` are silently ignored — they have no
+    /// equivalent in the region-aware world.
     #[test]
     fn migration_shim_legacy_default() {
         let yaml = r#"
@@ -670,15 +777,19 @@ table_line_separator: "\n"
                 t.same_paragraph,
                 "merge_lines=true keys on paragraph_number"
             );
-            assert!(t.same_band);
-            assert!(t.same_column);
             assert!(!t.same_depth);
+            assert!(!t.ignore_region_label);
             assert!(t.max_y_gap.is_none());
         }
+        // H/F/M get fresh defaults (no legacy equivalent).
+        assert!(cfg.header.ignore_region_label);
+        assert!(cfg.footer.ignore_region_label);
+        assert!(!cfg.margin.ignore_region_label);
     }
 
-    /// Test 8b — Migration shim: `merge_columns: true` collapses paragraph
-    /// boundaries (key drops paragraph_number) → `same_paragraph: false`.
+    /// Test 8b — Migration shim: legacy column flag is silently dropped.
+    /// `merge_columns: true` historically collapsed paragraph_number; the
+    /// region-aware redesign keys on region instead and ignores the flag.
     #[test]
     fn migration_shim_legacy_columns() {
         let yaml = r#"
@@ -690,8 +801,242 @@ merge_bands: false
         let cfg: crate::config::NodeTypeClusteringConfig =
             serde_yaml::from_str(yaml).expect("legacy YAML must deserialize");
         let t = &cfg.section;
-        assert!(!t.same_paragraph);
-        assert!(t.same_band);
-        assert!(!t.same_column);
+        assert!(t.same_paragraph, "merge_lines=true survives translation");
+        assert!(!t.ignore_region_label);
+    }
+
+    // ─── Region-aware tests (Block 10) ─────────────────────────────────────
+
+    /// Region-aware Section merge: same region, same depth, within proximity
+    /// → one node. Cross-region with otherwise-identical placement → split.
+    #[test]
+    fn section_within_region_merges_across_regions_splits() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let same_region = vec![
+            mk_element(
+                ParsedElementType::Section,
+                "Title line 1",
+                2,
+                0,
+                mk_placement_in_region(1, 0, 0, 100.0, Some("1")),
+            ),
+            mk_element(
+                ParsedElementType::Section,
+                "Title line 2",
+                2,
+                1,
+                mk_placement_in_region(1, 0, 1, 120.0, Some("1")),
+            ),
+        ];
+        let out = run_rule(same_region, &cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "Title line 1 Title line 2");
+
+        let cross_region = vec![
+            mk_element(
+                ParsedElementType::Section,
+                "Title A",
+                2,
+                0,
+                mk_placement_in_region(1, 0, 0, 100.0, Some("1")),
+            ),
+            mk_element(
+                ParsedElementType::Section,
+                "Title B",
+                2,
+                1,
+                mk_placement_in_region(1, 0, 0, 120.0, Some("2")),
+            ),
+        ];
+        let out = run_rule(cross_region, &cfg);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Header default ignores region_label: H-1 and H-2 on the same page
+    /// collapse into one running-header bucket.
+    #[test]
+    fn header_collapses_across_region_labels_within_page() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let els = vec![
+            mk_element(
+                ParsedElementType::Header,
+                "Chapter 3",
+                0,
+                0,
+                mk_placement_in_region(7, 0, 0, 30.0, Some("H-1")),
+            ),
+            mk_element(
+                ParsedElementType::Header,
+                "Page 18",
+                0,
+                1,
+                mk_placement_in_region(7, 0, 0, 30.0, Some("H-2")),
+            ),
+        ];
+        let out = run_rule(els, &cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "Chapter 3 Page 18");
+
+        // Cross-page must NOT merge — region is dropped but page is still in
+        // the key.
+        let cross_page = vec![
+            mk_element(
+                ParsedElementType::Header,
+                "Chapter 3",
+                0,
+                0,
+                mk_placement_in_region(7, 0, 0, 30.0, Some("H-1")),
+            ),
+            mk_element(
+                ParsedElementType::Header,
+                "Chapter 3",
+                0,
+                1,
+                mk_placement_in_region(8, 0, 0, 30.0, Some("H-1")),
+            ),
+        ];
+        let out = run_rule(cross_page, &cfg);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Margin default keeps region_label: a sidebar block and a footnote
+    /// margin in different leaves stay distinct, but multiple fragments
+    /// inside one Margin region merge.
+    #[test]
+    fn margin_partitions_by_region_label() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let els = vec![
+            mk_element(
+                ParsedElementType::Margin,
+                "Sidebar a",
+                0,
+                0,
+                mk_placement_in_region(2, 0, 0, 200.0, Some("M-1")),
+            ),
+            mk_element(
+                ParsedElementType::Margin,
+                "Sidebar b",
+                0,
+                1,
+                mk_placement_in_region(2, 0, 1, 220.0, Some("M-1")),
+            ),
+            mk_element(
+                ParsedElementType::Margin,
+                "Footnote",
+                0,
+                2,
+                mk_placement_in_region(2, 0, 0, 700.0, Some("M-2")),
+            ),
+        ];
+        let out = run_rule(els, &cfg);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "Sidebar a Sidebar b");
+        assert_eq!(out[1].text, "Footnote");
+    }
+
+    /// CR-38 overflow stopgap: when a `(page, region_label)` produces ≥N
+    /// distinct paragraph_numbers (Tika's row-keyed misbehavior in 2-column
+    /// layout), `paragraph_number` is dropped from the key for that region
+    /// and all elements in it collapse into one bucket.
+    #[test]
+    fn paragraph_overflow_threshold_collapses_region() {
+        // Default paragraph config has `region_overflow_threshold: Some(10)`.
+        // Build 12 elements in one region with 12 distinct paragraph_numbers.
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let mut els = Vec::new();
+        for i in 0..12 {
+            els.push(mk_element(
+                ParsedElementType::Paragraph,
+                &format!("frag{i}"),
+                4,
+                i,
+                mk_placement_in_region(1, i, 0, 100.0 + i as f32 * 14.0, Some("1")),
+            ));
+        }
+        let out = run_rule(els, &cfg);
+        assert_eq!(
+            out.len(),
+            1,
+            "12 paragraph_numbers ≥ threshold 10 → collapse"
+        );
+        // Verify all fragments concatenated in order.
+        assert!(out[0].text.starts_with("frag0"));
+        assert!(out[0].text.ends_with("frag11"));
+    }
+
+    /// CR-38 overflow stopgap: under the threshold, normal per-paragraph
+    /// bucketing applies (no collapse).
+    #[test]
+    fn paragraph_overflow_threshold_below_keeps_paragraphs() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let mut els = Vec::new();
+        // 5 paragraph_numbers in one region — under threshold 10.
+        for i in 0..5 {
+            els.push(mk_element(
+                ParsedElementType::Paragraph,
+                &format!("frag{i}"),
+                4,
+                i,
+                mk_placement_in_region(1, i, 0, 100.0 + i as f32 * 14.0, Some("1")),
+            ));
+        }
+        let out = run_rule(els, &cfg);
+        assert_eq!(out.len(), 5, "5 < threshold 10 → no collapse");
+    }
+
+    /// CR-38 overflow stopgap is per-region: one overflowing region collapses,
+    /// neighbouring regions in the same page stay normally bucketed.
+    #[test]
+    fn paragraph_overflow_threshold_is_per_region() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let mut els = Vec::new();
+        // Region "1" overflows (12 paragraphs)
+        for i in 0..12 {
+            els.push(mk_element(
+                ParsedElementType::Paragraph,
+                &format!("L{i}"),
+                4,
+                i,
+                mk_placement_in_region(1, i, 0, 100.0 + i as f32 * 14.0, Some("1")),
+            ));
+        }
+        // Region "2" stays clean (3 paragraphs, each 1 elem)
+        for i in 0..3 {
+            els.push(mk_element(
+                ParsedElementType::Paragraph,
+                &format!("R{i}"),
+                4,
+                100 + i,
+                mk_placement_in_region(1, 1000 + i, 0, 100.0 + i as f32 * 14.0, Some("2")),
+            ));
+        }
+        let out = run_rule(els, &cfg);
+        // Region "1" → 1 collapsed node; region "2" → 3 separate nodes.
+        assert_eq!(out.len(), 4);
+    }
+
+    /// Orphan elements (`region_label = None`) bucket as singletons — never
+    /// merge with each other even when other placement fields collide.
+    #[test]
+    fn orphan_region_label_never_merges() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let els = vec![
+            mk_element(
+                ParsedElementType::Paragraph,
+                "Orphan A",
+                4,
+                0,
+                mk_placement_in_region(3, 0, 0, 100.0, None),
+            ),
+            mk_element(
+                ParsedElementType::Paragraph,
+                "Orphan B",
+                4,
+                1,
+                mk_placement_in_region(3, 0, 0, 100.0, None),
+            ),
+        ];
+        let out = run_rule(els, &cfg);
+        assert_eq!(out.len(), 2);
     }
 }

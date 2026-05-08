@@ -25,7 +25,7 @@ pipeline:
     - name: "ListDetection"
       enabled: false
     - name: "NodeTypeClustering"
-      enabled: false
+      enabled: true
     - name: "SizeEnforcer"
       enabled: false
     - name: "Validation"
@@ -107,59 +107,108 @@ section_detection_v2:
 # Node type clustering (CR-29) — merges fragmented Tika elements into the
 # logical lines/paragraphs/sections they came from. Runs after SectionDetectionV2.
 #
-# Algorithm: partition coarsely at (page, element_type), then walk the bucket
-# in reading order and split into a new merge group whenever any constraint
-# fails between consecutive elements. Each ParsedElementType has its own
-# self-contained config — no shared defaults.
+# Algorithm: partition coarsely at (page, element_type, region_label, …),
+# then walk each bucket in reading order and split into a new merge group
+# whenever `max_y_gap` is exceeded between consecutive elements. Each
+# ParsedElementType has its own self-contained config — no shared defaults.
 #
 # Constraints (split when violated):
-#   same_line       — Tika line_number equality
-#   same_paragraph  — Tika paragraph_number equality (Y-gap-based; reliable for prose)
-#   same_band       — Tika band equality
-#   same_column     — Tika column equality (almost always required)
-#   same_depth      — hierarchy_level equality (safety against unrelated cross-band merges)
-#   max_y_gap       — points; null disables. Geometric proximity check.
+#   same_line                   — Tika line_number equality
+#   same_paragraph              — Tika paragraph_number equality (Y-gap-based; reliable for prose)
+#   same_depth                  — hierarchy_level equality (safety against unrelated section collapse)
+#   ignore_region_label         — drop region_label from the key (used for Header / Footer
+#                                 where per-page running chrome is one logical unit)
+#   max_y_gap                   — points; null disables. Geometric proximity check.
+#   region_overflow_threshold   — null disables. CR-38 stopgap: when a (page,
+#                                 region_label) has ≥N distinct paragraph_numbers,
+#                                 drop paragraph_number from the key for that
+#                                 region (catches Tika's row-keyed paragraph_number
+#                                 in 2-column body layout — gpt2 page 2 case).
+#                                 Tradeoff: collapses real within-column paragraph
+#                                 breaks when triggered. CR-38 will replace this
+#                                 with bbox-derived paragraph detection.
+#
+# region_label (Block 06b reading-order resort) is the primary structural axis
+# and is part of the key by default — clustering only happens within one Region
+# tree leaf. Set `ignore_region_label: true` to collapse all of a type's
+# elements within a page (Header/Footer default).
 node_type_clustering:
   section:
-    # Cross-band merge enabled — multi-line chapter titles routinely split into
-    # separate Tika bands. Safety: depth equality + 50pt proximity prevent
-    # collapsing unrelated section nodes that happen to share a page.
+    # Within-region merge with depth equality + proximity. A multi-line bold
+    # title in one leaf at one depth is one Section.
     same_line: false
     same_paragraph: false
-    same_band: false
-    same_column: true
     same_depth: true
+    ignore_region_label: false
     max_y_gap: 50.0
     prose_line_separator: " "
     table_line_separator: "\n"
 
   paragraph:
-    # Conservative prose-safe: Tika's paragraph_number is the reliable signal.
+    # Within-region, with Tika paragraph_number as the within-region granularity
+    # refinement. Solves "whole page = one leaf" small-margin docs where region
+    # alone is too coarse.
+    #
+    # region_overflow_threshold: 10 catches gpt2-style 2-column body where Tika
+    # emits one paragraph_number per visual row across both columns. CR-38 will
+    # replace this heuristic with bbox-derived paragraph detection.
     same_line: false
     same_paragraph: true
-    same_band: true
-    same_column: true
     same_depth: false
+    ignore_region_label: false
     max_y_gap: null
+    region_overflow_threshold: 10
     prose_line_separator: " "
     table_line_separator: "\n"
 
   list:
     same_line: false
     same_paragraph: true
-    same_band: true
-    same_column: true
     same_depth: false
+    ignore_region_label: false
     max_y_gap: null
+    region_overflow_threshold: 10
     prose_line_separator: " "
     table_line_separator: "\n"
 
   list_item:
     same_line: false
     same_paragraph: true
-    same_band: true
-    same_column: true
     same_depth: false
+    ignore_region_label: false
+    max_y_gap: null
+    region_overflow_threshold: 10
+    prose_line_separator: " "
+    table_line_separator: "\n"
+
+  header:
+    # Per-page running header is one logical unit — collapse all H-N labels
+    # on a page into one bucket. Future CR will split on-page footnotes from
+    # page chrome; for now everything labeled Header on a page merges.
+    same_line: false
+    same_paragraph: false
+    same_depth: false
+    ignore_region_label: true
+    max_y_gap: null
+    prose_line_separator: " "
+    table_line_separator: "\n"
+
+  footer:
+    same_line: false
+    same_paragraph: false
+    same_depth: false
+    ignore_region_label: true
+    max_y_gap: null
+    prose_line_separator: " "
+    table_line_separator: "\n"
+
+  margin:
+    # Keep region_label as a partition dimension — sidebars and edge-marginal
+    # notes in different leaves are distinct logical units.
+    same_line: false
+    same_paragraph: false
+    same_depth: false
+    ignore_region_label: false
     max_y_gap: null
     prose_line_separator: " "
     table_line_separator: "\n"
