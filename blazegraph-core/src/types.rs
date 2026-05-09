@@ -217,6 +217,14 @@ pub struct StyleMetadata {
     pub color: Option<String>, // CSS color value (e.g., "#FF0000" or "rgb(255,0,0)")
 }
 
+/// Channel-agnostic style information attached to `SemanticTreeElement`.
+///
+/// Reuses `StyleMetadata` (the shape DocumentNode already serializes) so
+/// the projection boundary can carry style data through without lossy
+/// reshaping. The v1 shape may not be final — channels populate as
+/// best-effort or `None`. See `SemanticTreeElement::style` for usage.
+pub type StyleInfo = StyleMetadata;
+
 /// Quantitative measurement of graph shape — deterministic, mechanically computed from structure.
 /// Travels with graph.json. Describes the L0 tree's statistical properties.
 /// See AmplifyNotes/09-Profile-Types.md for design rationale.
@@ -620,6 +628,71 @@ pub struct ElementGroup {
 
 #[derive(Debug, Clone)]
 pub enum GroupType {
+    Section,
+    Paragraph,
+    Header,
+    Footer,
+    Margin,
+}
+
+// ===== SEMANTIC TREE ELEMENT (channel boundary) =====
+//
+// `SemanticTreeElement` is the convergence type — what every input channel
+// (PDF, MD, DOCX) projects to before the universal `GraphBuilder` consumes
+// it. Format-specific quirks live in the channel projection; downstream
+// (GraphBuilder) is channel-agnostic.
+//
+// See `preprocessors/pdf/semantic_tree_projection.rs` for the PDF
+// channel's projection function, and `graphs/builder.rs` for the
+// downstream consumer.
+
+/// The convergence type — what every input channel (PDF, MD, DOCX) projects
+/// to before the universal `GraphBuilder` consumes it.
+///
+/// Channel contract: when a `Vec<SemanticTreeElement>` is produced, all
+/// format-specific transforms are complete. `GraphBuilder` walks-and-zips;
+/// it does not merge, reorder, or post-process. `text_order` equals
+/// projection-time vec position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticTreeElement {
+    /// The text content of this element.
+    pub text: String,
+
+    /// What kind of element this is.
+    pub element_type: SemanticElementType,
+
+    /// Hierarchy level hint. Meaningful for `Section` (1 = top-level,
+    /// 2 = nested, ...); for `Paragraph` / `Header` / `Footer` / `Margin`
+    /// it is `0` (sentinel — these are leaves attached to the current
+    /// open Section).
+    pub hierarchy_level: u32,
+
+    /// Position in the channel's projection-output vec. Zero-based,
+    /// strictly sequential, no gaps. `GraphBuilder` uses this as the
+    /// salt for deterministic ID generation; it also asserts
+    /// `text_order == vec_index` as a sanity check.
+    pub text_order: u32,
+
+    /// Physical location, if the source format has it (PDF only).
+    /// `None` for free-flow formats (Markdown, DOCX).
+    pub physical_location: Option<PhysicalLocation>,
+
+    /// Style information, if the source format has it. v1 shape
+    /// may not be final — channels populate as best-effort or `None`.
+    pub style: Option<StyleInfo>,
+
+    /// Pre-computed token count.
+    pub token_count: usize,
+}
+
+/// Element kinds carried at the SemanticTreeElement boundary.
+///
+/// v1 set: the Section/Paragraph/Header/Footer/Margin "labeled paragraph"
+/// shape. List/ListItem/Table/Figure/CodeBlock are deferred — the design
+/// flow defers them, and YAGNI applies until a downstream consumer needs
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemanticElementType {
     Section,
     Paragraph,
     Header,
