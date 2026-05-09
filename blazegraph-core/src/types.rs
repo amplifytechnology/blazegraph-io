@@ -617,24 +617,6 @@ pub struct GraphAnalyticsResult {
 /// Analytics computer that can analyze any subset of nodes in the graph
 pub struct GraphAnalytics;
 
-// Graph builder structs
-#[derive(Debug, Clone)]
-pub struct ElementGroup {
-    pub elements: Vec<ParsedPdfElement>,
-    pub group_type: GroupType,
-    pub hierarchy_level: u32,
-    pub combined_text: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum GroupType {
-    Section,
-    Paragraph,
-    Header,
-    Footer,
-    Margin,
-}
-
 // ===== SEMANTIC TREE ELEMENT (channel boundary) =====
 //
 // `SemanticTreeElement` is the convergence type — what every input channel

@@ -7,6 +7,7 @@ use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
 use crate::graphs::builder::GraphBuilder;
 use crate::graphs::NodeIdGenerator;
+use crate::preprocessors::pdf::project_to_semantic_tree;
 use crate::preprocessors::{Preprocessor, TikaPreprocessor};
 use crate::rules::RuleEngine;
 use crate::storage::{
@@ -302,8 +303,11 @@ impl DocumentProcessor {
         // Infer title from content before graph build
         let inferred_title = infer_title(&parsed_elements);
 
-        // Stage 3: ParsedElements → DocumentGraph
-        let mut graph = self.graph_builder.build_graph(parsed_elements.clone())?;
+        // Stage 3: ParsedPdfElement → SemanticTreeElement (channel exit)
+        let semantic_elements = project_to_semantic_tree(parsed_elements.clone());
+
+        // Stage 4: SemanticTreeElement → DocumentGraph
+        let mut graph = self.graph_builder.build_graph(semantic_elements)?;
 
         // Wire metadata and compute post-processing
         if let Some(title) = inferred_title {
@@ -450,10 +454,16 @@ impl DocumentProcessor {
         // Infer title before graph build consumes elements
         let inferred_title = infer_title(&parsed_elements);
 
+        // PDF channel exit: project rule output onto SemanticTreeElement.
+        // Everything from here is channel-agnostic.
+        let semantic_elements = profiler.time_step("Channel Projection", || {
+            project_to_semantic_tree(parsed_elements)
+        });
+
         // Graph construction (deterministic UUIDv5 node IDs)
         let mut graph = profiler.time_step("Graph Construction", || {
             self.graph_builder
-                .build_graph_deterministic(parsed_elements, id_gen)
+                .build_graph_deterministic(semantic_elements, id_gen)
         })?;
 
         // Post-processing: metadata, analysis, breadcrumbs

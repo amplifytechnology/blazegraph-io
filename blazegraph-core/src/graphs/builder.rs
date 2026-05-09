@@ -17,12 +17,18 @@ impl GraphBuilder {
 
     /// Build a document graph with deterministic node IDs.
     ///
-    /// The NodeIdGenerator produces UUIDv5 IDs scoped to a specific
-    /// (version, pdf_hash, config_hash) triple, ensuring identical inputs
-    /// always produce identical graphs.
+    /// The `NodeIdGenerator` produces UUIDv5 IDs scoped to a specific
+    /// `(version, source_hash, config_hash)` triple, ensuring identical
+    /// inputs always produce identical graphs.
+    ///
+    /// Channel contract: `elements` arrives at this boundary fully
+    /// transformed — no merge/reorder/post-process happens here. We
+    /// walk-and-zip: each `SemanticTreeElement` becomes one
+    /// `DocumentNode`, with a deterministic ID salted from
+    /// `text_order` (which equals vec index, asserted in debug builds).
     pub fn build_graph_deterministic(
         &self,
-        elements: Vec<ParsedPdfElement>,
+        elements: Vec<SemanticTreeElement>,
         id_gen: &NodeIdGenerator,
     ) -> Result<DocumentGraph> {
         println!(
@@ -59,31 +65,29 @@ impl GraphBuilder {
         };
         graph.nodes.insert(root_id, document_node);
 
-        // Group elements into meaningful chunks
-        let grouped_elements = self.group_elements_into_chunks(elements);
-        println!(
-            "📦 Grouped {} elements into {} meaningful chunks",
-            grouped_elements
-                .iter()
-                .map(|g| g.elements.len())
-                .sum::<usize>(),
-            grouped_elements.len()
-        );
+        for (index, element) in elements.iter().enumerate() {
+            // Sanity-check: the channel projection must assign
+            // `text_order = vec_index`. Drift here would mean a
+            // post-projection reorder snuck in.
+            debug_assert_eq!(
+                element.text_order as usize,
+                index,
+                "text_order/vec-position drift: element[{}].text_order = {}",
+                index,
+                element.text_order
+            );
+            let node_id = id_gen.node_id(element.text_order);
 
-        for (index, group) in grouped_elements.iter().enumerate() {
-            let text_order = index as u32;
-            let node_id = id_gen.node_id(text_order);
-
-            let node = self.create_node_from_group(group, text_order, node_id)?;
+            let node = self.create_node(element, element.text_order, node_id);
 
             // Determine parent based on hierarchy level
-            let parent_id = self.find_parent(&mut node_stack, group.hierarchy_level, root_id);
+            let parent_id = self.find_parent(&mut node_stack, element.hierarchy_level, root_id);
 
             // Insert node and create relationships
             let mut final_node = node;
             final_node.parent = Some(parent_id);
-            final_node.location.semantic.depth = group.hierarchy_level;
-            final_node.text_order = Some(text_order);
+            final_node.location.semantic.depth = element.hierarchy_level;
+            final_node.text_order = Some(element.text_order);
             final_node.location.semantic.path =
                 self.generate_hierarchical_path(&graph, parent_id, index);
 
@@ -95,10 +99,10 @@ impl GraphBuilder {
             }
 
             // Update hierarchy stack for sections
-            if matches!(group.group_type, GroupType::Section) {
+            if matches!(element.element_type, SemanticElementType::Section) {
                 while let Some(&stack_id) = node_stack.last() {
                     if let Some(stack_node) = graph.nodes.get(&stack_id) {
-                        if stack_node.location.semantic.depth >= group.hierarchy_level {
+                        if stack_node.location.semantic.depth >= element.hierarchy_level {
                             node_stack.pop();
                         } else {
                             break;
@@ -121,8 +125,9 @@ impl GraphBuilder {
     }
 
     /// Build a document graph with random UUIDv4 IDs (legacy fallback).
-    /// Used by --dump-stages and other paths that don't have pdf/config hashes.
-    pub fn build_graph(&self, elements: Vec<ParsedPdfElement>) -> Result<DocumentGraph> {
+    /// Used by --dump-stages and other paths that don't have source/config
+    /// hashes.
+    pub fn build_graph(&self, elements: Vec<SemanticTreeElement>) -> Result<DocumentGraph> {
         println!(
             "🏗️  Building document graph from {} elements",
             elements.len()
@@ -157,25 +162,15 @@ impl GraphBuilder {
         };
         graph.nodes.insert(root_id, document_node);
 
-        let grouped_elements = self.group_elements_into_chunks(elements);
-        println!(
-            "📦 Grouped {} elements into {} meaningful chunks",
-            grouped_elements
-                .iter()
-                .map(|g| g.elements.len())
-                .sum::<usize>(),
-            grouped_elements.len()
-        );
-
-        for (index, group) in grouped_elements.iter().enumerate() {
-            let node = self.create_node_from_group_v4(group, index as u32)?;
+        for (index, element) in elements.iter().enumerate() {
+            let node = self.create_node_v4(element, index as u32);
             let node_id = node.id;
 
-            let parent_id = self.find_parent(&mut node_stack, group.hierarchy_level, root_id);
+            let parent_id = self.find_parent(&mut node_stack, element.hierarchy_level, root_id);
 
             let mut final_node = node;
             final_node.parent = Some(parent_id);
-            final_node.location.semantic.depth = group.hierarchy_level;
+            final_node.location.semantic.depth = element.hierarchy_level;
             final_node.text_order = Some(index as u32);
             final_node.location.semantic.path =
                 self.generate_hierarchical_path(&graph, parent_id, index);
@@ -186,10 +181,10 @@ impl GraphBuilder {
                 parent.children.push(node_id);
             }
 
-            if matches!(group.group_type, GroupType::Section) {
+            if matches!(element.element_type, SemanticElementType::Section) {
                 while let Some(&stack_id) = node_stack.last() {
                     if let Some(stack_node) = graph.nodes.get(&stack_id) {
-                        if stack_node.location.semantic.depth >= group.hierarchy_level {
+                        if stack_node.location.semantic.depth >= element.hierarchy_level {
                             node_stack.pop();
                         } else {
                             break;
@@ -246,115 +241,43 @@ impl GraphBuilder {
         }
     }
 
-    fn group_elements_into_chunks(&self, elements: Vec<ParsedPdfElement>) -> Vec<ElementGroup> {
-        let mut groups = Vec::new();
-
-        for element in elements.iter() {
-            let group_type = match element.element_type {
-                crate::types::ParsedElementType::Section => GroupType::Section,
-                crate::types::ParsedElementType::List => GroupType::Paragraph,
-                crate::types::ParsedElementType::ListItem => GroupType::Paragraph,
-                crate::types::ParsedElementType::Paragraph => GroupType::Paragraph,
-                crate::types::ParsedElementType::Header => GroupType::Header,
-                crate::types::ParsedElementType::Footer => GroupType::Footer,
-                crate::types::ParsedElementType::Margin => GroupType::Margin,
-            };
-
-            groups.push(ElementGroup {
-                elements: vec![element.clone()],
-                group_type,
-                hierarchy_level: element.hierarchy_level,
-                combined_text: element.text.clone(),
-            });
-        }
-
-        groups
-    }
-
-    /// Create node with deterministic ID (UUIDv5)
-    fn create_node_from_group(
+    /// Create node with deterministic ID (UUIDv5).
+    fn create_node(
         &self,
-        group: &ElementGroup,
+        element: &SemanticTreeElement,
         order: u32,
         node_id: NodeId,
-    ) -> Result<DocumentNode> {
-        let (node_type_str, physical) = self.extract_node_type_and_physical(group);
-
-        let mut node =
-            DocumentNode::new_with_id(node_id, node_type_str, group.combined_text.clone());
-        node.location.physical = physical;
+    ) -> DocumentNode {
+        let node_type_str = node_type_for(element.element_type);
+        let mut node = DocumentNode::new_with_id(node_id, node_type_str, element.text.clone());
+        node.location.physical = element.physical_location.clone();
         node.text_order = Some(order);
-        node.token_count = group.elements.iter().map(|e| e.token_count).sum();
-        self.apply_style_info(&mut node, group);
-
-        Ok(node)
+        node.token_count = element.token_count;
+        node.style_info = element.style.clone();
+        node
     }
 
-    /// Create node with random ID (UUIDv4, legacy)
-    fn create_node_from_group_v4(&self, group: &ElementGroup, order: u32) -> Result<DocumentNode> {
-        let (node_type_str, physical) = self.extract_node_type_and_physical(group);
-
-        let mut node = DocumentNode::new(node_type_str, group.combined_text.clone());
-        node.location.physical = physical;
+    /// Create node with random ID (UUIDv4, legacy).
+    fn create_node_v4(&self, element: &SemanticTreeElement, order: u32) -> DocumentNode {
+        let node_type_str = node_type_for(element.element_type);
+        let mut node = DocumentNode::new(node_type_str, element.text.clone());
+        node.location.physical = element.physical_location.clone();
         node.text_order = Some(order);
-        node.token_count = group.elements.iter().map(|e| e.token_count).sum();
-        self.apply_style_info(&mut node, group);
-
-        Ok(node)
+        node.token_count = element.token_count;
+        node.style_info = element.style.clone();
+        node
     }
+}
 
-    fn extract_node_type_and_physical(
-        &self,
-        group: &ElementGroup,
-    ) -> (&str, Option<PhysicalLocation>) {
-        if let Some(first_element) = group.elements.first() {
-            let node_type = match first_element.element_type {
-                crate::types::ParsedElementType::Section => "Section",
-                crate::types::ParsedElementType::List => "List",
-                crate::types::ParsedElementType::ListItem => "ListItem",
-                crate::types::ParsedElementType::Paragraph => "Paragraph",
-                crate::types::ParsedElementType::Header => "Header",
-                crate::types::ParsedElementType::Footer => "Footer",
-                crate::types::ParsedElementType::Margin => "Margin",
-            };
-
-            let placement = first_element.pdf_placement();
-            let physical = Some(PhysicalLocation {
-                page: placement.page_number,
-                bounding_box: placement.bounding_box.clone(),
-            });
-
-            (node_type, physical)
-        } else {
-            let node_type = match group.group_type {
-                GroupType::Section => "Section",
-                GroupType::Paragraph => "Paragraph",
-                GroupType::Header => "Header",
-                GroupType::Footer => "Footer",
-                GroupType::Margin => "Margin",
-            };
-            (node_type, None)
-        }
-    }
-
-    fn apply_style_info(&self, node: &mut DocumentNode, group: &ElementGroup) {
-        if let Some(first_element) = group.elements.first() {
-            node.style_info = Some(StyleMetadata {
-                font_class: first_element.style_info.class_name.clone(),
-                font_size: Some(first_element.style_info.font_size),
-                font_family: Some(first_element.style_info.font_family.clone()),
-                color: Some(first_element.style_info.color.clone()),
-                is_bold: first_element
-                    .style_info
-                    .font_weight
-                    .to_lowercase()
-                    .contains("bold"),
-                is_italic: first_element
-                    .style_info
-                    .font_style
-                    .to_lowercase()
-                    .contains("italic"),
-            });
-        }
+/// Map `SemanticElementType` to the string the serialized graph carries
+/// in `DocumentNode.node_type`. Kept as a free function (no `&self`) so
+/// it doesn't pretend to depend on `GraphBuilder` state.
+fn node_type_for(t: SemanticElementType) -> &'static str {
+    match t {
+        SemanticElementType::Section => "Section",
+        SemanticElementType::Paragraph => "Paragraph",
+        SemanticElementType::Header => "Header",
+        SemanticElementType::Footer => "Footer",
+        SemanticElementType::Margin => "Margin",
     }
 }
