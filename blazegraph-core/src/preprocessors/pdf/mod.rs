@@ -4,7 +4,10 @@
 //! PDF content to Blazegraph XHTML, then parses into PreprocessorOutput.
 
 pub mod backends;
+pub mod semantic_tree_projection;
 pub mod xhtml_parser;
+
+pub use semantic_tree_projection::project_to_semantic_tree;
 
 use crate::preprocessors::traits::Preprocessor;
 use crate::types::*;
