@@ -37,6 +37,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use regex::Regex;
 use std::collections::HashMap;
+use std::time::Instant;
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
@@ -69,19 +70,28 @@ static FONT_CLASS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Main entry point. Extracts text elements (with full structural context),
 /// document metadata, style data, and bookmark data.
 pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
+    let t0 = Instant::now();
     let metadata = extract_enhanced_metadata(xhtml)?;
+    let t1 = Instant::now();
     let style_data = extract_style_data(xhtml)?;
+    let t2 = Instant::now();
     let bookmark_data = extract_bookmark_data(xhtml)?;
+    let t3 = Instant::now();
     let text_elements = extract_text_elements(xhtml, &style_data, &bookmark_data)?;
+    let t4 = Instant::now();
 
     println!(
-        "XHTML parsing complete: {} text elements, {} font classes, {} bookmarks",
+        "XHTML parsing complete: {} text elements, {} font classes, {} bookmarks (meta={}ms, style={}ms, bookmark={}ms, text={}ms)",
         text_elements.len(),
         style_data.font_classes.len(),
         bookmark_data
             .as_ref()
             .map(|b| b.sections.len())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        (t1 - t0).as_millis(),
+        (t2 - t1).as_millis(),
+        (t3 - t2).as_millis(),
+        (t4 - t3).as_millis(),
     );
 
     Ok(PreprocessorOutput {
