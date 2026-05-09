@@ -1,10 +1,11 @@
 //! Deterministic Node ID Generation
 //!
 //! Generates reproducible UUIDv5 node IDs from a document-scoped namespace.
-//! The contract: same blazegraph version + same PDF + same config = same node IDs.
+//! The contract: same blazegraph version + same source bytes + same config
+//! = same node IDs.
 //!
 //! The namespace is derived from:
-//!   UUIDv5(BLAZEGRAPH_NS, "{blazegraph_version}:{pdf_hash}:{config_hash}")
+//!   UUIDv5(BLAZEGRAPH_NS, "{blazegraph_version}:{source_hash}:{config_hash}")
 //!
 //! Each node ID is then:
 //!   UUIDv5(document_namespace, "root")     — for the document root
@@ -29,7 +30,7 @@ const BLAZEGRAPH_NS: Uuid = Uuid::from_bytes([
 /// Generates deterministic node IDs scoped to a specific document parse.
 #[derive(Debug, Clone)]
 pub struct NodeIdGenerator {
-    /// Document-scoped namespace: UUIDv5(BLAZEGRAPH_NS, "{version}:{pdf_hash}:{config_hash}")
+    /// Document-scoped namespace: UUIDv5(BLAZEGRAPH_NS, "{version}:{source_hash}:{config_hash}")
     document_namespace: Uuid,
 }
 
@@ -38,10 +39,11 @@ impl NodeIdGenerator {
     ///
     /// # Arguments
     /// * `blazegraph_version` - Parser version (e.g., "0.1.1")
-    /// * `pdf_hash` - Hash of the PDF content
+    /// * `source_hash` - Hash of the source-format content (PDF bytes for
+    ///   the PDF channel; markdown bytes for MD; DOCX bytes for DOCX)
     /// * `config_hash` - Hash of the parsing config
-    pub fn new(blazegraph_version: &str, pdf_hash: &str, config_hash: &str) -> Self {
-        let scope = format!("{}:{}:{}", blazegraph_version, pdf_hash, config_hash);
+    pub fn new(blazegraph_version: &str, source_hash: &str, config_hash: &str) -> Self {
+        let scope = format!("{}:{}:{}", blazegraph_version, source_hash, config_hash);
         let document_namespace = Uuid::new_v5(&BLAZEGRAPH_NS, scope.as_bytes());
         Self { document_namespace }
     }
