@@ -1,10 +1,10 @@
-/// Section Detection V2 — V3 algorithm (Block 09).
+/// Section Detection V2 — V3 algorithm (Block 09) + CR-41 bookmark substrate.
 ///
 /// Three-tier piecewise classifier on `delta = font_size - body_size`:
 ///
 /// - `delta > structural_size_margin` → ACCEPT (R1: clearly larger than body)
-/// - `delta > tolerance`              → bold OR isolated_in_leaf (R2: medium)
-/// - `|delta| ≤ tolerance`            → bold AND isolated_in_leaf (R3: at body)
+/// - `delta > tolerance`              → bold OR isolated_in_leaf OR bookmark_match (R2: medium)
+/// - `|delta| ≤ tolerance`            → bold AND (isolated_in_leaf OR bookmark_match) (R3: at body)
 /// - `delta < -tolerance`             → REJECT (below-body noise)
 ///
 /// Pre-gates (rotation rejection + alpha-ratio gate) run before the size
@@ -19,6 +19,16 @@
 /// Region tree leaf has a different bold-ness. This catches the canonical
 /// false positive (bold emphasis word inside a non-bold body line) at
 /// near-zero cost: the leaf substrate is precomputed once per document.
+///
+/// **Bookmark substrate (CR-41).** The XHTML parser populates
+/// `PdfTextElement.bookmark_match` when a span's normalized text exactly
+/// equals a PDF outline title. This is an author-declared structural
+/// signal that substitutes for `isolated_in_leaf` in R2/R3 when geometry
+/// can't see the structure (e.g., a bold body-size heading sharing its
+/// leaf with the trailing paragraph). TOC entries naturally do not match
+/// because Tika fragments them across multiple spans; only the monolithic
+/// body heading hits. PDFs without an outline see no behavior change
+/// (`bookmark_match` is `None` everywhere).
 ///
 /// V3 deltas vs the prior pipeline (locked 2026-05-07):
 /// - Replaced X-cluster `is_isolated` (per-element O(n) page walk) with
@@ -371,6 +381,17 @@ impl<'a> SectionDetectionV2Rule<'a> {
         family.contains("bold") || family.contains("medi") || family.contains("bx")
     }
 
+    /// CR-41: Whether the XHTML parser matched this span's normalized text
+    /// exactly against a PDF outline (bookmark) title. Acts as an alternative
+    /// to the geometric `isolated_in_leaf` signal in R2/R3 — when the PDF
+    /// author has explicitly named this span as a section target, the
+    /// structural-atom signal can come from the outline rather than from
+    /// the leaf's Y-line count. PDFs without a `BookmarkData` payload yield
+    /// `false` for every element by construction.
+    fn has_bookmark_match(element: &PdfTextElement) -> bool {
+        element.bookmark_match.is_some()
+    }
+
     /// Leaf-based isolation. Two gates compose the predicate:
     ///
     /// 1. **Same-line bold-mismatch** — any same-Y same-(page, leaf)
@@ -506,13 +527,18 @@ impl<'a> SectionDetectionV2Rule<'a> {
     ///
     /// - `delta < -tolerance`            → REJECT (below-body noise)
     /// - `delta > structural_size_margin` → ACCEPT (R1: clearly larger than body)
-    /// - `delta > tolerance`             → R2 (medium): bold OR isolated_in_leaf
-    /// - `|delta| ≤ tolerance`           → R3 (at body): bold AND isolated_in_leaf
+    /// - `delta > tolerance`             → R2 (medium): bold OR isolated_in_leaf OR bookmark_match
+    /// - `|delta| ≤ tolerance`           → R3 (at body): bold AND (isolated_in_leaf OR bookmark_match)
     ///
     /// R1 threshold is `body_size + structural_size_margin` by default
     /// (default 4pt — clearly above body); a `body_size * structural_size_ratio`
     /// override is honored when set, useful for documents with proportional
     /// type scales.
+    ///
+    /// CR-41: `bookmark_match` substitutes for `isolated_in_leaf` in R2/R3
+    /// when the PDF outline names this span as a section target. Required
+    /// at body-size R3 only as an alternative to isolation; bold is still
+    /// required. PDFs without a bookmark outline see no behavior change.
     ///
     /// Rotated elements are always rejected upfront (matches the Block 02
     /// statistical filter).
@@ -557,13 +583,15 @@ impl<'a> SectionDetectionV2Rule<'a> {
 
         let bold = Self::is_bold(element);
         let isolated = self.is_isolated_in_leaf(element_idx);
+        let bookmark_promoted = Self::has_bookmark_match(element);
 
         if delta > tolerance {
-            // R2 (medium): either signal alone suffices.
-            bold || isolated
+            // R2 (medium): bold, isolation, OR bookmark match (CR-41).
+            bold || isolated || bookmark_promoted
         } else {
-            // R3 (at-body band): both signals required.
-            bold && isolated
+            // R3 (at-body band): bold required; isolation OR bookmark
+            // match (CR-41) supplies the structural-atom signal.
+            bold && (isolated || bookmark_promoted)
         }
     }
 

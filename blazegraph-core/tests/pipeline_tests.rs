@@ -20,7 +20,9 @@ use blazegraph_io_core::preprocessors::pdf::xhtml_parser;
 use blazegraph_io_core::rules::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
 use blazegraph_io_core::rules::section_detection_v2::SectionDetectionV2Rule;
 use blazegraph_io_core::ParsedElementType;
-use blazegraph_io_core::{BoundingBox, FontClass, PdfTextElement, Placement, StyleData};
+use blazegraph_io_core::{
+    BookmarkSection, BoundingBox, FontClass, PdfTextElement, Placement, StyleData,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -1229,5 +1231,83 @@ fn v2_test8_hierarchy_levels_assigned_correctly() {
     assert_eq!(
         sections[3].hierarchy_level, 1,
         "Chapter Two (16pt) should step back to level 1"
+    );
+}
+
+// ── Test 9 (CR-41) ─────────────────────────────────────────────────────────
+/// Bookmark match substitutes for `isolated_in_leaf` at body-size R3.
+///
+/// Canonical case: a bold body-size heading sharing its Region tree leaf
+/// with the trailing body paragraph (rfc-quic page-30 shape). Without
+/// CR-41, R3's `bold AND isolated` rejects on isolation (multi-line leaf).
+/// With CR-41, the parser-supplied `bookmark_match` substitutes for the
+/// missing structural-atom signal and the heading classifies as Section.
+///
+/// The control assertion (no bookmark match → still rejected) confirms
+/// the gate is keyed on the bookmark substrate, not on something else.
+#[test]
+fn v2_test9_bookmark_match_substitutes_for_isolation_at_body_size() {
+    fn build(text_elements: Vec<PdfTextElement>) -> Vec<blazegraph_io_core::ParsedPdfElement> {
+        let font_analysis = make_font_analysis(10.0, &[("body", 5)]);
+        let config = make_v2_config(SectionDetectionV2Config::default());
+        let doc_analysis = make_doc_analysis();
+        let style_data = StyleData {
+            font_classes: BTreeMap::new(),
+        };
+        let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            &text_elements,
+            &config,
+            &doc_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        rule.apply(vec![]).expect("apply should succeed")
+    }
+
+    // Five spans in the same Region tree leaf (default region_label = "1"):
+    // line 0 = bold body-size heading; lines 1-4 = body text below it.
+    // Multi-line leaf → `isolated_in_leaf` returns false for line 0.
+    let make_layout = || {
+        vec![
+            make_v2_element(
+                "body",
+                "5.2.1.  Client Packet Handling",
+                10.0,
+                "bold",
+                0,
+                0,
+                10.0,
+                200.0,
+            ),
+            make_v2_element("body", "Valid packets sent to clients...", 10.0, "normal", 0, 1, 10.0, 400.0),
+            make_v2_element("body", "client selects. Clients...", 10.0, "normal", 0, 2, 10.0, 400.0),
+            make_v2_element("body", "and port to identify a connection...", 10.0, "normal", 0, 3, 10.0, 400.0),
+            make_v2_element("body", "discarded.", 10.0, "normal", 0, 4, 10.0, 100.0),
+        ]
+    };
+
+    // Control: no bookmark match → R3 rejects on isolation.
+    let result_control = build(make_layout());
+    assert_eq!(
+        result_control[0].element_type,
+        ParsedElementType::Paragraph,
+        "without bookmark match, bold body-size heading in multi-line leaf should NOT be a section (R3 isolation rejects)"
+    );
+
+    // CR-41: same shape with bookmark_match populated → R3 accepts via the
+    // bookmark disjunct, and the heading classifies as Section.
+    let mut layout = make_layout();
+    layout[0].bookmark_match = Some(BookmarkSection {
+        title: "5.2.1.  Client Packet Handling".to_string(),
+        order: 0,
+        level: 3,
+    });
+    let result_promoted = build(layout);
+    assert_eq!(
+        result_promoted[0].element_type,
+        ParsedElementType::Section,
+        "with bookmark_match=Some, bold body-size heading should be promoted to Section even when leaf has body neighbors"
     );
 }
