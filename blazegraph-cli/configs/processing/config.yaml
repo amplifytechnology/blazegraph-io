@@ -65,17 +65,25 @@ section_detection_v2:
   starting_section_level: 1
 
   # Inclusion patterns: promote a weak/rejected candidate to section when the regex
-  # matches AND the element is structurally isolated AND the text length is within
-  # `inclusion_max_length` (CR-26). Patterns require the keyword followed by an
-  # explicit identifier (number / Roman / letter) and an end-of-string anchor.
-  # This shape distinguishes real labels ("Article 64", "CHAPTER 4 – Other
-  # provisions") from body wrap-lines that begin with the keyword but continue
-  # with prose ("section 12(1) and Schedule 2", "article or offensive weapon.").
+  # matches AND the per-pattern structural gates pass AND the text length is within
+  # `inclusion_max_length`. Patterns require the keyword followed by an explicit
+  # identifier (number / Roman / letter) and an end-of-string anchor. This shape
+  # distinguishes real labels ("Article 64", "CHAPTER 4 – Other provisions") from
+  # body wrap-lines that begin with the keyword but continue with prose
+  # ("section 12(1) and Schedule 2", "article or offensive weapon.").
+  #
+  # CR-26: text length cap, isolation gate (always-required, pre-CR-42).
+  # CR-42: per-pattern `require_bold` / `require_isolation` gates. The Section
+  # pattern in particular ships with `require_bold: true` to filter out inline
+  # hyperlink spans (normal-weight `<span class="f4" style="color:#2222ee">
+  # Section 18</span>`) that occur in RFC-class documents. UK-Act-of-Parliament
+  # body labels like "Section 12" are reliably bold, so the gate is a no-op for
+  # the canonical Police-Act use case while closing the rfc-quic FP class.
   inclusion_patterns:
-    - "(?i)^chapter\\s+[IVXLCDM\\d]+([\\s\\.\\-–—:].*)?\\s*$"
-    - "(?i)^article\\s+\\d+[a-z]?\\s*$"
-    - "(?i)^section\\s+\\d+[a-z]?\\s*$"
-    - "(?i)^appendix\\s+[A-Z\\d]+\\s*$"
+    - { pattern: "(?i)^chapter\\s+[IVXLCDM\\d]+([\\s\\.\\-–—:].*)?\\s*$", require_bold: true, require_isolation: true }
+    - { pattern: "(?i)^article\\s+\\d+[a-z]?\\s*$",                       require_bold: true, require_isolation: true }
+    - { pattern: "(?i)^section\\s+\\d+[a-z]?\\s*$",                       require_bold: true, require_isolation: true }
+    - { pattern: "(?i)^appendix\\s+[A-Z\\d]+\\s*$",                       require_bold: true, require_isolation: true }
 
   # Maximum text length (characters) for an inclusion-pattern match to promote.
   # Defence in depth alongside the shape-anchored patterns above — caps any

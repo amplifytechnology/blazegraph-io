@@ -278,6 +278,17 @@ impl HierarchyContext {
 // Rule struct
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Compiled inclusion pattern with its per-pattern gate config. CR-42 —
+/// `require_bold` / `require_isolation` flags ride alongside the regex so
+/// `apply_pattern_refinement` can filter on a per-pattern basis (e.g., the
+/// Section pattern requires bold to reject inline hyperlink spans, while a
+/// hypothetical pattern targeting non-bold labels could opt out).
+struct CompiledInclusionPattern {
+    regex: Regex,
+    require_bold: bool,
+    require_isolation: bool,
+}
+
 pub struct SectionDetectionV2Rule<'a> {
     _engine: &'a RuleEngine,
     text_elements: &'a [PdfTextElement],
@@ -285,8 +296,9 @@ pub struct SectionDetectionV2Rule<'a> {
     _document_analysis: &'a DocumentAnalysis,
     font_size_analysis: &'a FontSizeAnalysis,
     _style_data: &'a StyleData,
-    /// Compiled inclusion regexes (promote weak/rejected candidates to sections)
-    inclusion_regexes: Vec<Regex>,
+    /// Compiled inclusion patterns (promote weak/rejected candidates to sections)
+    /// with per-pattern bold/isolation gates (CR-42).
+    inclusion_patterns: Vec<CompiledInclusionPattern>,
     /// Compiled exclusion regexes (demote promoted candidates)
     exclusion_regexes: Vec<Regex>,
     /// Compiled tiebreaker patterns paired with their keyword names. CR-27 —
@@ -306,10 +318,18 @@ impl<'a> SectionDetectionV2Rule<'a> {
     ) -> Self {
         let v2 = &config.section_detection_v2;
 
-        let inclusion_regexes = v2
+        let inclusion_patterns = v2
             .inclusion_patterns
             .iter()
-            .filter_map(|p| Regex::new(p).ok())
+            .filter_map(|ip| {
+                Regex::new(&ip.pattern)
+                    .ok()
+                    .map(|regex| CompiledInclusionPattern {
+                        regex,
+                        require_bold: ip.require_bold,
+                        require_isolation: ip.require_isolation,
+                    })
+            })
             .collect();
 
         let exclusion_regexes = v2
@@ -331,7 +351,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
             _document_analysis: document_analysis,
             font_size_analysis,
             _style_data: style_data,
-            inclusion_regexes,
+            inclusion_patterns,
             exclusion_regexes,
             tiebreaker_regexes,
         }
@@ -540,6 +560,14 @@ impl<'a> SectionDetectionV2Rule<'a> {
     /// at body-size R3 only as an alternative to isolation; bold is still
     /// required. PDFs without a bookmark outline see no behavior change.
     ///
+    /// CR-43: `bookmark_match` also bypasses `passes_alpha_ratio`. The PDF
+    /// outline is authoritative — when the author explicitly named this span
+    /// as a section target, the generic alpha-ratio safety filter (intended
+    /// to reject table data and number-heavy noise) loses authority. This
+    /// closes the rfc-quic short-numbered-title miss class
+    /// (`'10.1. Idle Timeout'`, `'19.2. PING Frames'`, …) where the
+    /// digit-and-dot prefix tanks the ratio below the configured threshold.
+    ///
     /// Rotated elements are always rejected upfront (matches the Block 02
     /// statistical filter).
     fn classify_pass1(&self, element_idx: usize) -> bool {
@@ -568,7 +596,9 @@ impl<'a> SectionDetectionV2Rule<'a> {
             return false;
         }
 
-        if !self.passes_alpha_ratio(&element.text) {
+        // CR-43 — bookmark_match overrides the alpha-ratio gate. The PDF outline
+        // is authoritative; the alpha-ratio filter is a heuristic safeguard.
+        if !Self::has_bookmark_match(element) && !self.passes_alpha_ratio(&element.text) {
             return false;
         }
 
@@ -601,19 +631,25 @@ impl<'a> SectionDetectionV2Rule<'a> {
 
     /// Apply exclusion patterns (demote) then inclusion patterns (promote).
     ///
-    /// Inclusion matches additionally require:
-    /// 1. `is_isolated(element_idx)` — element sits alone on its visual line (not a
-    ///    paragraph-internal reference like "as described in Article 5 of this
-    ///    Regulation").
-    /// 2. text length ≤ `inclusion_max_length` — synthetic length gate that filters
-    ///    body wrap-lines beginning with a structural keyword. Pass 1 protects body
-    ///    text via bold/rarity gates that depend on a meaningful font_size signal;
-    ///    on documents where Tika reports degenerate font sizes (CELEX/EU regulation
-    ///    embedded fonts), Pass 2 has neither bold nor size to lean on, so length
-    ///    is the discriminator: real labels are short, body wraps are long.
+    /// Inclusion matches additionally require, for each pattern:
+    /// 1. text length ≤ `inclusion_max_length` — global synthetic length gate
+    ///    that filters body wrap-lines beginning with a structural keyword.
+    ///    Pass 1 protects body text via bold/rarity gates that depend on a
+    ///    meaningful font_size signal; on documents where Tika reports
+    ///    degenerate font sizes (CELEX/EU regulation embedded fonts), Pass 2
+    ///    has neither bold nor size to lean on, so length is the discriminator
+    ///    — real labels are short, body wraps are long.
+    /// 2. `is_bold(element)` if the pattern declares `require_bold: true`
+    ///    (CR-42). Closes the rfc-quic FP class where inline hyperlink spans
+    ///    (`<span class="f4" style="color:#2222ee">Section 18</span>`)
+    ///    matched the `^section\s+\d+` pattern but should never have promoted.
+    /// 3. `is_isolated_in_leaf(element_idx)` if the pattern declares
+    ///    `require_isolation: true` — element sits alone on its visual line
+    ///    (not a paragraph-internal reference like "as described in Article 5
+    ///    of this Regulation").
     ///
-    /// Patterns ship as written in config; per-pattern case sensitivity is controlled
-    /// by `(?i)` in the YAML.
+    /// Patterns ship as written in config; per-pattern case sensitivity is
+    /// controlled by `(?i)` in the YAML.
     fn apply_pattern_refinement(
         &self,
         pass1_is_section: bool,
@@ -632,18 +668,26 @@ impl<'a> SectionDetectionV2Rule<'a> {
             }
         }
 
-        // Inclusion: promote only when text matches AND element is isolated AND
-        // text length is within the structural-label cap. Char count, not byte
-        // length — labels are ASCII in practice but we count chars to stay
-        // predictable for any future Latin/Roman/numeric variants.
+        // Inclusion: promote only when text matches AND the per-pattern gates
+        // pass AND text length is within the structural-label cap. Char count,
+        // not byte length — labels are ASCII in practice but we count chars to
+        // stay predictable for any future Latin/Roman/numeric variants.
         if !result {
             let max_len = self.config.section_detection_v2.inclusion_max_length;
             if text.chars().count() <= max_len {
-                for re in &self.inclusion_regexes {
-                    if re.is_match(text) && self.is_isolated_in_leaf(element_idx) {
-                        result = true;
-                        break;
+                let element = &self.text_elements[element_idx];
+                for rule in &self.inclusion_patterns {
+                    if !rule.regex.is_match(text) {
+                        continue;
                     }
+                    if rule.require_bold && !Self::is_bold(element) {
+                        continue;
+                    }
+                    if rule.require_isolation && !self.is_isolated_in_leaf(element_idx) {
+                        continue;
+                    }
+                    result = true;
+                    break;
                 }
             }
         }
@@ -866,7 +910,7 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
 mod tests {
     use super::*;
     use crate::analytics::DocumentAnalysis;
-    use crate::config::{ParsingConfig, SectionDetectionV2Config};
+    use crate::config::{InclusionPattern, ParsingConfig, SectionDetectionV2Config};
     use crate::rules::engine::FontSizeAnalysis;
     use crate::types::{BoundingBox, FontClass, PdfTextElement, Placement, StyleData};
     use std::collections::{BTreeMap, HashMap};
@@ -1190,6 +1234,66 @@ mod tests {
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
+    // ── CR-43 tests — bookmark_match bypasses alpha_ratio ─────────────────────
+
+    /// CR-43 — `bookmark_match` overrides the alpha-ratio safety filter.
+    ///
+    /// Text `'10.1. Idle Timeout'` is 18 chars / 11 alpha → ratio 0.611, which
+    /// fails `min_alpha_ratio = 0.7`. Pre-CR-43, `classify_pass1` rejects at
+    /// the alpha-ratio gate and CR-41's R3 disjunction never gets to fire.
+    /// With CR-43 the bookmark substrate bypasses the gate and R3
+    /// (`bold AND (isolated OR bookmark_match)`) admits it.
+    ///
+    /// Reproduces the rfc-quic page-57 miss class: short numbered titles like
+    /// `'10.1. Idle Timeout'`, `'19.2. PING Frames'`, `'17.2.4. Handshake
+    /// Packet'` whose digit-and-dot prefix tanks alpha ratio below 0.7.
+    #[test]
+    fn test_cr43_bookmark_match_bypasses_alpha_ratio() {
+        let body = 12.0;
+        let mut element = make_element(body, true, "body", 0);
+        element.text = "10.1. Idle Timeout".to_string();
+        element.bookmark_match = Some(BookmarkSection {
+            title: "10.1. Idle Timeout".to_string(),
+            order: 75,
+            level: 3,
+        });
+
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let mut config = make_config(0.1, 4.0, None);
+        // Mirror production threshold (config.yaml). Default in code is 0.5,
+        // which would not exercise the bypass.
+        config.section_detection_v2.min_alpha_ratio = 0.7;
+
+        // Sanity: alpha ratio is below the gate (test fixture invariant).
+        let alpha = "10.1. Idle Timeout".chars().filter(|c| c.is_alphabetic()).count();
+        let total = "10.1. Idle Timeout".chars().count();
+        assert!(
+            (alpha as f32) / (total as f32) < 0.7,
+            "fixture must fail alpha-ratio gate"
+        );
+
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-43 paired control — without `bookmark_match`, the alpha-ratio gate
+    /// still rejects. Confirms the bypass keys on the bookmark substrate, not
+    /// on something else (font size, bold, isolation).
+    #[test]
+    fn test_cr43_alpha_ratio_still_rejects_without_bookmark() {
+        let body = 12.0;
+        let mut element = make_element(body, true, "body", 0);
+        element.text = "10.1. Idle Timeout".to_string();
+        // bookmark_match: None (default from make_element)
+
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let mut config = make_config(0.1, 4.0, None);
+        config.section_detection_v2.min_alpha_ratio = 0.7;
+
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
     // ── CR-20 tests — bold detection font-family fallback ─────────────────────
 
     /// Helper: build a PdfTextElement with explicit font_weight and font_family strings.
@@ -1476,6 +1580,11 @@ mod tests {
 
     /// Build a configured rule with custom inclusion/exclusion pattern lists.
     /// All other config values match `make_config(1.0, 5.0, None)`.
+    ///
+    /// Inclusion patterns wrap with CR-26-era gates (isolation-only, no bold
+    /// requirement) so existing CR-26 tests using non-bold fixtures keep
+    /// passing. CR-42 tests that exercise per-pattern gates use
+    /// `build_pattern_rule_test_with_gates` instead.
     fn build_pattern_rule_test(
         elements: &[PdfTextElement],
         inclusion: Vec<&str>,
@@ -1487,9 +1596,32 @@ mod tests {
         StyleData,
         RuleEngine,
     ) {
+        let inclusion_patterns: Vec<InclusionPattern> = inclusion
+            .into_iter()
+            .map(|p| InclusionPattern {
+                pattern: p.to_string(),
+                require_bold: false,
+                require_isolation: true,
+            })
+            .collect();
+        build_pattern_rule_test_with_gates(elements, inclusion_patterns, exclusion)
+    }
+
+    /// CR-42 — variant that takes pre-built `InclusionPattern`s so per-pattern
+    /// `require_bold` / `require_isolation` gates can be exercised in tests.
+    fn build_pattern_rule_test_with_gates(
+        elements: &[PdfTextElement],
+        inclusion_patterns: Vec<InclusionPattern>,
+        exclusion: Vec<&str>,
+    ) -> (
+        ParsingConfig,
+        FontSizeAnalysis,
+        DocumentAnalysis,
+        StyleData,
+        RuleEngine,
+    ) {
         let mut config = make_config(1.0, 5.0, None);
-        config.section_detection_v2.inclusion_patterns =
-            inclusion.into_iter().map(String::from).collect();
+        config.section_detection_v2.inclusion_patterns = inclusion_patterns;
         config.section_detection_v2.exclusion_patterns =
             exclusion.into_iter().map(String::from).collect();
         let font_analysis = make_font_analysis(10.0, vec![("body", elements.len().max(1))]);
@@ -1597,6 +1729,92 @@ mod tests {
             build_pattern_rule_test(&elements, vec!["(?i)^article"], vec![]);
         let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
         assert!(rule.apply_pattern_refinement(false, 0, label));
+    }
+
+    // ── CR-42 tests — per-pattern bold/isolation gating ──────────────────────
+
+    /// CR-42 Test — `require_bold: true` rejects the inline-hyperlink-span FP.
+    ///
+    /// Reproduces the rfc-quic page-38 false positive: an inline hyperlink span
+    /// `<span class="f4" style="color:#2222ee">Section 18</span>` (normal weight)
+    /// matches the `^section\s+\d+` inclusion pattern, sits in its own tiny
+    /// XY-cut leaf (so `is_isolated_in_leaf` returns true), and has length 10
+    /// (well under `inclusion_max_length: 20`). Pre-CR-42 this promoted, then
+    /// same-line clustering joined the surrounding spans into a Section node.
+    /// With `require_bold: true` on the pattern, the gate rejects.
+    ///
+    /// Paired with the next test which confirms `require_bold: true` still
+    /// admits a real bold label of the same shape (e.g., a UK-Acts "Section 12").
+    #[test]
+    fn test_cr42_require_bold_rejects_hyperlink_span() {
+        // Normal-weight hyperlink span — matches pattern, is isolated, fails bold gate
+        let mut hyperlink = make_inclusion_element("Section 18", 200.0, 60.0);
+        hyperlink.style_info.color = "#2222ee".to_string();
+        let elements = vec![hyperlink];
+
+        let inclusion = vec![InclusionPattern {
+            pattern: r"(?i)^section\s+\d+[a-z]?\s*$".to_string(),
+            require_bold: true,
+            require_isolation: true,
+        }];
+
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test_with_gates(&elements, inclusion, vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(!rule.apply_pattern_refinement(false, 0, "Section 18"));
+    }
+
+    /// CR-42 Test (paired) — `require_bold: true` still admits a bold label.
+    ///
+    /// Same shape as the FP test but `font_weight: "bold"` — confirms the gate
+    /// doesn't accidentally reject real UK-Acts-of-Parliament bold "Section 12"
+    /// labels (the canonical use case for this pattern).
+    #[test]
+    fn test_cr42_require_bold_admits_bold_label() {
+        let mut label = make_inclusion_element("Section 12", 100.0, 60.0);
+        label.style_info.font_weight = "bold".to_string();
+        let elements = vec![label];
+
+        let inclusion = vec![InclusionPattern {
+            pattern: r"(?i)^section\s+\d+[a-z]?\s*$".to_string(),
+            require_bold: true,
+            require_isolation: true,
+        }];
+
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test_with_gates(&elements, inclusion, vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(rule.apply_pattern_refinement(false, 0, "Section 12"));
+    }
+
+    /// CR-42 Test — `require_isolation: false` admits a non-isolated label.
+    ///
+    /// Confirms per-pattern gates compose orthogonally: a pattern that opts out
+    /// of isolation can still promote a same-line-as-other-text label as long
+    /// as the bold gate (or any future gate) is satisfied. This is the
+    /// generality lever — the shape that lets future non-canonical-label
+    /// patterns ride on this infra without retrofitting code.
+    #[test]
+    fn test_cr42_require_isolation_false_admits_non_isolated() {
+        // Two same-Y bold elements in the same leaf — `is_isolated_in_leaf` returns
+        // false for either alone, so a `require_isolation: true` pattern would reject.
+        let mut anchor = make_inclusion_element("Article 5", 100.0, 80.0);
+        anchor.style_info.font_weight = "bold".to_string();
+        let mut neighbour = make_inclusion_element("of this Regulation", 200.0, 200.0);
+        neighbour.style_info.font_weight = "bold".to_string();
+        let elements = vec![anchor, neighbour];
+
+        let inclusion = vec![InclusionPattern {
+            pattern: r"(?i)^article\s+\d+[a-z]?\s*$".to_string(),
+            require_bold: true,
+            require_isolation: false,
+        }];
+
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test_with_gates(&elements, inclusion, vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        // is_isolated_in_leaf would be false here, but the pattern doesn't require it.
+        assert!(rule.apply_pattern_refinement(false, 0, "Article 5"));
     }
 
     // ── CR-27 tests — keyword tiebreaker hierarchy ───────────────────────────

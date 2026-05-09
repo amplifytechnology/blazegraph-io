@@ -1020,8 +1020,17 @@ fn v2_test5_numbered_subsection_pattern_promotes_weak() {
     // No same-line neighbors → isolated = true. But weak + (bold AND isolated) → bold is false.
     // weak + (isolated AND rare): count/total = 1/1 = 100% → not rare.
     // So Pass 1 would NOT classify as section. Pass 2 inclusion pattern "^\\d+\\.\\d+" matches → promote.
+    //
+    // CR-42: production defaults set `require_bold: true` on inclusion patterns to filter
+    // out inline hyperlink-span FPs. This test exercises the regex-only promotion path
+    // (no bold signal), so it explicitly opts out of the bold gate to keep the original
+    // pre-CR-42 semantics it was written to verify.
     let font_analysis = make_font_analysis(10.0, &[("body", 1)]);
-    let config = make_v2_config(SectionDetectionV2Config::default());
+    let mut v2_config = SectionDetectionV2Config::default();
+    for ip in &mut v2_config.inclusion_patterns {
+        ip.require_bold = false;
+    }
+    let config = make_v2_config(v2_config);
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
         font_classes: BTreeMap::new(),

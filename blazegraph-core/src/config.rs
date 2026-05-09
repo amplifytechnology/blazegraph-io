@@ -917,9 +917,11 @@ pub struct SectionDetectionV2Config {
 
     /// Regex patterns that promote a weak/rejected candidate to a section
     /// (escape hatch — e.g., "^\\d+\\.\\d+" for numbered subsections).
-    /// Promotion additionally requires `is_isolated()` and a length cap
-    /// (`inclusion_max_length`) — see CR-26.
-    pub inclusion_patterns: Vec<String>,
+    /// Promotion additionally requires the per-pattern structural gates
+    /// (`require_bold`, `require_isolation`) and a global length cap
+    /// (`inclusion_max_length`). See CR-26 (length cap, isolation) and
+    /// CR-42 (per-pattern bold/isolation gating).
+    pub inclusion_patterns: Vec<InclusionPattern>,
 
     /// Maximum text length (in characters) for an inclusion-pattern match to
     /// promote. Real structural labels ("Article 64", "CHAPTER II") are short;
@@ -950,6 +952,29 @@ pub struct SectionDetectionV2Config {
 pub struct TiebreakerKeyword {
     pub name: String,
     pub pattern: String,
+}
+
+/// Inclusion pattern with per-pattern structural gates (CR-42).
+///
+/// Each pattern declares whether `is_bold(element)` and/or
+/// `is_isolated_in_leaf(element_idx)` are required for promotion.
+///
+/// Both gates default to `true` — appropriate for the typical structural-label
+/// pattern (Chapter, Article, Section labels in regulations and acts), and the
+/// safe default for any new pattern added without thinking.
+///
+/// CR-42 was filed to close an rfc-quic FP where the `^section\s+\d+`
+/// inclusion pattern was firing on inline hyperlink spans (normal-weight
+/// `<span class="f4" style="color:#2222ee">Section 18</span>`). With
+/// `require_bold: true`, real bold UK-Acts-of-Parliament "Section 12" labels
+/// still promote; the hyperlink span does not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InclusionPattern {
+    pub pattern: String,
+    #[serde(default = "default_true")]
+    pub require_bold: bool,
+    #[serde(default = "default_true")]
+    pub require_isolation: bool,
 }
 
 // ─── CR-28 — Graph Sanity-Check-and-Correction Pipe ──────────────────────────
@@ -1011,10 +1036,26 @@ impl Default for SectionDetectionV2Config {
             enforce_max_depth: true,
             starting_section_level: 1,
             inclusion_patterns: vec![
-                r"^\d+\.".to_string(),    // "1.", "2.", ...
-                r"^\d+\.\d+".to_string(), // "1.1", "3.2", ...
-                r"^Chapter\s+\d+".to_string(),
-                r"^Appendix\s+[A-Z]".to_string(),
+                InclusionPattern {
+                    pattern: r"^\d+\.".to_string(), // "1.", "2.", ...
+                    require_bold: true,
+                    require_isolation: true,
+                },
+                InclusionPattern {
+                    pattern: r"^\d+\.\d+".to_string(), // "1.1", "3.2", ...
+                    require_bold: true,
+                    require_isolation: true,
+                },
+                InclusionPattern {
+                    pattern: r"^Chapter\s+\d+".to_string(),
+                    require_bold: true,
+                    require_isolation: true,
+                },
+                InclusionPattern {
+                    pattern: r"^Appendix\s+[A-Z]".to_string(),
+                    require_bold: true,
+                    require_isolation: true,
+                },
             ],
             inclusion_max_length: 30,
             exclusion_patterns: vec![r"^Figure\s".to_string(), r"^Table\s".to_string()],
