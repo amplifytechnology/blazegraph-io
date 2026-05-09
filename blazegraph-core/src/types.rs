@@ -510,7 +510,9 @@ impl DocumentMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleData {
-    pub font_classes: std::collections::HashMap<String, FontClass>,
+    /// Sorted by key (font class name) so JSON serialization is deterministic.
+    /// Required for content-addressed cache stability — see CR-40.
+    pub font_classes: std::collections::BTreeMap<String, FontClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

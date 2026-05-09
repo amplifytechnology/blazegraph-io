@@ -841,7 +841,7 @@ mod tests {
     use crate::config::{ParsingConfig, SectionDetectionV2Config};
     use crate::rules::engine::FontSizeAnalysis;
     use crate::types::{BoundingBox, FontClass, PdfTextElement, Placement, StyleData};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -960,7 +960,7 @@ mod tests {
 
     fn make_style_data() -> StyleData {
         StyleData {
-            font_classes: HashMap::new(),
+            font_classes: BTreeMap::new(),
         }
     }
 

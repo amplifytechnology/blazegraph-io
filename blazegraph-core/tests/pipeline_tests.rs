@@ -22,7 +22,7 @@ use blazegraph_io_core::rules::section_detection_v2::SectionDetectionV2Rule;
 use blazegraph_io_core::ParsedElementType;
 use blazegraph_io_core::{BoundingBox, FontClass, PdfTextElement, Placement, StyleData};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 // ============================================================================
@@ -620,7 +620,7 @@ fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextEleme
 
 /// Build a minimal StyleData with the given (class_name, font_size) pairs.
 fn make_style_data(classes: &[(&str, f32)]) -> StyleData {
-    let mut font_classes = HashMap::new();
+    let mut font_classes = BTreeMap::new();
     for (class_name, font_size) in classes {
         font_classes.insert(
             class_name.to_string(),
@@ -799,7 +799,7 @@ fn v2_test1_dispatched_and_detects_section() {
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
@@ -853,7 +853,7 @@ fn v2_test2_size_only_strong_candidate_is_section() {
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
@@ -912,7 +912,7 @@ fn v2_test3_bold_inline_emphasis_is_not_section() {
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
@@ -975,7 +975,7 @@ fn v2_test4_bold_isolated_at_body_size_is_section() {
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
@@ -1022,7 +1022,7 @@ fn v2_test5_numbered_subsection_pattern_promotes_weak() {
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
@@ -1065,7 +1065,7 @@ fn v2_test6_figure_caption_is_demoted() {
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
@@ -1112,7 +1112,7 @@ fn v2_test7_rotated_element_is_never_section() {
     let config = make_v2_config(SectionDetectionV2Config::default());
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
@@ -1194,7 +1194,7 @@ fn v2_test8_hierarchy_levels_assigned_correctly() {
     });
     let doc_analysis = make_doc_analysis();
     let style_data = StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     };
     let engine = RuleEngine::new().expect("RuleEngine::new should succeed");
 
