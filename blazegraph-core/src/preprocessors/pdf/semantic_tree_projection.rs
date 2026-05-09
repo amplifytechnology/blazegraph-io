@@ -29,13 +29,10 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
         .map(|(index, parsed)| {
             let element_type = project_element_type(&parsed.element_type);
             let hierarchy_level = normalize_hierarchy_level(element_type, parsed.hierarchy_level);
-            let physical_location = parsed
-                .placement
-                .as_ref()
-                .map(|p| PhysicalLocation {
-                    page: p.page_number,
-                    bounding_box: p.bounding_box.clone(),
-                });
+            let physical_location = parsed.placement.as_ref().map(|p| PhysicalLocation {
+                page: p.page_number,
+                bounding_box: p.bounding_box.clone(),
+            });
             let style = Some(project_style(&parsed));
 
             SemanticTreeElement {
@@ -289,7 +286,10 @@ mod tests {
             .style
             .as_ref()
             .expect("style should be Some — FontClass always projects best-effort");
-        assert!(style.is_bold, "Bold (capital) should match case-insensitive");
+        assert!(
+            style.is_bold,
+            "Bold (capital) should match case-insensitive"
+        );
         assert!(
             style.is_italic,
             "Italic (capital) should match case-insensitive",

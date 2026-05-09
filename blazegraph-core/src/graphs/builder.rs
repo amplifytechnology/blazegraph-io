@@ -70,11 +70,9 @@ impl GraphBuilder {
             // `text_order = vec_index`. Drift here would mean a
             // post-projection reorder snuck in.
             debug_assert_eq!(
-                element.text_order as usize,
-                index,
+                element.text_order as usize, index,
                 "text_order/vec-position drift: element[{}].text_order = {}",
-                index,
-                element.text_order
+                index, element.text_order
             );
             let node_id = id_gen.node_id(element.text_order);
 
