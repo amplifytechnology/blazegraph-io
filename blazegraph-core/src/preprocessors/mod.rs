@@ -23,12 +23,12 @@
 //! - (Future) `MarkdownPreprocessor` - Markdown files
 //! - (Future) `DocxPreprocessor` - Word documents
 
-pub mod traits;
 pub mod pdf;
+pub mod traits;
 
 // Re-export main types
+pub use pdf::{PdfBackend, PdfBackendImpl, PdfPreprocessor};
 pub use traits::Preprocessor;
-pub use pdf::{PdfPreprocessor, PdfBackend, PdfBackendImpl};
 
 // Re-export backends
 #[cfg(feature = "jni-backend")]

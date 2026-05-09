@@ -1,23 +1,56 @@
-/// Block 03 — Section Detection V2
+/// Section Detection V2 — V3 algorithm (Block 09) + CR-41 bookmark substrate.
 ///
-/// A candidate-then-refine pipeline that composes four signals (size, bold, isolation,
-/// font rarity) into a decision tree, with regex patterns as an escape hatch.
+/// Three-tier piecewise classifier on `delta = font_size - body_size`:
 ///
-/// Key improvements over V1 (`SectionAndHierarchyDetectionRule`):
-/// - Segment-based isolation: uses `(band, column, line_number)` grouping to distinguish
-///   bold section headers from inline bold emphasis inside paragraphs.
-/// - Font rarity: uses `FontSizeAnalysis.class_usage_counts` to detect structurally
-///   uncommon fonts, even at body size.
-/// - Composable signals: a missing signal on one axis can be confirmed by another.
-/// - Regex escape hatches: numbered subsections promoted, figure captions demoted.
-/// - Rotated elements are always classified as non-section (belt-and-suspenders on top
-///   of Block 02's statistical filter).
+/// - `delta > structural_size_margin` → ACCEPT (R1: clearly larger than body)
+/// - `delta > tolerance`              → bold OR isolated_in_leaf OR bookmark_match (R2: medium)
+/// - `|delta| ≤ tolerance`            → bold AND (isolated_in_leaf OR bookmark_match) (R3: at body)
+/// - `delta < -tolerance`             → REJECT (below-body noise)
+///
+/// Pre-gates (rotation rejection + alpha-ratio gate) run before the size
+/// classification. Pattern-refinement (`apply_pattern_refinement`) applies
+/// exclusion regex demotion + inclusion regex promotion (Article N / CHAPTER N
+/// / etc.) as a backup for the size-based pipeline, including for
+/// degenerate-font documents where Tika reports body_size = 1pt (CELEX).
+///
+/// Isolation is leaf-based — `is_isolated_in_leaf` consults the
+/// `Placement.region_label` set by `analytics::reading_order::tag_and_resort`
+/// (Block 06b). An element is *isolated* when no same-Y neighbor inside its
+/// Region tree leaf has a different bold-ness. This catches the canonical
+/// false positive (bold emphasis word inside a non-bold body line) at
+/// near-zero cost: the leaf substrate is precomputed once per document.
+///
+/// **Bookmark substrate (CR-41).** The XHTML parser populates
+/// `PdfTextElement.bookmark_match` when a span's normalized text exactly
+/// equals a PDF outline title. This is an author-declared structural
+/// signal that substitutes for `isolated_in_leaf` in R2/R3 when geometry
+/// can't see the structure (e.g., a bold body-size heading sharing its
+/// leaf with the trailing paragraph). TOC entries naturally do not match
+/// because Tika fragments them across multiple spans; only the monolithic
+/// body heading hits. PDFs without an outline see no behavior change
+/// (`bookmark_match` is `None` everywhere).
+///
+/// V3 deltas vs the prior pipeline (locked 2026-05-07):
+/// - Replaced X-cluster `is_isolated` (per-element O(n) page walk) with
+///   `is_isolated_in_leaf` (per-element O(leaf_size) walk). The X-cluster
+///   logic was a stand-in that pre-dated `region_label`.
+/// - R2 relaxed from `bold AND isolated` to `bold OR isolated` — leaf-based
+///   isolation is reliable enough that either signal alone suffices on
+///   medium-tier candidates. This catches Computer-Modern / italic /
+///   non-bold section titles that V2's AND missed.
+/// - R1 threshold raised from `body + 1.5pt` to `body + 4pt` — at smaller
+///   deltas the size signal is weaker and the auxiliary-signal requirement
+///   in R2 keeps body-emphasis-at-slightly-larger-font from auto-promoting.
+/// - Rarity gate dropped — was already dead in production
+///   (`font_rarity_threshold: 0.00` made `is_rare_font` always false). The
+///   V3 algorithm doesn't need it; isolation+bold cover the "structurally
+///   distinctive" notion with cleaner semantics.
 use super::engine::{FontSizeAnalysis, ParseRule, RuleEngine};
+use crate::analytics::DocumentAnalysis;
 use crate::config::{ParsingConfig, SectionDetectionV2Config};
 use crate::types::*;
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashMap;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HierarchyContext (CR-27: stack-based with keyword tiebreaker)
@@ -74,7 +107,7 @@ impl HierarchyContext {
         let prev = self.previous_section_font_size;
         self.previous_section_font_size = Some(font_size);
 
-        let depth = match prev {
+        match prev {
             None => {
                 let d = config.starting_section_level;
                 self.stack.push(HierarchyAnchor {
@@ -106,8 +139,7 @@ impl HierarchyContext {
                     self.resolve_tie(keyword, font_size, config)
                 }
             }
-        };
-        depth
+        }
     }
 
     /// Resolve a section transition where font-delta is within tolerance.
@@ -130,15 +162,12 @@ impl HierarchyContext {
         // the None anchor is transient and should be popped before resolution.
         if keyword.is_some()
             && self.stack.len() >= 2
-            && self.stack.last().map_or(false, |a| a.keyword.is_none())
+            && self.stack.last().is_some_and(|a| a.keyword.is_none())
         {
             self.stack.pop();
         }
 
-        let top_keyword = self
-            .stack
-            .last()
-            .and_then(|a| a.keyword.as_deref());
+        let top_keyword = self.stack.last().and_then(|a| a.keyword.as_deref());
 
         // Same keyword as effective top → sibling. Replace top's font_size so
         // future deltas measure against the most recent section.
@@ -249,6 +278,17 @@ impl HierarchyContext {
 // Rule struct
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Compiled inclusion pattern with its per-pattern gate config. CR-42 —
+/// `require_bold` / `require_isolation` flags ride alongside the regex so
+/// `apply_pattern_refinement` can filter on a per-pattern basis (e.g., the
+/// Section pattern requires bold to reject inline hyperlink spans, while a
+/// hypothetical pattern targeting non-bold labels could opt out).
+struct CompiledInclusionPattern {
+    regex: Regex,
+    require_bold: bool,
+    require_isolation: bool,
+}
+
 pub struct SectionDetectionV2Rule<'a> {
     _engine: &'a RuleEngine,
     text_elements: &'a [PdfTextElement],
@@ -256,18 +296,15 @@ pub struct SectionDetectionV2Rule<'a> {
     _document_analysis: &'a DocumentAnalysis,
     font_size_analysis: &'a FontSizeAnalysis,
     _style_data: &'a StyleData,
-    /// Compiled inclusion regexes (promote weak/rejected candidates to sections)
-    inclusion_regexes: Vec<Regex>,
+    /// Compiled inclusion patterns (promote weak/rejected candidates to sections)
+    /// with per-pattern bold/isolation gates (CR-42).
+    inclusion_patterns: Vec<CompiledInclusionPattern>,
     /// Compiled exclusion regexes (demote promoted candidates)
     exclusion_regexes: Vec<Regex>,
     /// Compiled tiebreaker patterns paired with their keyword names. CR-27 —
     /// consulted by `HierarchyContext` to resolve depth when font-delta is
     /// within tolerance.
     tiebreaker_regexes: Vec<(String, Regex)>,
-    /// Per `(page, band)` x-extent: `(min_x, max_right)` aggregated across all elements
-    /// in that band. Used to derive a stable column width for ratio-based isolation,
-    /// independent of whether the column under inspection has body neighbors.
-    band_extents: HashMap<(u32, u32), (f32, f32)>,
 }
 
 impl<'a> SectionDetectionV2Rule<'a> {
@@ -281,10 +318,18 @@ impl<'a> SectionDetectionV2Rule<'a> {
     ) -> Self {
         let v2 = &config.section_detection_v2;
 
-        let inclusion_regexes = v2
+        let inclusion_patterns = v2
             .inclusion_patterns
             .iter()
-            .filter_map(|p| Regex::new(p).ok())
+            .filter_map(|ip| {
+                Regex::new(&ip.pattern)
+                    .ok()
+                    .map(|regex| CompiledInclusionPattern {
+                        regex,
+                        require_bold: ip.require_bold,
+                        require_isolation: ip.require_isolation,
+                    })
+            })
             .collect();
 
         let exclusion_regexes = v2
@@ -296,23 +341,8 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let tiebreaker_regexes = v2
             .tiebreaker_keywords
             .iter()
-            .filter_map(|tk| {
-                Regex::new(&tk.pattern)
-                    .ok()
-                    .map(|re| (tk.name.clone(), re))
-            })
+            .filter_map(|tk| Regex::new(&tk.pattern).ok().map(|re| (tk.name.clone(), re)))
             .collect();
-
-        let mut band_extents: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
-        for e in text_elements {
-            let key = (e.page_number(), e.band());
-            let bbox = e.bounding_box();
-            let entry = band_extents
-                .entry(key)
-                .or_insert((f32::INFINITY, f32::NEG_INFINITY));
-            entry.0 = entry.0.min(bbox.x);
-            entry.1 = entry.1.max(bbox.x + bbox.width);
-        }
 
         Self {
             _engine: engine,
@@ -321,10 +351,9 @@ impl<'a> SectionDetectionV2Rule<'a> {
             _document_analysis: document_analysis,
             font_size_analysis,
             _style_data: style_data,
-            inclusion_regexes,
+            inclusion_patterns,
             exclusion_regexes,
             tiebreaker_regexes,
-            band_extents,
         }
     }
 
@@ -369,110 +398,143 @@ impl<'a> SectionDetectionV2Rule<'a> {
             return true;
         }
         let family = element.style_info.font_family.to_lowercase();
-        family.contains("bold")
-            || family.contains("medi")
-            || family.contains("bx")
+        family.contains("bold") || family.contains("medi") || family.contains("bx")
     }
 
-    /// Determine isolation as a single geometric question:
-    /// **does the visual line this element sits on fill its column?**
+    /// CR-41: Whether the XHTML parser matched this span's normalized text
+    /// exactly against a PDF outline (bookmark) title. Acts as an alternative
+    /// to the geometric `isolated_in_leaf` signal in R2/R3 — when the PDF
+    /// author has explicitly named this span as a section target, the
+    /// structural-atom signal can come from the outline rather than from
+    /// the leaf's Y-line count. PDFs without a `BookmarkData` payload yield
+    /// `false` for every element by construction.
+    fn has_bookmark_match(element: &PdfTextElement) -> bool {
+        element.bookmark_match.is_some()
+    }
+
+    /// Leaf-based isolation. Two gates compose the predicate:
     ///
-    /// "Visual line" = all elements in the same `(page, band, column)` whose Y-coordinate
-    /// is within `line_height_tolerance` of `element.bounding_box.y`. Y is ground truth;
-    /// Tika's `data-line` counter is unreliable (resets per `<p>`, so a header and the
-    /// next paragraph's first body line collide on `line=0` even though they're at
-    /// different visual Y).
+    /// 1. **Same-line bold-mismatch** — any same-Y same-(page, leaf)
+    ///    neighbor with different bold-ness disqualifies the candidate.
+    ///    Catches bold-in-paragraph and symmetric anchor-with-continuation
+    ///    cases. Already applied as a hard reject at the top of
+    ///    `classify_pass1`; redundant here for defense-in-depth and for
+    ///    direct callers (pattern-refinement, tests).
     ///
-    /// An element alone on its visual line → isolated (no other content sharing the
-    /// baseline). Otherwise compute the union extent of all bboxes on this line and
-    /// compare to `column_width = band_x_extent / nr_band_columns`. A short line in a
-    /// wide column is isolated; a line that fills the column is not (mid-line bold
-    /// emphasis, justified body, or Tika overlay-style spans for inline styling).
-    fn is_isolated(&self, element_idx: usize) -> bool {
+    /// 2. **Multi-line-leaf rejection** — if the (page, leaf) contains
+    ///    ≥ 2 distinct Y-lines (regardless of fontsize), the leaf is a
+    ///    flowing multi-line content block (body paragraph, abstract,
+    ///    table caption, references entry) and the candidate is part of
+    ///    the flow. Genuinely multi-line section titles still classify
+    ///    via R1 (large-delta auto-promote) or R2's bold disjunct.
+    ///
+    /// The single-Y-line constraint is the structural-atom signature: a
+    /// leaf produced by XY-cut that contains exactly one visual line is
+    /// a header / caption / standalone label. Inline cross-references
+    /// like "Section 6 of [QUIC-RECOVERY]" sit in multi-line body
+    /// leaves and are correctly rejected — the inclusion-pattern path
+    /// (which only ever runs on body-tier candidates) shares this gate.
+    ///
+    /// The leaf substrate (`Placement.region_label`) is set by
+    /// `analytics::reading_order::tag_and_resort` (Block 06b). Elements
+    /// with `region_label = None` don't reach this code in production —
+    /// they are pre-classified as `Margin` at the `PdfTextElement →
+    /// ParsedPdfElement` boundary (Block 07) and the `classify` early-
+    /// return guard skips them. Defensive return: `false` for missing labels.
+    fn is_isolated_in_leaf(&self, element_idx: usize) -> bool {
         let element = &self.text_elements[element_idx];
-        let cfg = &self.config.section_detection_v2;
+        let Some(label) = element.placement.region_label.as_deref() else {
+            return false;
+        };
 
-        let page = element.page_number();
-        let band = element.band();
-        let col = element.column();
+        let elem_page = element.page_number();
         let y = element.bounding_box().y;
-        let tol = cfg.line_height_tolerance;
+        let tol = self.config.section_detection_v2.line_height_tolerance;
+        let elem_bold = Self::is_bold(element);
 
-        let mut min_x = element.bounding_box().x;
-        let mut max_right = element.bounding_box().x + element.bounding_box().width;
-        let mut had_line_neighbor = false;
+        // Distinct Y-lines anywhere in the (page, leaf). Multi-line means
+        // ≥ 2 → reject (the candidate is in flowing content, not a
+        // structural one-line atom).
+        let mut distinct_y_lines: Vec<f32> = Vec::new();
+
+        for (idx, n) in self.text_elements.iter().enumerate() {
+            // Region labels reset per page (XY-cut runs per page); filter
+            // by `(page_number, region_label)` to avoid cross-page leaf
+            // contamination — leaf "4-1" on page 3 is structurally
+            // distinct from leaf "4-1" on page 5.
+            if n.page_number() != elem_page || n.placement.region_label.as_deref() != Some(label) {
+                continue;
+            }
+
+            let ny = n.bounding_box().y;
+
+            // Same-Y same-leaf neighbor with different bold-ness → bold-in-
+            // paragraph (bold word inside body, or non-bold continuation
+            // next to a bold anchor). Already filtered as a hard reject in
+            // `classify_pass1::has_same_y_bold_mismatch`; redundant here as
+            // defense-in-depth so the predicate also holds when called
+            // directly (pattern-refinement path, tests).
+            if idx != element_idx && (ny - y).abs() < tol && Self::is_bold(n) != elem_bold {
+                return false;
+            }
+
+            // Multi-line-leaf bookkeeping. Both strict and lax modes count
+            // distinct Y-lines anywhere in the (page, leaf): a leaf with
+            // ≥ 2 distinct Y-lines is a flowing content block. The
+            // pattern-inclusion path (lax) needs this gate too — without
+            // it, inline cross-references like "Section 6 of [...]"
+            // matching `(?i)^section\s+\d+` get admitted simply because
+            // their body neighbors don't have a different bold-ness, which
+            // then mis-promotes the line via post-pass merge.
+            if !distinct_y_lines.iter().any(|&yy| (yy - ny).abs() < tol) {
+                distinct_y_lines.push(ny);
+                if distinct_y_lines.len() >= 2 {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Hard-reject gate for bold-in-paragraph cases. Returns `true` when any
+    /// same-Y same-(page, leaf) neighbor of the candidate has a different
+    /// bold-ness. Catches:
+    ///
+    /// - **Bold word inside non-bold body line** (canonical false positive
+    ///   in `**Then** under the section…` shape).
+    /// - **Non-bold body next to a bold anchor** (the symmetric case where
+    ///   the body fragment is the non-bold neighbor of a bold "Article 5"
+    ///   structural anchor).
+    ///
+    /// Lifted out of `is_isolated_in_leaf` so it acts as a hard reject in
+    /// `classify_pass1` *before* the size/bold/isolation tier logic. Without
+    /// this lift, R2's `bold OR isolated` admits bold lead-ins like
+    /// "Encoder:" via the bold disjunct even when isolation correctly
+    /// returns false.
+    fn has_same_y_bold_mismatch(&self, element_idx: usize) -> bool {
+        let element = &self.text_elements[element_idx];
+        let Some(label) = element.placement.region_label.as_deref() else {
+            return false;
+        };
+
+        let elem_page = element.page_number();
+        let y = element.bounding_box().y;
+        let tol = self.config.section_detection_v2.line_height_tolerance;
+        let elem_bold = Self::is_bold(element);
+
         for (idx, n) in self.text_elements.iter().enumerate() {
             if idx == element_idx
-                || n.page_number() != page
-                || n.band() != band
-                || n.column() != col
-                || (n.bounding_box().y - y).abs() >= tol
+                || n.page_number() != elem_page
+                || n.placement.region_label.as_deref() != Some(label)
             {
                 continue;
             }
-            had_line_neighbor = true;
-            let n_left = n.bounding_box().x;
-            let n_right = n.bounding_box().x + n.bounding_box().width;
-            if n_left < min_x {
-                min_x = n_left;
-            }
-            if n_right > max_right {
-                max_right = n_right;
+            if (n.bounding_box().y - y).abs() < tol && Self::is_bold(n) != elem_bold {
+                return true;
             }
         }
-
-        if !had_line_neighbor {
-            return true;
-        }
-
-        let line_extent = max_right - min_x;
-        let column_width = self.column_width_for(page, band, element.placement.nr_band_columns);
-        if column_width <= 0.0 {
-            return false;
-        }
-        line_extent / column_width < cfg.isolation_threshold
-    }
-
-    /// Column width derived from band x-extent divided by `nr_band_columns`.
-    ///
-    /// Uses band extent (not per-column extent) so that a column containing only the
-    /// header still gets a meaningful denominator from sibling columns' content.
-    fn column_width_for(&self, page: u32, band: u32, nr_band_columns: u32) -> f32 {
-        let Some(&(min_x, max_right)) = self.band_extents.get(&(page, band)) else {
-            return 0.0;
-        };
-        let band_width = max_right - min_x;
-        if band_width <= 0.0 {
-            return 0.0;
-        }
-        let nr_cols = nr_band_columns.max(1) as f32;
-        (band_width / nr_cols).max(1.0)
-    }
-
-    /// Check whether the element's font class is rare in the document.
-    fn is_rare_font(&self, element: &PdfTextElement) -> bool {
-        let cfg = &self.config.section_detection_v2;
-        let class_name = &element.style_info.class_name;
-
-        // Total non-rotated element count = sum of all class_usage_counts values
-        let total: usize = self
-            .font_size_analysis
-            .class_usage_counts
-            .values()
-            .sum();
-
-        if total == 0 {
-            return false;
-        }
-
-        let count = self
-            .font_size_analysis
-            .class_usage_counts
-            .get(class_name)
-            .copied()
-            .unwrap_or(0);
-
-        (count as f32 / total as f32) < cfg.font_rarity_threshold
+        false
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -481,24 +543,46 @@ impl<'a> SectionDetectionV2Rule<'a> {
 
     /// Core classification: returns `true` if the element should be a section after Pass 1.
     ///
-    /// Four-region piecewise decision based on `delta = font_size - body_size`:
+    /// Three-tier piecewise decision on `delta = font_size - body_size`:
     ///
-    /// - `delta < -tolerance`               → REJECT (below-body noise)
-    /// - `|delta| ≤ tolerance`              → Region 3 (at-body band):
-    ///                                         promote if isolated AND (bold OR rare)
-    /// - `tolerance < delta ≤ margin`       → Region 2 (moderate):
-    ///                                         promote if bold OR isolated
-    /// - `delta > margin`                   → Region 1 (large): auto-promote unconditionally
+    /// - `delta < -tolerance`            → REJECT (below-body noise)
+    /// - `delta > structural_size_margin` → ACCEPT (R1: clearly larger than body)
+    /// - `delta > tolerance`             → R2 (medium): bold OR isolated_in_leaf OR bookmark_match
+    /// - `|delta| ≤ tolerance`           → R3 (at body): bold AND (isolated_in_leaf OR bookmark_match)
     ///
-    /// Region 1 threshold is `body_size + structural_size_margin` by default,
-    /// or `body_size * structural_size_ratio` when a ratio is configured.
+    /// R1 threshold is `body_size + structural_size_margin` by default
+    /// (default 4pt — clearly above body); a `body_size * structural_size_ratio`
+    /// override is honored when set, useful for documents with proportional
+    /// type scales.
     ///
-    /// Rotated elements are always rejected (§8).
+    /// CR-41: `bookmark_match` substitutes for `isolated_in_leaf` in R2/R3
+    /// when the PDF outline names this span as a section target. Required
+    /// at body-size R3 only as an alternative to isolation; bold is still
+    /// required. PDFs without a bookmark outline see no behavior change.
+    ///
+    /// CR-43: `bookmark_match` also bypasses `passes_alpha_ratio`. The PDF
+    /// outline is authoritative — when the author explicitly named this span
+    /// as a section target, the generic alpha-ratio safety filter (intended
+    /// to reject table data and number-heavy noise) loses authority. This
+    /// closes the rfc-quic short-numbered-title miss class
+    /// (`'10.1. Idle Timeout'`, `'19.2. PING Frames'`, …) where the
+    /// digit-and-dot prefix tanks the ratio below the configured threshold.
+    ///
+    /// Rotated elements are always rejected upfront (matches the Block 02
+    /// statistical filter).
     fn classify_pass1(&self, element_idx: usize) -> bool {
         let element = &self.text_elements[element_idx];
 
-        // §8: Rotated elements are never sections
         if element.rotation() != 0 {
+            return false;
+        }
+
+        // Hard reject: bold-in-paragraph case. A bold candidate sharing its
+        // Y-line in its (page, leaf) with a non-bold neighbor (or vice
+        // versa) is body emphasis, not a structural element. Lifted above
+        // the size/bold/isolation logic so it overrides R2's `bold OR
+        // isolated` disjunct.
+        if self.has_same_y_bold_mismatch(element_idx) {
             return false;
         }
 
@@ -508,39 +592,36 @@ impl<'a> SectionDetectionV2Rule<'a> {
         let tolerance = cfg.font_size_tolerance;
         let delta = font_size - body_size;
 
-        // REJECT: below body − tolerance
         if delta < -tolerance {
             return false;
         }
 
-        // Alpha ratio gate
-        if !self.passes_alpha_ratio(&element.text) {
+        // CR-43 — bookmark_match overrides the alpha-ratio gate. The PDF outline
+        // is authoritative; the alpha-ratio filter is a heuristic safeguard.
+        if !Self::has_bookmark_match(element) && !self.passes_alpha_ratio(&element.text) {
             return false;
         }
 
-        // Region 1 threshold: body + margin (or body * ratio when configured)
         let region1_threshold = match cfg.structural_size_ratio {
             Some(ratio) => body_size * ratio,
             None => body_size + cfg.structural_size_margin,
         };
 
-        // Region 1: size alone is authoritative — auto-promote
         if font_size > region1_threshold {
             return true;
         }
 
         let bold = Self::is_bold(element);
-        let isolated = self.is_isolated(element_idx);
-        let rare = self.is_rare_font(element);
+        let isolated = self.is_isolated_in_leaf(element_idx);
+        let bookmark_promoted = Self::has_bookmark_match(element);
 
         if delta > tolerance {
-            // Region 2 (moderate): both signals required — bold-only or isolated-only is
-            // insufficient; non-bold body text that happens to be column-isolated must not promote.
-            bold && isolated
+            // R2 (medium): bold, isolation, OR bookmark match (CR-41).
+            bold || isolated || bookmark_promoted
         } else {
-            // Region 3 (at-body band): |delta| ≤ tolerance
-            // Needs isolation AND at least one font-distinctive signal
-            isolated && (bold || rare)
+            // R3 (at-body band): bold required; isolation OR bookmark
+            // match (CR-41) supplies the structural-atom signal.
+            bold && (isolated || bookmark_promoted)
         }
     }
 
@@ -550,19 +631,25 @@ impl<'a> SectionDetectionV2Rule<'a> {
 
     /// Apply exclusion patterns (demote) then inclusion patterns (promote).
     ///
-    /// Inclusion matches additionally require:
-    /// 1. `is_isolated(element_idx)` — element sits alone on its visual line (not a
-    ///    paragraph-internal reference like "as described in Article 5 of this
-    ///    Regulation").
-    /// 2. text length ≤ `inclusion_max_length` — synthetic length gate that filters
-    ///    body wrap-lines beginning with a structural keyword. Pass 1 protects body
-    ///    text via bold/rarity gates that depend on a meaningful font_size signal;
-    ///    on documents where Tika reports degenerate font sizes (CELEX/EU regulation
-    ///    embedded fonts), Pass 2 has neither bold nor size to lean on, so length
-    ///    is the discriminator: real labels are short, body wraps are long.
+    /// Inclusion matches additionally require, for each pattern:
+    /// 1. text length ≤ `inclusion_max_length` — global synthetic length gate
+    ///    that filters body wrap-lines beginning with a structural keyword.
+    ///    Pass 1 protects body text via bold/rarity gates that depend on a
+    ///    meaningful font_size signal; on documents where Tika reports
+    ///    degenerate font sizes (CELEX/EU regulation embedded fonts), Pass 2
+    ///    has neither bold nor size to lean on, so length is the discriminator
+    ///    — real labels are short, body wraps are long.
+    /// 2. `is_bold(element)` if the pattern declares `require_bold: true`
+    ///    (CR-42). Closes the rfc-quic FP class where inline hyperlink spans
+    ///    (`<span class="f4" style="color:#2222ee">Section 18</span>`)
+    ///    matched the `^section\s+\d+` pattern but should never have promoted.
+    /// 3. `is_isolated_in_leaf(element_idx)` if the pattern declares
+    ///    `require_isolation: true` — element sits alone on its visual line
+    ///    (not a paragraph-internal reference like "as described in Article 5
+    ///    of this Regulation").
     ///
-    /// Patterns ship as written in config; per-pattern case sensitivity is controlled
-    /// by `(?i)` in the YAML.
+    /// Patterns ship as written in config; per-pattern case sensitivity is
+    /// controlled by `(?i)` in the YAML.
     fn apply_pattern_refinement(
         &self,
         pass1_is_section: bool,
@@ -581,18 +668,26 @@ impl<'a> SectionDetectionV2Rule<'a> {
             }
         }
 
-        // Inclusion: promote only when text matches AND element is isolated AND
-        // text length is within the structural-label cap. Char count, not byte
-        // length — labels are ASCII in practice but we count chars to stay
-        // predictable for any future Latin/Roman/numeric variants.
+        // Inclusion: promote only when text matches AND the per-pattern gates
+        // pass AND text length is within the structural-label cap. Char count,
+        // not byte length — labels are ASCII in practice but we count chars to
+        // stay predictable for any future Latin/Roman/numeric variants.
         if !result {
             let max_len = self.config.section_detection_v2.inclusion_max_length;
             if text.chars().count() <= max_len {
-                for re in &self.inclusion_regexes {
-                    if re.is_match(text) && self.is_isolated(element_idx) {
-                        result = true;
-                        break;
+                let element = &self.text_elements[element_idx];
+                for rule in &self.inclusion_patterns {
+                    if !rule.regex.is_match(text) {
+                        continue;
                     }
+                    if rule.require_bold && !Self::is_bold(element) {
+                        continue;
+                    }
+                    if rule.require_isolation && !self.is_isolated_in_leaf(element_idx) {
+                        continue;
+                    }
+                    result = true;
+                    break;
                 }
             }
         }
@@ -610,6 +705,19 @@ impl<'a> SectionDetectionV2Rule<'a> {
         hierarchy_context: &mut HierarchyContext,
         current_element: &ParsedPdfElement,
     ) -> (ParsedElementType, u32) {
+        // Header / Footer / Margin elements are pre-classified at the
+        // PdfTextElement → ParsedPdfElement boundary from
+        // `placement.region_label` (Block 07). Skip section detection on them
+        // so running headers, footers, and out-of-region marginalia never get
+        // promoted to Section.
+        if matches!(
+            current_element.element_type,
+            ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
+        ) {
+            let content_level = hierarchy_context.get_content_level();
+            return (current_element.element_type.clone(), content_level);
+        }
+
         let element = &self.text_elements[element_idx];
 
         // Pass 1
@@ -632,6 +740,86 @@ impl<'a> SectionDetectionV2Rule<'a> {
             (current_element.element_type.clone(), content_level)
         }
     }
+
+    /// Promote same-Y same-(page, leaf) sibling fragments to Section when
+    /// any one of them already classified as Section, **but only in
+    /// single-Y-line leaves**. Catches Tika fragmentation of structural
+    /// header lines (canonical example: "3.1" + "Encoder and Decoder
+    /// Stacks" — the number-only prefix fails `passes_alpha_ratio`, the
+    /// title passes, and the post-pass merges them) without mistakenly
+    /// promoting body fragments adjacent to inline cross-references like
+    /// "Section 6 of [QUIC-RECOVERY]".
+    ///
+    /// The single-Y-line gate is the structural-atom signature: a leaf
+    /// produced by XY-cut that contains exactly one visual line is a
+    /// header / caption / standalone label. Multi-line leaves are flowing
+    /// content — even if some fragment in them classifies as Section
+    /// (e.g. an inline "Section N" cross-reference matched by the
+    /// inclusion pattern), the surrounding fragments are body content and
+    /// must not be promoted.
+    fn promote_same_line_section_fragments(out: &mut [ParsedPdfElement]) {
+        use std::collections::HashMap;
+
+        const Y_TOL: f32 = 3.0;
+
+        // First: collect per-(page, leaf) the distinct Y-lines and the
+        // Section-bearing Y-line (if any) plus its hierarchy level.
+        struct LeafInfo {
+            y_lines: Vec<f32>,
+            section_y: Option<(f32, u32)>,
+        }
+        let mut leaves: HashMap<(u32, String), LeafInfo> = HashMap::new();
+
+        for el in out.iter() {
+            let Some(p) = el.placement.as_ref() else {
+                continue;
+            };
+            let Some(label) = p.region_label.as_deref() else {
+                continue;
+            };
+            let key = (p.page_number, label.to_string());
+            let info = leaves.entry(key).or_insert(LeafInfo {
+                y_lines: Vec::new(),
+                section_y: None,
+            });
+            let y = p.bounding_box.y;
+            if !info.y_lines.iter().any(|&yy| (yy - y).abs() < Y_TOL) {
+                info.y_lines.push(y);
+            }
+            if el.element_type == ParsedElementType::Section && info.section_y.is_none() {
+                info.section_y = Some((y, el.hierarchy_level));
+            }
+        }
+
+        // Second pass: promote within single-Y-line leaves that contain a
+        // Section. The single-Y constraint is the structural-atom check.
+        for el in out.iter_mut() {
+            if el.element_type == ParsedElementType::Section {
+                continue;
+            }
+            let Some(p) = el.placement.as_ref() else {
+                continue;
+            };
+            let Some(label) = p.region_label.as_deref() else {
+                continue;
+            };
+            let key = (p.page_number, label.to_string());
+            let Some(info) = leaves.get(&key) else {
+                continue;
+            };
+            if info.y_lines.len() != 1 {
+                continue;
+            }
+            let Some((sy, level)) = info.section_y else {
+                continue;
+            };
+            let y = p.bounding_box.y;
+            if (sy - y).abs() < Y_TOL {
+                el.element_type = ParsedElementType::Section;
+                el.hierarchy_level = level;
+            }
+        }
+    }
 }
 
 impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
@@ -648,7 +836,9 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
                 .iter()
                 .enumerate()
                 .map(|(i, te)| ParsedPdfElement {
-                    element_type: ParsedElementType::Paragraph,
+                    element_type: ParsedElementType::from_region_label(
+                        te.placement.region_label.as_deref(),
+                    ),
                     text: te.text.clone(),
                     hierarchy_level: 3,
                     position: i,
@@ -685,6 +875,16 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
             }
         }
 
+        // Same-Y same-(page, leaf) section promotion. Tika fragments a
+        // single visual line into multiple PdfTextElements (e.g., the
+        // section heading "3.1 Encoder and Decoder Stacks" emits two
+        // fragments at the same Y: "3.1" and "Encoder and Decoder Stacks").
+        // Per-element gates can reject one fragment for contingent reasons
+        // (the number prefix "3.1" fails `passes_alpha_ratio`) while
+        // accepting its sibling. The fragments share a structural identity:
+        // if one is a Section, all of them are. Promote them together.
+        Self::promote_same_line_section_fragments(&mut out);
+
         let sections = out
             .iter()
             .filter(|e| e.element_type == ParsedElementType::Section)
@@ -709,16 +909,15 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ParsingConfig, SectionDetectionV2Config};
+    use crate::analytics::DocumentAnalysis;
+    use crate::config::{InclusionPattern, ParsingConfig, SectionDetectionV2Config};
     use crate::rules::engine::FontSizeAnalysis;
-    use crate::types::{
-        BoundingBox, DocumentAnalysis, FontClass, Placement, PdfTextElement, StyleData,
-    };
-    use std::collections::HashMap;
+    use crate::types::{BoundingBox, FontClass, PdfTextElement, Placement, StyleData};
+    use std::collections::{BTreeMap, HashMap};
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    fn make_placement(band: u32, column: u32, line_number: u32, rotation: i32) -> Placement {
+    fn make_placement(line_number: u32, rotation: i32) -> Placement {
         Placement {
             page_number: 1,
             bounding_box: BoundingBox {
@@ -727,13 +926,15 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
             },
-            band,
-            column,
-            nr_band_columns: 1,
             line_number,
             segment_number: 0,
             rotation,
             paragraph_number: 0,
+            // Default fixture leaf — body content. Tests that exercise
+            // bold-in-paragraph or multi-leaf isolation override this.
+            region_label: Some("1".to_string()),
+            page_width: 0.0,
+            page_height: 0.0,
         }
     }
 
@@ -758,7 +959,7 @@ mod tests {
                 font_weight,
                 color: "#000000".to_string(),
             },
-            placement: make_placement(0, 0, line_number, 0),
+            placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
             token_count: 1,
@@ -766,7 +967,10 @@ mod tests {
         }
     }
 
-    /// Standalone neighbour element sharing the same (band, column, line_number) as index 0.
+    /// Non-bold neighbour element sharing the same Y, same leaf as index 0.
+    /// V3 isolation reads "different bold-ness on the same Y in the same leaf
+    /// → not isolated", so a non-bold neighbour next to a bold candidate is
+    /// the canonical bold-in-paragraph reject case.
     fn make_neighbour(line_number: u32) -> PdfTextElement {
         PdfTextElement {
             text: "neighbour".to_string(),
@@ -781,18 +985,18 @@ mod tests {
             placement: Placement {
                 page_number: 1,
                 bounding_box: BoundingBox {
-                    x: 110.0, // right next to element at x=0, width=100 → gap = 10pt
+                    x: 110.0,
                     y: 0.0,
                     width: 50.0,
                     height: 12.0,
                 },
-                band: 0,
-                column: 0,
-                nr_band_columns: 1,
                 line_number,
                 segment_number: 1,
                 rotation: 0,
                 paragraph_number: 0,
+                region_label: Some("1".to_string()),
+                page_width: 0.0,
+                page_height: 0.0,
             },
             reading_order: 1,
             bookmark_match: None,
@@ -813,41 +1017,30 @@ mod tests {
         }
     }
 
-    fn make_config(
-        tolerance: f32,
-        margin: f32,
-        ratio: Option<f32>,
-        isolation_threshold: f32,
-    ) -> ParsingConfig {
-        let mut cfg = ParsingConfig::default();
-        cfg.section_detection_v2 = SectionDetectionV2Config {
-            font_size_tolerance: tolerance,
-            structural_size_margin: margin,
-            structural_size_ratio: ratio,
-            isolation_threshold,
-            line_height_tolerance: 3.0,
-            font_rarity_threshold: 0.05, // < 5% → rare
-            ..SectionDetectionV2Config::default()
-        };
-        cfg
+    fn make_config(tolerance: f32, margin: f32, ratio: Option<f32>) -> ParsingConfig {
+        ParsingConfig {
+            section_detection_v2: SectionDetectionV2Config {
+                font_size_tolerance: tolerance,
+                structural_size_margin: margin,
+                structural_size_ratio: ratio,
+                line_height_tolerance: 3.0,
+                ..SectionDetectionV2Config::default()
+            },
+            ..ParsingConfig::default()
+        }
     }
 
     fn make_style_data() -> StyleData {
         StyleData {
-            font_classes: HashMap::new(),
+            font_classes: BTreeMap::new(),
         }
     }
 
     fn make_document_analysis() -> DocumentAnalysis {
-        DocumentAnalysis {
-            font_size_counts: HashMap::new(),
-            font_family_counts: HashMap::new(),
-            bold_counts: (0, 0),
-            italic_counts: (0, 0),
-            most_common_font_size: 10.0,
-            most_common_font_family: "TestFont".to_string(),
-            all_font_sizes: vec![],
-        }
+        // Rules do not read DocumentAnalysis fields in tests (the parameter is
+        // threaded through but unused by V2 — see `_document_analysis` on the
+        // rule struct). Default is sufficient.
+        DocumentAnalysis::default()
     }
 
     /// Build a `SectionDetectionV2Rule` and call `classify_pass1` on index 0.
@@ -880,23 +1073,24 @@ mod tests {
         // element: 16pt, not bold, common font, isolated (no neighbours → line_number 0 unique)
         let elements = vec![make_element(16.0, false, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(classify(&elements, &font_analysis, &config));
     }
 
-    /// Test 2 — Region 1 boundary: delta == margin is Region 2 (not Region 1).
-    /// delta = 15 - 10 = 5 = margin → font_size = 15 is NOT > region1_threshold (15) → Region 2
-    /// No bold, not isolated (has a neighbour within gap) → NOT promoted.
+    /// Test 2 — R1 boundary: delta == margin is R2 (not R1).
+    /// delta = 15 - 10 = 5 = margin → `font_size > body + margin` is `15 > 15` = false → R2.
+    /// To make R2 reject we need `bold OR isolated_in_leaf` to be false. Use a
+    /// non-bold candidate whose same-Y same-leaf neighbour IS bold → leaf
+    /// isolation flips to false (different bold-ness on the same line). Both
+    /// signals false → R2 rejects.
     #[test]
     fn test_region1_boundary_is_region2() {
         let body = 10.0;
-        // Two elements share same line → element 0 is NOT isolated (gap = 10 < gap_cfg 20)
-        let elements = vec![
-            make_element(15.0, false, "body", 5),
-            make_neighbour(5), // same line, gap = 10pt < isolation_neighbor_gap 20 → not isolated
-        ];
+        let mut neighbour = make_neighbour(5);
+        neighbour.style_info.font_weight = "bold".to_string();
+        let elements = vec![make_element(15.0, false, "body", 5), neighbour];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -908,33 +1102,37 @@ mod tests {
         let body = 10.0;
         let elements = vec![make_element(13.0, true, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(classify(&elements, &font_analysis, &config));
     }
 
-    /// Test 4 — Region 2: isolated alone no longer promotes (AND semantics).
-    /// delta = 13 - 10 = 3, tolerance = 1, margin = 5 → Region 2
-    /// not bold, isolated (no same-line neighbours) → NOT promoted (bold AND isolated required)
+    /// Test 4 — R2: isolated alone promotes (V3 OR semantics).
+    /// delta = 13 - 10 = 3 → R2; non-bold, alone in leaf → isolated → promoted.
+    /// Captures the V3 relaxation (`bold OR isolated`) that lets non-bold but
+    /// structurally-isolated medium-tier headers (academic italic / Computer-
+    /// Modern section titles) classify cleanly.
     #[test]
-    fn test_region2_isolated_alone_does_not_promote() {
+    fn test_region2_isolated_alone_promotes() {
         let body = 10.0;
         let elements = vec![make_element(13.0, false, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
-        assert!(!classify(&elements, &font_analysis, &config));
+        let config = make_config(1.0, 5.0, None);
+        assert!(classify(&elements, &font_analysis, &config));
     }
 
-    /// Test 5 — Region 2: neither bold nor isolated rejects (arXiv watermark shape).
-    /// delta = 3 → Region 2; not bold, has neighbour within gap → NOT promoted
+    /// Test 5 — R2: neither bold nor isolated rejects.
+    /// delta = 3 → R2; non-bold candidate with a bold same-Y same-leaf
+    /// neighbour → leaf isolation flips to false → both signals false → reject.
+    /// Captures the bold-anchor-with-non-bold-body case (e.g. bold "Article 5"
+    /// with non-bold continuation "of this Regulation").
     #[test]
     fn test_region2_neither_signal_rejects() {
         let body = 10.0;
-        let elements = vec![
-            make_element(13.0, false, "body", 7),
-            make_neighbour(7), // shares line, gap 10 < gap_cfg 20 → not isolated
-        ];
+        let mut neighbour = make_neighbour(7);
+        neighbour.style_info.font_weight = "bold".to_string();
+        let elements = vec![make_element(13.0, false, "body", 7), neighbour];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -946,26 +1144,13 @@ mod tests {
         let body = 10.0;
         let elements = vec![make_element(10.5, true, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(classify(&elements, &font_analysis, &config));
     }
 
-    /// Test 7 — Region 3: isolated AND rare promotes (bold not required).
-    /// |delta| = 0.5 ≤ tolerance → Region 3; isolated, not bold, rare font → promoted
-    #[test]
-    fn test_region3_isolated_and_rare_promotes() {
-        let body = 10.0;
-        // "rare_font" appears 1/100 times = 1% < rarity_threshold 5% → rare
-        let elements = vec![make_element(10.5, false, "rare_font", 0)];
-        let font_analysis = make_font_analysis(
-            body,
-            vec![("rare_font", 1), ("body", 99)],
-        );
-        let config = make_config(1.0, 5.0, None, 0.80);
-        assert!(classify(&elements, &font_analysis, &config));
-    }
+    // (V2 Test 7 — `isolated AND rare` — removed in V3: rarity gate dropped.)
 
-    /// Test 8 — Region 3: isolated alone does NOT promote.
+    /// Test 8 — R3: isolated alone does NOT promote.
     /// |delta| ≤ tolerance, isolated, not bold, common font → NOT promoted
     #[test]
     fn test_region3_isolated_alone_does_not_promote() {
@@ -973,28 +1158,29 @@ mod tests {
         // "body" = 90/100 = 90% → not rare
         let elements = vec![make_element(10.5, false, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 90), ("other", 10)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
     /// Test 9 — Region 3: non-isolated bold does NOT promote.
-    /// |delta| ≤ tolerance, bold, column-filling AND has same-line neighbour →
-    /// fails both segment and width-ratio isolation → NOT promoted.
+    /// |delta| ≤ tolerance, bold, with a same-Y X-clustered neighbour whose
+    /// joined extent fills the page → ratio = 1.0 ≥ isolation_threshold →
+    /// NOT isolated → NOT promoted.
     ///
-    /// Constructs an element wide enough to defeat the ratio check
-    /// (text_width=160 in a band of 200 → ratio 0.80 ≥ 0.75) and a same-line
-    /// neighbour at gap=10pt < `isolation_neighbor_gap` (20) to defeat the segment check.
+    /// Neighbour is placed at gap=4pt (well below `X_CLUSTER_GAP_THRESHOLD_PT=6`)
+    /// so the two elements form a single visual cluster, which is what the
+    /// "non-isolated" semantic requires post-strip.
     #[test]
     fn test_region3_non_isolated_bold_does_not_promote() {
         let body = 10.0;
         let mut element = make_element(10.5, true, "body", 3);
         element.placement.bounding_box.width = 160.0;
         let mut neighbour = make_neighbour(3);
-        neighbour.placement.bounding_box.x = 170.0;
-        neighbour.placement.bounding_box.width = 30.0;
+        neighbour.placement.bounding_box.x = 164.0; // gap = 4pt → same cluster
+        neighbour.placement.bounding_box.width = 36.0;
         let elements = vec![element, neighbour];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -1005,7 +1191,7 @@ mod tests {
         let body = 10.0;
         let elements = vec![make_element(8.0, true, "body", 0)];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -1019,7 +1205,7 @@ mod tests {
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         // margin=0.1 so body+margin=10.1; ratio=Some(1.5) → threshold=15
         // isolation_neighbor_gap = 20; elements at unique lines → isolated
-        let config = make_config(1.0, 0.1, Some(1.5), 0.80);
+        let config = make_config(1.0, 0.1, Some(1.5));
 
         // 12pt: delta=2 > tolerance 1 → Region 2, isolated, bold → promoted (both signals)
         let elements_12 = vec![make_element(12.0, true, "body", 0)];
@@ -1030,20 +1216,81 @@ mod tests {
         assert!(classify(&elements_16, &font_analysis, &config));
     }
 
-    /// Test 12 — arXiv watermark regression.
-    /// body=7pt, element=11pt, not bold, has same-line neighbour (gap<20) → not isolated,
-    /// common font, default config (margin=5.0, tolerance=1.0).
-    /// delta = 11 - 7 = 4, threshold = 7 + 5 = 12; 4 ≤ 5 (margin), 4 > 1 (tolerance) → Region 2.
-    /// Region 2: bold AND isolated → neither → NOT promoted.
+    /// Test 12 — arXiv watermark regression (V3 path).
+    /// In production, arxiv-style sidebar / watermark content is rotated and
+    /// excluded from `body_element_indices` by `tag_and_resort` → its
+    /// `region_label` stays `None` → element_type becomes `Margin` at the
+    /// conversion boundary → the Block 07 classify guard skips section
+    /// detection entirely. As a defense, `classify_pass1` itself rejects
+    /// rotated elements upfront. This test pins that defense.
     #[test]
     fn test_arxiv_watermark_regression() {
         let body = 7.0;
-        let elements = vec![
-            make_element(11.0, false, "body", 9),
-            make_neighbour(9), // gap 10 < 20 → not isolated
-        ];
+        let mut element = make_element(11.0, true, "body", 0);
+        element.placement.rotation = 90;
+        let elements = vec![element];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
+        let config = make_config(1.0, 5.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    // ── CR-43 tests — bookmark_match bypasses alpha_ratio ─────────────────────
+
+    /// CR-43 — `bookmark_match` overrides the alpha-ratio safety filter.
+    ///
+    /// Text `'10.1. Idle Timeout'` is 18 chars / 11 alpha → ratio 0.611, which
+    /// fails `min_alpha_ratio = 0.7`. Pre-CR-43, `classify_pass1` rejects at
+    /// the alpha-ratio gate and CR-41's R3 disjunction never gets to fire.
+    /// With CR-43 the bookmark substrate bypasses the gate and R3
+    /// (`bold AND (isolated OR bookmark_match)`) admits it.
+    ///
+    /// Reproduces the rfc-quic page-57 miss class: short numbered titles like
+    /// `'10.1. Idle Timeout'`, `'19.2. PING Frames'`, `'17.2.4. Handshake
+    /// Packet'` whose digit-and-dot prefix tanks alpha ratio below 0.7.
+    #[test]
+    fn test_cr43_bookmark_match_bypasses_alpha_ratio() {
+        let body = 12.0;
+        let mut element = make_element(body, true, "body", 0);
+        element.text = "10.1. Idle Timeout".to_string();
+        element.bookmark_match = Some(BookmarkSection {
+            title: "10.1. Idle Timeout".to_string(),
+            order: 75,
+            level: 3,
+        });
+
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let mut config = make_config(0.1, 4.0, None);
+        // Mirror production threshold (config.yaml). Default in code is 0.5,
+        // which would not exercise the bypass.
+        config.section_detection_v2.min_alpha_ratio = 0.7;
+
+        // Sanity: alpha ratio is below the gate (test fixture invariant).
+        let alpha = "10.1. Idle Timeout".chars().filter(|c| c.is_alphabetic()).count();
+        let total = "10.1. Idle Timeout".chars().count();
+        assert!(
+            (alpha as f32) / (total as f32) < 0.7,
+            "fixture must fail alpha-ratio gate"
+        );
+
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-43 paired control — without `bookmark_match`, the alpha-ratio gate
+    /// still rejects. Confirms the bypass keys on the bookmark substrate, not
+    /// on something else (font size, bold, isolation).
+    #[test]
+    fn test_cr43_alpha_ratio_still_rejects_without_bookmark() {
+        let body = 12.0;
+        let mut element = make_element(body, true, "body", 0);
+        element.text = "10.1. Idle Timeout".to_string();
+        // bookmark_match: None (default from make_element)
+
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let mut config = make_config(0.1, 4.0, None);
+        config.section_detection_v2.min_alpha_ratio = 0.7;
+
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
@@ -1067,7 +1314,7 @@ mod tests {
                 font_weight: font_weight.to_string(),
                 color: "#000000".to_string(),
             },
-            placement: make_placement(0, 0, line_number, 0),
+            placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
             token_count: 1,
@@ -1085,8 +1332,7 @@ mod tests {
     /// CR-20 Test 2 — LaTeX "Medi" family detected as bold (NimbusRomNo9L-Medi).
     #[test]
     fn test_bold_detected_via_medi_family() {
-        let element =
-            make_element_with_font(12.0, "normal", "NimbusRomNo9L-Medi", "latex-medi", 0);
+        let element = make_element_with_font(12.0, "normal", "NimbusRomNo9L-Medi", "latex-medi", 0);
         assert!(SectionDetectionV2Rule::is_bold(&element));
     }
 
@@ -1107,210 +1353,187 @@ mod tests {
         assert!(!SectionDetectionV2Rule::is_bold(&cmr));
     }
 
-    // ── CR-21 tests — page-scoped band matching ────────────────────────────────
+    // ── V3 leaf-based isolation tests ─────────────────────────────────────────
 
-    /// Build a PdfTextElement with an explicit page number, x position, band, column, line.
-    fn make_element_on_page(
-        font_size: f32,
-        page_number: u32,
-        band: u32,
-        column: u32,
-        line_number: u32,
-        x: f32,
-    ) -> PdfTextElement {
+    /// Build a leaf-tagged element at the given (x, y, leaf, bold). Width
+    /// fixed at 80pt for predictable Y-line geometry across the leaf-isolation
+    /// fixtures.
+    fn make_leaf_element(x: f32, y: f32, leaf: &str, bold: bool) -> PdfTextElement {
+        let weight = if bold { "bold" } else { "normal" };
         PdfTextElement {
-            text: "1 Introduction".to_string(),
+            text: "fragment".to_string(),
             style_info: FontClass {
-                class_name: "section".to_string(),
-                font_family: "NimbusRomNo9L-Medi".to_string(),
-                font_size,
+                class_name: "body".to_string(),
+                font_family: "TestFont".to_string(),
+                font_size: 10.0,
                 font_style: "normal".to_string(),
-                font_weight: "normal".to_string(),
+                font_weight: weight.to_string(),
                 color: "#000000".to_string(),
             },
             placement: Placement {
-                page_number,
+                page_number: 1,
                 bounding_box: BoundingBox {
                     x,
-                    y: 0.0,
+                    y,
                     width: 80.0,
                     height: 12.0,
                 },
-                band,
-                column,
-                nr_band_columns: 1,
-                line_number,
+                line_number: 0,
                 segment_number: 0,
                 rotation: 0,
                 paragraph_number: 0,
+                region_label: Some(leaf.to_string()),
+                page_width: 0.0,
+                page_height: 0.0,
             },
             reading_order: 0,
             bookmark_match: None,
-            token_count: 2,
+            token_count: 1,
             raw_tags: vec![],
         }
     }
 
-    /// CR-21 Test 5 — Elements sharing (band=0, col=0, line=0) but on different pages
-    /// must NOT be treated as same-line neighbours. Target is index 1 (page 2).
-    /// Expected: isolated=true (page 1 element is ignored).
+    fn make_leaf_rule<'a>(
+        engine: &'a RuleEngine,
+        elements: &'a [PdfTextElement],
+        config: &'a ParsingConfig,
+        document_analysis: &'a DocumentAnalysis,
+        font_analysis: &'a FontSizeAnalysis,
+        style_data: &'a StyleData,
+    ) -> SectionDetectionV2Rule<'a> {
+        SectionDetectionV2Rule::new(
+            engine,
+            elements,
+            config,
+            document_analysis,
+            font_analysis,
+            style_data,
+        )
+    }
+
+    /// V3 Test 1 — single element in a leaf has no same-Y neighbors → isolated.
     #[test]
-    fn test_isolation_cross_page_same_band_not_neighbours() {
+    fn block09_leaf_singleton_is_isolated() {
+        let elements = vec![make_leaf_element(0.0, 0.0, "1", true)];
+        let fa = make_font_analysis(10.0, vec![("body", 1)]);
+        let cfg = make_config(0.1, 4.0, None);
+        let da = make_document_analysis();
+        let sd = make_style_data();
+        let eng = RuleEngine::new().expect("engine");
+        let rule = make_leaf_rule(&eng, &elements, &cfg, &da, &fa, &sd);
+        assert!(rule.is_isolated_in_leaf(0));
+    }
+
+    /// V3 Test 2 — bold candidate + non-bold same-Y same-leaf neighbor →
+    /// not isolated. Canonical bold-emphasis-in-paragraph case.
+    #[test]
+    fn block09_leaf_bold_with_nonbold_same_line_not_isolated() {
         let elements = vec![
-            // Page 1 — same band/col/line, x=110 (would create gap=10 → not isolated if counted)
-            make_element_on_page(12.0, 1, 0, 0, 0, 110.0),
-            // Page 2 — the target we're classifying, x=0
-            make_element_on_page(12.0, 2, 0, 0, 0, 0.0),
+            make_leaf_element(0.0, 0.0, "1", true),   // bold candidate
+            make_leaf_element(90.0, 0.0, "1", false), // non-bold body neighbor
         ];
-        let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
-        // isolation_neighbor_gap = 20: a gap of 10 would be < 20 → not isolated
-        let config = make_config(1.0, 5.0, None, 0.80);
-        let engine = RuleEngine::new().expect("engine");
-        let document_analysis = make_document_analysis();
-        let style_data = make_style_data();
-        let rule = SectionDetectionV2Rule::new(
-            &engine,
-            &elements,
-            &config,
-            &document_analysis,
-            &font_analysis,
-            &style_data,
-        );
-        // Index 1 is on page 2; page 1 element must not count as a neighbour
-        assert!(rule.is_isolated(1), "cross-page element must not be a neighbour");
+        let fa = make_font_analysis(10.0, vec![("body", 2)]);
+        let cfg = make_config(0.1, 4.0, None);
+        let da = make_document_analysis();
+        let sd = make_style_data();
+        let eng = RuleEngine::new().expect("engine");
+        let rule = make_leaf_rule(&eng, &elements, &cfg, &da, &fa, &sd);
+        assert!(!rule.is_isolated_in_leaf(0));
     }
 
-    /// Same page, same (page, band, col), same Y line — line-extent fills column.
-    /// Two side-by-side elements at the same Y union to fill the column width →
-    /// ratio ≥ isolation_threshold → not isolated.
+    /// V3 Test 3 — multi-line leaf rejects isolation regardless of
+    /// fontsize. The (page, leaf) substrate identifies a flowing content
+    /// block; the candidate is part of the flow. Real bold headers in
+    /// big multi-line leaves still classify via R2's bold disjunct or R1
+    /// auto-promotion. Inline cross-references (e.g. `Section 6 of [...]`)
+    /// in body leaves get correctly rejected too — same gate.
     #[test]
-    fn test_isolation_same_page_same_band_are_neighbours() {
+    fn block09_leaf_multi_line_rejects_isolation() {
         let elements = vec![
-            // Target at x=0, width=80 → right edge at 80
-            make_element_on_page(12.0, 1, 0, 0, 0, 0.0),
-            // Neighbour at x=90, width=80 → right edge at 170 (same Y=0)
-            make_element_on_page(12.0, 1, 0, 0, 0, 90.0),
+            make_leaf_element(0.0, 0.0, "1", false),
+            make_leaf_element(0.0, 50.0, "1", false),
         ];
-        let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
-        let engine = RuleEngine::new().expect("engine");
-        let document_analysis = make_document_analysis();
-        let style_data = make_style_data();
-        let rule = SectionDetectionV2Rule::new(
-            &engine,
-            &elements,
-            &config,
-            &document_analysis,
-            &font_analysis,
-            &style_data,
-        );
-        // line_extent = 170, band_x_extent = 170, nr_band_columns=1 → ratio = 1.0 ≥ 0.80
-        assert!(
-            !rule.is_isolated(0),
-            "same-Y neighbour fills column union → not isolated"
-        );
+        let fa = make_font_analysis(10.0, vec![("body", 2)]);
+        let cfg = make_config(0.1, 4.0, None);
+        let da = make_document_analysis();
+        let sd = make_style_data();
+        let eng = RuleEngine::new().expect("engine");
+        let rule = make_leaf_rule(&eng, &elements, &cfg, &da, &fa, &sd);
+        assert!(!rule.is_isolated_in_leaf(0));
     }
 
-    /// Line-extent Test A — Attention 3.1 / 3.2 shape regression.
-    /// Header alone on its Y line (a real section title) is isolated even when
-    /// the body block below shares the same `(page, band, col)` and Tika's
-    /// per-paragraph `data-line` collides. Y-coordinate is the ground truth.
+    /// V3 Test 3b — multi-line leaf with mixed fontsizes rejects
+    /// isolation. Body content is the canonical case: a math-prose mix
+    /// where a fragment at +1pt above body is alone at its size on its
+    /// line, but the leaf has body content at body size on other lines.
     #[test]
-    fn test_line_extent_isolated_when_alone_on_y_line() {
-        // Header at y=490, x=108, width=145 (≈ "3.1 Encoder and Decoder Stacks")
-        let mut header = make_element_on_page(9.0, 3, 2, 0, 0, 108.0);
-        header.placement.bounding_box.y = 490.0;
-        header.placement.bounding_box.width = 145.0;
-        // Body line below at y=510, fills column. Defines band x-extent.
-        let mut body = make_element_on_page(9.0, 3, 2, 0, 0, 108.0);
-        body.placement.bounding_box.y = 510.0;
-        body.placement.bounding_box.width = 402.0;
-        let elements = vec![header, body];
-        let font_analysis = make_font_analysis(9.0, vec![("section", 100)]);
-        let config = make_config(0.1, 5.0, None, 0.80);
-        let engine = RuleEngine::new().expect("engine");
-        let document_analysis = make_document_analysis();
-        let style_data = make_style_data();
-        let rule = SectionDetectionV2Rule::new(
-            &engine,
-            &elements,
-            &config,
-            &document_analysis,
-            &font_analysis,
-            &style_data,
-        );
-        // Header is alone on y=490 (body at y=510, gap=20 > tolerance=3) → isolated
-        assert!(rule.is_isolated(0));
+    fn block09_leaf_multi_line_mixed_size_rejects() {
+        let mut larger = make_leaf_element(0.0, 0.0, "1", false);
+        larger.style_info.font_size = 11.0;
+        let body = make_leaf_element(0.0, 50.0, "1", false);
+        let elements = vec![larger, body];
+        let fa = make_font_analysis(10.0, vec![("body", 2)]);
+        let cfg = make_config(0.1, 4.0, None);
+        let da = make_document_analysis();
+        let sd = make_style_data();
+        let eng = RuleEngine::new().expect("engine");
+        let rule = make_leaf_rule(&eng, &elements, &cfg, &da, &fa, &sd);
+        assert!(!rule.is_isolated_in_leaf(0));
     }
 
-    /// Line-extent Test B — Tika overlapping-spans regression (QUIC "MUST" pattern).
-    /// When Tika emits an inline-styled word as a separate span overlapping a
-    /// base-font line, both spans share the same Y. Their union fills the column,
-    /// so neither is treated as isolated. This catches false positives where
-    /// mid-paragraph bold lead-ins (`Encoder:`) would otherwise be promoted.
+    /// V3 Test 4 — multi-fragment all-bold same-Y same-leaf → isolated.
+    /// A bold title that Tika emits as multiple spans on the same line is
+    /// still one structural unit.
     #[test]
-    fn test_line_extent_rejects_overlapping_inline_span() {
-        // Base-font line at y=300 spanning the whole column
-        let mut base = make_element_on_page(9.0, 1, 0, 0, 0, 108.0);
-        base.placement.bounding_box.y = 300.0;
-        base.placement.bounding_box.width = 400.0;
-        // Overlapping inline-styled span at same Y, narrow
-        let mut overlay = make_element_on_page(9.0, 1, 0, 0, 0, 200.0);
-        overlay.placement.bounding_box.y = 300.0;
-        overlay.placement.bounding_box.width = 30.0;
-        let elements = vec![overlay, base];
-        let font_analysis = make_font_analysis(9.0, vec![("section", 50), ("body", 50)]);
-        let config = make_config(0.1, 5.0, None, 0.80);
-        let engine = RuleEngine::new().expect("engine");
-        let document_analysis = make_document_analysis();
-        let style_data = make_style_data();
-        let rule = SectionDetectionV2Rule::new(
-            &engine,
-            &elements,
-            &config,
-            &document_analysis,
-            &font_analysis,
-            &style_data,
-        );
-        // line_extent ≈ 400, column_width ≈ 400 → ratio ≈ 1.0 → not isolated
-        assert!(
-            !rule.is_isolated(0),
-            "inline-styled overlay span on a full-width line must not be isolated"
-        );
-    }
-
-    /// CR-21 Test 7 — Simulate the "1 Introduction" / watermark collision.
-    /// Page 1 element at (band=0, col=0, line=0, x=124) — simulates a watermark.
-    /// Page 2 element at (band=0, col=0, line=0, x=108) — simulates "1 Introduction".
-    /// Without CR-21, the page 1 element would be counted as a same-line neighbour,
-    /// producing a gap of 0 (overlap) → isolated=false → section header rejected.
-    /// With CR-21, page 1 is excluded → no neighbours → isolated=true.
-    #[test]
-    fn test_isolation_introduction_scenario() {
+    fn block09_leaf_all_bold_multi_fragment_is_isolated() {
         let elements = vec![
-            // Page 1 watermark-like element
-            make_element_on_page(11.0, 1, 0, 0, 0, 124.0),
-            // Page 2 "1 Introduction"
-            make_element_on_page(11.0, 2, 0, 0, 0, 108.0),
+            make_leaf_element(0.0, 0.0, "1", true),
+            make_leaf_element(90.0, 0.0, "1", true),
+            make_leaf_element(180.0, 0.0, "1", true),
         ];
-        let font_analysis = make_font_analysis(10.0, vec![("section", 2)]);
-        let config = make_config(1.0, 5.0, None, 0.80);
-        let engine = RuleEngine::new().expect("engine");
-        let document_analysis = make_document_analysis();
-        let style_data = make_style_data();
-        let rule = SectionDetectionV2Rule::new(
-            &engine,
-            &elements,
-            &config,
-            &document_analysis,
-            &font_analysis,
-            &style_data,
-        );
-        // Page 2 element (index 1) must be isolated — page 1 element not a neighbour
-        assert!(
-            rule.is_isolated(1),
-            "page 2 introduction must be isolated despite page 1 band collision"
-        );
+        let fa = make_font_analysis(10.0, vec![("body", 3)]);
+        let cfg = make_config(0.1, 4.0, None);
+        let da = make_document_analysis();
+        let sd = make_style_data();
+        let eng = RuleEngine::new().expect("engine");
+        let rule = make_leaf_rule(&eng, &elements, &cfg, &da, &fa, &sd);
+        assert!(rule.is_isolated_in_leaf(0));
+    }
+
+    /// V3 Test 5 — different leaves on the same Y → isolated. The XY-cut
+    /// produced two separate leaves at this Y (e.g., left and right column
+    /// of a multi-column page). Cross-leaf neighbors don't disqualify.
+    #[test]
+    fn block09_leaf_cross_leaf_same_y_does_not_disqualify() {
+        let elements = vec![
+            make_leaf_element(0.0, 0.0, "1", true),    // leaf 1
+            make_leaf_element(300.0, 0.0, "2", false), // leaf 2, same Y
+        ];
+        let fa = make_font_analysis(10.0, vec![("body", 2)]);
+        let cfg = make_config(0.1, 4.0, None);
+        let da = make_document_analysis();
+        let sd = make_style_data();
+        let eng = RuleEngine::new().expect("engine");
+        let rule = make_leaf_rule(&eng, &elements, &cfg, &da, &fa, &sd);
+        assert!(rule.is_isolated_in_leaf(0));
+    }
+
+    /// V3 Test 6 — element with no `region_label` (orphan) → not isolated.
+    /// In production, Margin elements are skipped at `classify` entry by
+    /// the Block 07 guard, so this code path doesn't fire there. Defensive
+    /// behavior: orphans never claim isolation.
+    #[test]
+    fn block09_leaf_missing_label_returns_false() {
+        let mut e = make_leaf_element(0.0, 0.0, "1", true);
+        e.placement.region_label = None;
+        let elements = vec![e];
+        let fa = make_font_analysis(10.0, vec![("body", 1)]);
+        let cfg = make_config(0.1, 4.0, None);
+        let da = make_document_analysis();
+        let sd = make_style_data();
+        let eng = RuleEngine::new().expect("engine");
+        let rule = make_leaf_rule(&eng, &elements, &cfg, &da, &fa, &sd);
+        assert!(!rule.is_isolated_in_leaf(0));
     }
 
     // ── CR-26 tests — isolation-gated inclusion patterns ──────────────────────
@@ -1331,14 +1554,22 @@ mod tests {
             },
             placement: Placement {
                 page_number: 1,
-                bounding_box: BoundingBox { x, y: 0.0, width, height: 12.0 },
-                band: 0,
-                column: 0,
-                nr_band_columns: 1,
+                bounding_box: BoundingBox {
+                    x,
+                    y: 0.0,
+                    width,
+                    height: 12.0,
+                },
                 line_number: 0,
                 segment_number: 0,
                 rotation: 0,
                 paragraph_number: 0,
+                // Body leaf — the inclusion-pattern fixtures probe pattern + isolation
+                // semantics; co-leaf neighbours of differing bold-ness are how
+                // `is_isolated_in_leaf` distinguishes structural labels from inline.
+                region_label: Some("1".to_string()),
+                page_width: 0.0,
+                page_height: 0.0,
             },
             reading_order: 0,
             bookmark_match: None,
@@ -1348,7 +1579,12 @@ mod tests {
     }
 
     /// Build a configured rule with custom inclusion/exclusion pattern lists.
-    /// All other config values match `make_config(1.0, 5.0, None, 0.80)`.
+    /// All other config values match `make_config(1.0, 5.0, None)`.
+    ///
+    /// Inclusion patterns wrap with CR-26-era gates (isolation-only, no bold
+    /// requirement) so existing CR-26 tests using non-bold fixtures keep
+    /// passing. CR-42 tests that exercise per-pattern gates use
+    /// `build_pattern_rule_test_with_gates` instead.
     fn build_pattern_rule_test(
         elements: &[PdfTextElement],
         inclusion: Vec<&str>,
@@ -1360,9 +1596,32 @@ mod tests {
         StyleData,
         RuleEngine,
     ) {
-        let mut config = make_config(1.0, 5.0, None, 0.80);
-        config.section_detection_v2.inclusion_patterns =
-            inclusion.into_iter().map(String::from).collect();
+        let inclusion_patterns: Vec<InclusionPattern> = inclusion
+            .into_iter()
+            .map(|p| InclusionPattern {
+                pattern: p.to_string(),
+                require_bold: false,
+                require_isolation: true,
+            })
+            .collect();
+        build_pattern_rule_test_with_gates(elements, inclusion_patterns, exclusion)
+    }
+
+    /// CR-42 — variant that takes pre-built `InclusionPattern`s so per-pattern
+    /// `require_bold` / `require_isolation` gates can be exercised in tests.
+    fn build_pattern_rule_test_with_gates(
+        elements: &[PdfTextElement],
+        inclusion_patterns: Vec<InclusionPattern>,
+        exclusion: Vec<&str>,
+    ) -> (
+        ParsingConfig,
+        FontSizeAnalysis,
+        DocumentAnalysis,
+        StyleData,
+        RuleEngine,
+    ) {
+        let mut config = make_config(1.0, 5.0, None);
+        config.section_detection_v2.inclusion_patterns = inclusion_patterns;
         config.section_detection_v2.exclusion_patterns =
             exclusion.into_iter().map(String::from).collect();
         let font_analysis = make_font_analysis(10.0, vec![("body", elements.len().max(1))]);
@@ -1383,16 +1642,19 @@ mod tests {
         assert!(rule.apply_pattern_refinement(false, 0, "Article 5"));
     }
 
-    /// CR-26 Test 2 — Inclusion match on a column-filling line does NOT promote.
-    /// Two side-by-side elements at the same Y union to fill the column. The
-    /// substring `Article` matches but `is_isolated` returns false. This is the
-    /// load-bearing case the gate exists to handle.
+    /// CR-26 Test 2 — Inclusion match next to a different-bold-ness same-Y
+    /// same-leaf neighbour does NOT promote. Under V3 leaf isolation, the
+    /// presence of any same-line same-leaf neighbour with mismatched bold-ness
+    /// flips `is_isolated_in_leaf` to false — which gates the inclusion-pattern
+    /// path. Captures the bold-anchor-with-non-bold-body case (e.g., bold
+    /// "Article 5" anchor + non-bold continuation "of this Regulation").
     #[test]
     fn test_cr26_inclusion_paragraph_internal_does_not_promote() {
-        let elements = vec![
-            make_inclusion_element("as described in Article 5 of", 100.0, 200.0),
-            make_inclusion_element("this Regulation, the framework", 305.0, 195.0),
-        ];
+        let mut anchor = make_inclusion_element("Article 5", 100.0, 80.0);
+        anchor.style_info.font_weight = "bold".to_string();
+        let continuation =
+            make_inclusion_element("of this Regulation, the framework", 185.0, 195.0);
+        let elements = vec![anchor, continuation];
         let (config, fa, da, sd, eng) =
             build_pattern_rule_test(&elements, vec!["(?i)article"], vec![]);
         let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
@@ -1426,7 +1688,11 @@ mod tests {
     /// the inclusion path.
     #[test]
     fn test_cr26_exclusion_unaffected_by_isolation_gate() {
-        let elements = vec![make_inclusion_element("Figure 3: Architecture", 100.0, 80.0)];
+        let elements = vec![make_inclusion_element(
+            "Figure 3: Architecture",
+            100.0,
+            80.0,
+        )];
         let (config, fa, da, sd, eng) =
             build_pattern_rule_test(&elements, vec![], vec!["^Figure\\s"]);
         let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
@@ -1463,6 +1729,92 @@ mod tests {
             build_pattern_rule_test(&elements, vec!["(?i)^article"], vec![]);
         let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
         assert!(rule.apply_pattern_refinement(false, 0, label));
+    }
+
+    // ── CR-42 tests — per-pattern bold/isolation gating ──────────────────────
+
+    /// CR-42 Test — `require_bold: true` rejects the inline-hyperlink-span FP.
+    ///
+    /// Reproduces the rfc-quic page-38 false positive: an inline hyperlink span
+    /// `<span class="f4" style="color:#2222ee">Section 18</span>` (normal weight)
+    /// matches the `^section\s+\d+` inclusion pattern, sits in its own tiny
+    /// XY-cut leaf (so `is_isolated_in_leaf` returns true), and has length 10
+    /// (well under `inclusion_max_length: 20`). Pre-CR-42 this promoted, then
+    /// same-line clustering joined the surrounding spans into a Section node.
+    /// With `require_bold: true` on the pattern, the gate rejects.
+    ///
+    /// Paired with the next test which confirms `require_bold: true` still
+    /// admits a real bold label of the same shape (e.g., a UK-Acts "Section 12").
+    #[test]
+    fn test_cr42_require_bold_rejects_hyperlink_span() {
+        // Normal-weight hyperlink span — matches pattern, is isolated, fails bold gate
+        let mut hyperlink = make_inclusion_element("Section 18", 200.0, 60.0);
+        hyperlink.style_info.color = "#2222ee".to_string();
+        let elements = vec![hyperlink];
+
+        let inclusion = vec![InclusionPattern {
+            pattern: r"(?i)^section\s+\d+[a-z]?\s*$".to_string(),
+            require_bold: true,
+            require_isolation: true,
+        }];
+
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test_with_gates(&elements, inclusion, vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(!rule.apply_pattern_refinement(false, 0, "Section 18"));
+    }
+
+    /// CR-42 Test (paired) — `require_bold: true` still admits a bold label.
+    ///
+    /// Same shape as the FP test but `font_weight: "bold"` — confirms the gate
+    /// doesn't accidentally reject real UK-Acts-of-Parliament bold "Section 12"
+    /// labels (the canonical use case for this pattern).
+    #[test]
+    fn test_cr42_require_bold_admits_bold_label() {
+        let mut label = make_inclusion_element("Section 12", 100.0, 60.0);
+        label.style_info.font_weight = "bold".to_string();
+        let elements = vec![label];
+
+        let inclusion = vec![InclusionPattern {
+            pattern: r"(?i)^section\s+\d+[a-z]?\s*$".to_string(),
+            require_bold: true,
+            require_isolation: true,
+        }];
+
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test_with_gates(&elements, inclusion, vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(rule.apply_pattern_refinement(false, 0, "Section 12"));
+    }
+
+    /// CR-42 Test — `require_isolation: false` admits a non-isolated label.
+    ///
+    /// Confirms per-pattern gates compose orthogonally: a pattern that opts out
+    /// of isolation can still promote a same-line-as-other-text label as long
+    /// as the bold gate (or any future gate) is satisfied. This is the
+    /// generality lever — the shape that lets future non-canonical-label
+    /// patterns ride on this infra without retrofitting code.
+    #[test]
+    fn test_cr42_require_isolation_false_admits_non_isolated() {
+        // Two same-Y bold elements in the same leaf — `is_isolated_in_leaf` returns
+        // false for either alone, so a `require_isolation: true` pattern would reject.
+        let mut anchor = make_inclusion_element("Article 5", 100.0, 80.0);
+        anchor.style_info.font_weight = "bold".to_string();
+        let mut neighbour = make_inclusion_element("of this Regulation", 200.0, 200.0);
+        neighbour.style_info.font_weight = "bold".to_string();
+        let elements = vec![anchor, neighbour];
+
+        let inclusion = vec![InclusionPattern {
+            pattern: r"(?i)^article\s+\d+[a-z]?\s*$".to_string(),
+            require_bold: true,
+            require_isolation: false,
+        }];
+
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test_with_gates(&elements, inclusion, vec![]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        // is_isolated_in_leaf would be false here, but the pattern doesn't require it.
+        assert!(rule.apply_pattern_refinement(false, 0, "Article 5"));
     }
 
     // ── CR-27 tests — keyword tiebreaker hierarchy ───────────────────────────
@@ -1520,7 +1872,10 @@ mod tests {
         let mut ctx = HierarchyContext::new();
         let d1 = ctx.update_for_section(12.0, None, &cfg);
         let d2 = ctx.update_for_section(12.0, None, &cfg);
-        assert_eq!(d1, d2, "two None-keyword sections at equal font must be siblings");
+        assert_eq!(
+            d1, d2,
+            "two None-keyword sections at equal font must be siblings"
+        );
     }
 
     /// CR-27 Test 5 — `None` after a keyword fires tiebreaker (deeper).
@@ -1531,7 +1886,11 @@ mod tests {
         let mut ctx = HierarchyContext::new();
         let d_chap = ctx.update_for_section(12.0, Some("chapter"), &cfg);
         let d_subtitle = ctx.update_for_section(12.0, None, &cfg);
-        assert_eq!(d_subtitle, d_chap + 1, "subtitle must be one deeper than CHAPTER");
+        assert_eq!(
+            d_subtitle,
+            d_chap + 1,
+            "subtitle must be one deeper than CHAPTER"
+        );
     }
 
     /// CR-27 Test 6 — font-delta still wins when decisive (skips the tiebreaker).
@@ -1541,7 +1900,11 @@ mod tests {
         let mut ctx = HierarchyContext::new();
         let d_title = ctx.update_for_section(24.0, None, &cfg);
         let d_part = ctx.update_for_section(12.0, Some("part"), &cfg);
-        assert_eq!(d_part, d_title + 1, "decisive font-delta still pushes deeper");
+        assert_eq!(
+            d_part,
+            d_title + 1,
+            "decisive font-delta still pushes deeper"
+        );
     }
 
     /// CR-27 Test 7 — full Police Act PART/CHAPTER/numbered sequence.
@@ -1663,5 +2026,80 @@ mod tests {
         // want after a fix):
         //   assert_eq!(d_wrap, 3, "wrap-line should remain at section depth (continuation)");
         //   assert_eq!(body_depth, 4, "body should be one level under the section");
+    }
+
+    // ── Block 07 — Header / Footer / Margin classification skip ───────────────
+
+    /// Build a `PdfTextElement` whose font size and isolation would otherwise
+    /// promote it to Section under the Region 1 path (`test_region1_auto_promotes`
+    /// is the canonical positive case). Caller chooses the `region_label` to
+    /// drive the Block 07 boundary classifier.
+    fn make_section_sized_element(region_label: Option<&str>) -> PdfTextElement {
+        let mut el = make_element(16.0, false, "body", 0);
+        el.placement.region_label = region_label.map(str::to_string);
+        el
+    }
+
+    /// Apply `SectionDetectionV2Rule` over a freshly-bootstrapped element list
+    /// (the bootstrap path picks `element_type` from `region_label`) and return
+    /// the resulting element types in order.
+    fn run_apply_bootstrap(text_elements: &[PdfTextElement]) -> Vec<ParsedElementType> {
+        let body = 10.0;
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let engine = RuleEngine::new().expect("engine");
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            text_elements,
+            &config,
+            &document_analysis,
+            &font_analysis,
+            &style_data,
+        );
+        rule.apply(Vec::new())
+            .expect("apply succeeds")
+            .into_iter()
+            .map(|e| e.element_type)
+            .collect()
+    }
+
+    /// Block 07 — `H-*` region label is preserved through section detection.
+    /// The element has section-promoting geometry (16pt vs 10pt body, isolated)
+    /// so without the skip guard it would land as `Section`.
+    #[test]
+    fn block07_header_label_skips_section_promotion() {
+        let text_elements = vec![make_section_sized_element(Some("H-1"))];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Header]);
+    }
+
+    /// Block 07 — `F-*` region label is preserved through section detection.
+    #[test]
+    fn block07_footer_label_skips_section_promotion() {
+        let text_elements = vec![make_section_sized_element(Some("F-2"))];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Footer]);
+    }
+
+    /// Block 07 — orphan element (region_label = None) classifies as Margin and
+    /// is skipped by section detection. Sidebar marginalia / rotated content /
+    /// elements outside any Region tree leaf land here.
+    #[test]
+    fn block07_orphan_label_skips_section_promotion() {
+        let text_elements = vec![make_section_sized_element(None)];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Margin]);
+    }
+
+    /// Block 07 — body leaf labels (`"1"`, `"2-1"`, …) follow the normal
+    /// section-detection path. This is the regression check for the guard:
+    /// the `H-` / `F-` prefix gate must not catch body labels.
+    #[test]
+    fn block07_body_leaf_label_still_promotes_to_section() {
+        let text_elements = vec![make_section_sized_element(Some("2-1"))];
+        let types = run_apply_bootstrap(&text_elements);
+        assert_eq!(types, vec![ParsedElementType::Section]);
     }
 }

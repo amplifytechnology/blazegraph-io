@@ -51,6 +51,13 @@ pub struct ParsingConfig {
     /// in check + correct mode).
     #[serde(default)]
     pub graph_sanity: GraphSanityConfig,
+    /// When true, the analytics pre-pass writes one JSON file per stat kind to
+    /// `{cache_dir}/stat/<stat_name>/<pdf_hash>.json` after finalization. This is
+    /// a sidecar for offline tooling — not a pipeline cache (output is not read
+    /// back). Default `true` for development; flip off in production where the
+    /// extra writes are unwanted.
+    #[serde(default = "default_true")]
+    pub dump_analytics: bool,
 }
 
 // ─── NodeTypeClustering config (CR-29; was ParagraphClustering) ───────────
@@ -65,6 +72,9 @@ pub struct NodeTypeClusteringConfig {
     pub paragraph: NodeTypeMergeConfig,
     pub list: NodeTypeMergeConfig,
     pub list_item: NodeTypeMergeConfig,
+    pub header: NodeTypeMergeConfig,
+    pub footer: NodeTypeMergeConfig,
+    pub margin: NodeTypeMergeConfig,
 }
 
 impl Default for NodeTypeClusteringConfig {
@@ -74,6 +84,9 @@ impl Default for NodeTypeClusteringConfig {
             paragraph: NodeTypeMergeConfig::default_paragraph(),
             list: NodeTypeMergeConfig::default_paragraph(),
             list_item: NodeTypeMergeConfig::default_paragraph(),
+            header: NodeTypeMergeConfig::default_header_footer(),
+            footer: NodeTypeMergeConfig::default_header_footer(),
+            margin: NodeTypeMergeConfig::default_margin(),
         }
     }
 }
@@ -84,28 +97,47 @@ impl Default for NodeTypeClusteringConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeTypeMergeConfig {
     // ── Boundary constraints (split when violated between consecutive elements) ──
-
     /// Require both elements be in the same Tika line (line_number equality).
     #[serde(default)]
     pub same_line: bool,
 
     /// Require both elements be in the same Tika paragraph (paragraph_number equality).
-    /// `true` is the conservative prose-safe default.
+    /// `true` is the conservative prose-safe default for body prose; `false` for
+    /// Section (a multi-paragraph bold title in one leaf is still one Section).
     #[serde(default)]
     pub same_paragraph: bool,
 
-    /// Require both elements be in the same Tika band (band equality).
-    /// `false` allows cross-band merge — the multi-line section title case.
+    /// Drop `region_label` from the equivalence key for this element type.
+    /// `true` collapses all elements of this type within a page into one bucket
+    /// regardless of which Region tree leaf they sit in. Default `false` keeps
+    /// region as a partition dimension; flipped on by Header / Footer defaults
+    /// (per-page running header / footer is one logical unit).
     #[serde(default)]
-    pub same_band: bool,
+    pub ignore_region_label: bool,
 
-    /// Require both elements be in the same Tika column (column equality).
-    /// `true` for almost everything — cross-column merging scrambles reading order.
-    #[serde(default = "default_true")]
-    pub same_column: bool,
+    /// Stopgap for Tika's row-keyed `paragraph_number` in 2-column body layout
+    /// (see [CR-38](docs/P2/core/change-requests/CR-38-bbox-based-paragraph-detection.md)).
+    ///
+    /// When `Some(n)`, a pre-scan counts distinct `paragraph_number`s per
+    /// `(page, element_type, region_label)`. If the count is `>= n` for a
+    /// region, `paragraph_number` is dropped from the key for that region —
+    /// the whole region collapses into one bucket. Catches the gpt2-style
+    /// failure mode where Tika emits one `<p>` per visual row across both
+    /// columns, leaving each column-region with one `paragraph_number` per
+    /// line.
+    ///
+    /// **Tradeoff:** when the threshold fires, real within-column paragraph
+    /// breaks are lost. CR-38 replaces this heuristic with bbox-derived
+    /// paragraph detection (modal body X + indent rule + Y-gap distribution),
+    /// which preserves paragraph structure in 2-column layouts. This knob is
+    /// the Block 10 ship-it pragma; CR-38 is the structurally-correct fix.
+    ///
+    /// `None` disables the fallback (clustering uses `paragraph_number`
+    /// directly).
+    #[serde(default)]
+    pub region_overflow_threshold: Option<u32>,
 
     // ── Safety constraints ──────────────────────────────────────────────────────
-
     /// Require both elements have equal `hierarchy_level`. Prevents a section
     /// header and a sub-section header on the same page from merging just
     /// because they share a band-collapsed bucket.
@@ -120,7 +152,6 @@ pub struct NodeTypeMergeConfig {
     pub max_y_gap: Option<f32>,
 
     // ── Output formatting ───────────────────────────────────────────────────────
-
     /// Separator between merged elements crossing line boundaries when the
     /// element's band has ≤2 columns (prose flows continuously).
     #[serde(default = "default_prose_separator")]
@@ -132,36 +163,82 @@ pub struct NodeTypeMergeConfig {
     pub table_line_separator: String,
 }
 
-fn default_prose_separator() -> String { " ".to_string() }
-fn default_table_separator() -> String { "\n".to_string() }
+fn default_prose_separator() -> String {
+    " ".to_string()
+}
+fn default_table_separator() -> String {
+    "\n".to_string()
+}
 
 impl NodeTypeMergeConfig {
-    /// Section default: cross-band merge enabled (multi-line title case), gated
-    /// on depth equality and proximity to prevent unrelated section collapse.
+    /// Section default: within-region merge with depth equality + proximity. A
+    /// multi-line bold chapter title in one Region tree leaf at one depth is one
+    /// Section regardless of how Tika sliced paragraphs across the bands.
     pub fn default_section() -> Self {
         Self {
             same_line: false,
             same_paragraph: false,
-            same_band: false,
-            same_column: true,
+            ignore_region_label: false,
             same_depth: true,
             max_y_gap: Some(50.0),
+            region_overflow_threshold: None,
             prose_line_separator: " ".to_string(),
             table_line_separator: "\n".to_string(),
         }
     }
 
-    /// Paragraph (and List / ListItem) default: conservative prose-safe.
-    /// Tika's paragraph_number is the reliable cluster signal; no cross-band
-    /// merging.
+    /// Paragraph (and List / ListItem) default: within-region, with Tika
+    /// paragraph_number as the within-region granularity refinement. This
+    /// solves the small-margin "whole page = one leaf" failure mode where
+    /// region alone is too coarse — paragraph_number gives the within-leaf
+    /// Y-gap clustering Tika has already computed.
+    ///
+    /// `region_overflow_threshold: Some(10)` catches Tika's row-keyed
+    /// paragraph_number in 2-column body layouts (see CR-38). When a
+    /// `(page, region_label)` produces ≥10 distinct paragraph_numbers,
+    /// paragraph_number is dropped and the region collapses to one bucket.
     pub fn default_paragraph() -> Self {
         Self {
             same_line: false,
             same_paragraph: true,
-            same_band: true,
-            same_column: true,
+            ignore_region_label: false,
             same_depth: false,
             max_y_gap: None,
+            region_overflow_threshold: Some(10),
+            prose_line_separator: " ".to_string(),
+            table_line_separator: "\n".to_string(),
+        }
+    }
+
+    /// Header / Footer default: collapse all per-page H-N / F-N labels into
+    /// one bucket per (page, type). Per-page running headers and footers are
+    /// one logical unit — different `H-N` indices are just multiple fragments
+    /// of the same chrome row.
+    pub fn default_header_footer() -> Self {
+        Self {
+            same_line: false,
+            same_paragraph: false,
+            ignore_region_label: true,
+            same_depth: false,
+            max_y_gap: None,
+            region_overflow_threshold: None,
+            prose_line_separator: " ".to_string(),
+            table_line_separator: "\n".to_string(),
+        }
+    }
+
+    /// Margin default: keep `region_label` as a partition dimension. A sidebar
+    /// block and a page-edge marginal note are different logical units even
+    /// though they're both Margin; merging within one Margin region is fine,
+    /// merging across is not.
+    pub fn default_margin() -> Self {
+        Self {
+            same_line: false,
+            same_paragraph: false,
+            ignore_region_label: false,
+            same_depth: false,
+            max_y_gap: None,
+            region_overflow_threshold: None,
             prose_line_separator: " ".to_string(),
             table_line_separator: "\n".to_string(),
         }
@@ -187,17 +264,26 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
         let value = serde_yaml::Value::deserialize(deserializer)?;
         let mapping = value
             .as_mapping()
-            .ok_or_else(|| serde::de::Error::custom(
-                "node_type_clustering: expected a mapping",
-            ))?;
+            .ok_or_else(|| serde::de::Error::custom("node_type_clustering: expected a mapping"))?;
 
         // If any legacy cascade key is present, route to the migration shim.
-        let legacy_keys = ["merge_segments", "merge_lines", "merge_columns", "merge_bands"];
+        let legacy_keys = [
+            "merge_segments",
+            "merge_lines",
+            "merge_columns",
+            "merge_bands",
+        ];
         let is_legacy = legacy_keys
             .iter()
             .any(|k| mapping.contains_key(serde_yaml::Value::String((*k).to_string())));
 
         if is_legacy {
+            // Legacy `paragraph_clustering:` block. The four cascade booleans
+            // (merge_segments / merge_lines / merge_columns / merge_bands) are
+            // translated to the constraint subset that survives Block 06b's
+            // band/column drop: only `same_line` and `same_paragraph` carry
+            // information now. `merge_columns` / `merge_bands` are silently
+            // ignored (no equivalent in the region-aware world).
             #[derive(Deserialize)]
             struct LegacyParagraphClustering {
                 #[serde(default = "default_true")]
@@ -205,28 +291,26 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
                 #[serde(default = "default_true")]
                 merge_lines: bool,
                 #[serde(default)]
+                #[allow(dead_code)]
                 merge_columns: bool,
                 #[serde(default)]
+                #[allow(dead_code)]
                 merge_bands: bool,
                 #[serde(default = "default_prose_separator")]
                 prose_line_separator: String,
                 #[serde(default = "default_table_separator")]
                 table_line_separator: String,
             }
-            let l: LegacyParagraphClustering = serde_yaml::from_value(value)
-                .map_err(serde::de::Error::custom)?;
+            let l: LegacyParagraphClustering =
+                serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
 
-            // Translate cascade booleans → constraint set. The cascade rule is:
-            // higher levels imply all lower levels. Effective level = highest
-            // enabled flag. The constraint that splits on each level boundary
-            // is `same_X: true` for the level just above the effective one.
             let unified = NodeTypeMergeConfig {
-                same_line:      l.merge_segments && !l.merge_lines && !l.merge_columns && !l.merge_bands,
-                same_paragraph: l.merge_lines     && !l.merge_columns && !l.merge_bands,
-                same_band:      !l.merge_bands,
-                same_column:    !l.merge_columns && !l.merge_bands,
+                same_line: l.merge_segments && !l.merge_lines,
+                same_paragraph: l.merge_lines,
+                ignore_region_label: false,
                 same_depth: false,
                 max_y_gap: None,
+                region_overflow_threshold: None,
                 prose_line_separator: l.prose_line_separator,
                 table_line_separator: l.table_line_separator,
             };
@@ -234,7 +318,10 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
                 section: unified.clone(),
                 paragraph: unified.clone(),
                 list: unified.clone(),
-                list_item: unified,
+                list_item: unified.clone(),
+                header: NodeTypeMergeConfig::default_header_footer(),
+                footer: NodeTypeMergeConfig::default_header_footer(),
+                margin: NodeTypeMergeConfig::default_margin(),
             });
         }
 
@@ -250,6 +337,12 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             list: NodeTypeMergeConfig,
             #[serde(default = "NodeTypeMergeConfig::default_paragraph")]
             list_item: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_header_footer")]
+            header: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_header_footer")]
+            footer: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_margin")]
+            margin: NodeTypeMergeConfig,
         }
         let n: NewShape = serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -257,6 +350,9 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             paragraph: n.paragraph,
             list: n.list,
             list_item: n.list_item,
+            header: n.header,
+            footer: n.footer,
+            margin: n.margin,
         })
     }
 }
@@ -368,7 +464,7 @@ impl Default for SectionAndHierarchyConfig {
             small_header_threshold: 0.1,
             min_header_size: 8.5,
             use_bold_indicator: true,
-            bold_size_strict: true,  // Default to strict mode (bold AND larger)
+            bold_size_strict: true, // Default to strict mode (bold AND larger)
             max_depth: 5,
             font_size_tolerance: 0.1,
             enforce_max_depth: true,
@@ -415,7 +511,6 @@ pub struct ElementClusteringConfig {
 fn default_y_tolerance() -> f32 {
     15.0
 }
-
 
 fn default_false() -> bool {
     false
@@ -475,7 +570,6 @@ pub struct ListDetectionConfig {
     /// Y-coordinate tolerance for considering elements on the same line (in points)
     #[serde(default = "default_y_tolerance")]
     pub y_tolerance: f32,
-
 
     /// List item patterns
     /// Bullet point patterns to detect
@@ -538,7 +632,7 @@ pub struct SequentialNumberingConfig {
     /// Allow letter sequences (a, b, c) in addition to numbers
     #[serde(default = "default_true")]
     pub allow_letter_sequences: bool,
-    
+
     /// Maximum gap tolerance between numbers (0 = no gaps allowed)
     #[serde(default = "default_zero")]
     pub max_gap_tolerance: u32,
@@ -558,7 +652,7 @@ pub struct MathematicalContextConfig {
     /// Mathematical symbols to detect
     #[serde(default = "default_mathematical_symbols")]
     pub symbols: Vec<String>,
-    
+
     /// Mathematical terms that indicate context
     #[serde(default = "default_mathematical_terms")]
     pub terms: Vec<String>,
@@ -578,7 +672,7 @@ pub struct HyphenContextConfig {
     /// Strategy for handling hyphens: "reject", "strict", "context_aware"
     #[serde(default = "default_hyphen_strategy")]
     pub strategy: String,
-    
+
     /// Require space after hyphen for valid lists
     #[serde(default = "default_true")]
     pub require_space_after: bool,
@@ -601,7 +695,7 @@ fn default_zero() -> u32 {
 fn default_mathematical_symbols() -> Vec<String> {
     vec![
         "→".to_string(),
-        "←".to_string(), 
+        "←".to_string(),
         "⇒".to_string(),
         "⇐".to_string(),
         "∀".to_string(),
@@ -628,46 +722,46 @@ pub struct ListValidationConfig {
     /// Whether list validation is enabled
     #[serde(default = "default_validation_enabled")]
     pub enabled: bool,
-    
+
     /// Minimum number of items required for a valid list
     #[serde(default = "default_true")]
     pub minimum_size_check: bool,
-    
+
     /// Validate that numbered lists start with "1" (or equivalent first item)
     #[serde(default = "default_true")]
     pub first_item_validation: bool,
-    
+
     /// If using parenthetical numbering (n), must start with (1)
     #[serde(default = "default_true")]
     pub parenthetical_context_check: bool,
-    
+
     // Advanced validation rules (enabled by default)
     #[serde(default = "default_true")]
     pub sequential_numbering_check: bool,
-    
+
     #[serde(default = "default_true")]
     pub mathematical_context_check: bool,
-    
+
     #[serde(default = "default_true")]
     pub hyphen_context_check: bool,
-    
+
     // Rule-specific configurations
     #[serde(default)]
     pub sequential_numbering: SequentialNumberingConfig,
-    
+
     #[serde(default)]
     pub mathematical_context: MathematicalContextConfig,
-    
+
     #[serde(default)]
     pub hyphen_context: HyphenContextConfig,
-    
+
     // Future validation rules (disabled by default)
     #[serde(default = "default_false")]
     pub sequence_pattern_check: bool,
-    
+
     #[serde(default = "default_false")]
     pub content_quality_check: bool,
-    
+
     #[serde(default = "default_false")]
     pub spatial_coherence_check: bool,
 }
@@ -781,35 +875,27 @@ impl Default for SizeEnforcerConfig {
     }
 }
 
-/// Configuration for the V2 section detection rule.
-/// V2 uses a candidate-then-refine pipeline that composes size, bold, isolation,
-/// and font-rarity signals rather than gating them sequentially.
+/// Configuration for the V2 section detection rule (V3 algorithm — Block 09).
+///
+/// Three-tier piecewise classifier on `delta = font_size - body_size` plus
+/// pre-gates (rotation, alpha-ratio) and pattern refinement (inclusion /
+/// exclusion regex) as a backup. Isolation is leaf-based, consulting the
+/// `Placement.region_label` set by `analytics::reading_order::tag_and_resort`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionDetectionV2Config {
-    /// Column-width ratio below which a visual line is considered isolated.
-    /// `line_extent / column_width < this` → isolated. The line extent is the union
-    /// of all bboxes sharing the candidate's `(page, band, column)` and Y-coordinate
-    /// (within `line_height_tolerance`). Short lines in wide columns are isolated;
-    /// lines that fill the column (mid-line emphasis, justified body, Tika overlay
-    /// spans for inline styling) are not.
-    pub isolation_threshold: f32,
-
-    /// Y-coordinate tolerance (points) for grouping bboxes onto the same visual line.
-    /// Two elements within `|Δy| < this` in the same `(page, band, column)` are
-    /// considered to be on the same baseline. Defaults to a value smaller than typical
-    /// inter-line spacing so consecutive lines do not merge.
+    /// Y-coordinate tolerance (points) for grouping bboxes onto the same
+    /// visual line. Two elements within `|Δy| < this` in the same Region
+    /// tree leaf are considered to be on the same baseline. Defaults to a
+    /// value smaller than typical inter-line spacing so consecutive lines
+    /// do not merge.
     pub line_height_tolerance: f32,
-
-    /// Frequency ratio (0.0–1.0) below which a font class is "rare".
-    /// class_usage / total_non_rotated_elements < this → rare.
-    pub font_rarity_threshold: f32,
 
     /// Font-size tolerance (points). Defines the symmetric ±tolerance band around body size.
     ///
-    /// - `delta < -tolerance` → REJECT (below-body noise).
-    /// - `|delta| ≤ tolerance` → Region 3 (at-body band): needs isolated AND (bold OR rare).
-    /// - `tolerance < delta ≤ structural_size_margin` → Region 2 (moderate): needs bold OR isolated.
-    /// - `delta > structural_size_margin` → Region 1 (large): auto-promote unconditionally.
+    /// - `delta < -tolerance`             → REJECT (below-body noise).
+    /// - `|delta| ≤ tolerance`            → R3 (at-body band): needs bold AND isolated_in_leaf.
+    /// - `tolerance < delta ≤ structural_size_margin` → R2 (medium): needs bold OR isolated_in_leaf.
+    /// - `delta > structural_size_margin` → R1 (large): auto-promote unconditionally.
     pub font_size_tolerance: f32,
 
     /// Size margin (points) above body text at which size alone confirms structural role.
@@ -831,9 +917,11 @@ pub struct SectionDetectionV2Config {
 
     /// Regex patterns that promote a weak/rejected candidate to a section
     /// (escape hatch — e.g., "^\\d+\\.\\d+" for numbered subsections).
-    /// Promotion additionally requires `is_isolated()` and a length cap
-    /// (`inclusion_max_length`) — see CR-26.
-    pub inclusion_patterns: Vec<String>,
+    /// Promotion additionally requires the per-pattern structural gates
+    /// (`require_bold`, `require_isolation`) and a global length cap
+    /// (`inclusion_max_length`). See CR-26 (length cap, isolation) and
+    /// CR-42 (per-pattern bold/isolation gating).
+    pub inclusion_patterns: Vec<InclusionPattern>,
 
     /// Maximum text length (in characters) for an inclusion-pattern match to
     /// promote. Real structural labels ("Article 64", "CHAPTER II") are short;
@@ -866,6 +954,29 @@ pub struct TiebreakerKeyword {
     pub pattern: String,
 }
 
+/// Inclusion pattern with per-pattern structural gates (CR-42).
+///
+/// Each pattern declares whether `is_bold(element)` and/or
+/// `is_isolated_in_leaf(element_idx)` are required for promotion.
+///
+/// Both gates default to `true` — appropriate for the typical structural-label
+/// pattern (Chapter, Article, Section labels in regulations and acts), and the
+/// safe default for any new pattern added without thinking.
+///
+/// CR-42 was filed to close an rfc-quic FP where the `^section\s+\d+`
+/// inclusion pattern was firing on inline hyperlink spans (normal-weight
+/// `<span class="f4" style="color:#2222ee">Section 18</span>`). With
+/// `require_bold: true`, real bold UK-Acts-of-Parliament "Section 12" labels
+/// still promote; the hyperlink span does not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InclusionPattern {
+    pub pattern: String,
+    #[serde(default = "default_true")]
+    pub require_bold: bool,
+    #[serde(default = "default_true")]
+    pub require_isolation: bool,
+}
+
 // ─── CR-28 — Graph Sanity-Check-and-Correction Pipe ──────────────────────────
 
 /// Per-invariant gating: every sanity-check invariant has both a check mode
@@ -878,7 +989,10 @@ pub struct InvariantToggle {
 
 impl Default for InvariantToggle {
     fn default() -> Self {
-        Self { check: true, correct: true }
+        Self {
+            check: true,
+            correct: true,
+        }
     }
 }
 
@@ -913,36 +1027,71 @@ impl Default for GraphSanityConfig {
 impl Default for SectionDetectionV2Config {
     fn default() -> Self {
         Self {
-            isolation_threshold: 0.80,
             line_height_tolerance: 3.0,
-            font_rarity_threshold: 0.05,
             font_size_tolerance: 0.1,
-            structural_size_margin: 5.0,
+            structural_size_margin: 4.0,
             structural_size_ratio: None,
             min_alpha_ratio: 0.5,
             max_depth: 6,
             enforce_max_depth: true,
             starting_section_level: 1,
             inclusion_patterns: vec![
-                r"^\d+\.".to_string(),          // "1.", "2.", ...
-                r"^\d+\.\d+".to_string(),       // "1.1", "3.2", ...
-                r"^Chapter\s+\d+".to_string(),
-                r"^Appendix\s+[A-Z]".to_string(),
+                InclusionPattern {
+                    pattern: r"^\d+\.".to_string(), // "1.", "2.", ...
+                    require_bold: true,
+                    require_isolation: true,
+                },
+                InclusionPattern {
+                    pattern: r"^\d+\.\d+".to_string(), // "1.1", "3.2", ...
+                    require_bold: true,
+                    require_isolation: true,
+                },
+                InclusionPattern {
+                    pattern: r"^Chapter\s+\d+".to_string(),
+                    require_bold: true,
+                    require_isolation: true,
+                },
+                InclusionPattern {
+                    pattern: r"^Appendix\s+[A-Z]".to_string(),
+                    require_bold: true,
+                    require_isolation: true,
+                },
             ],
             inclusion_max_length: 30,
-            exclusion_patterns: vec![
-                r"^Figure\s".to_string(),
-                r"^Table\s".to_string(),
-            ],
+            exclusion_patterns: vec![r"^Figure\s".to_string(), r"^Table\s".to_string()],
             tiebreaker_keywords: vec![
-                TiebreakerKeyword { name: "part".into(),     pattern: r"(?i)^part\s+[IVXLCDM\d]+".into() },
-                TiebreakerKeyword { name: "chapter".into(),  pattern: r"(?i)^chapter\s+[IVXLCDM\d]+".into() },
-                TiebreakerKeyword { name: "article".into(),  pattern: r"(?i)^article\s+\d+[a-z]?".into() },
-                TiebreakerKeyword { name: "section".into(),  pattern: r"(?i)^section\s+\d+[a-z]?".into() },
-                TiebreakerKeyword { name: "appendix".into(), pattern: r"(?i)^appendix\s+[A-Z\d]+".into() },
-                TiebreakerKeyword { name: "schedule".into(), pattern: r"(?i)^schedule\s+\d+".into() },
-                TiebreakerKeyword { name: "annex".into(),    pattern: r"(?i)^annex\s+[IVX\d]+".into() },
-                TiebreakerKeyword { name: "numbered".into(), pattern: r"^\d+\s+[A-Z]".into() },
+                TiebreakerKeyword {
+                    name: "part".into(),
+                    pattern: r"(?i)^part\s+[IVXLCDM\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "chapter".into(),
+                    pattern: r"(?i)^chapter\s+[IVXLCDM\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "article".into(),
+                    pattern: r"(?i)^article\s+\d+[a-z]?".into(),
+                },
+                TiebreakerKeyword {
+                    name: "section".into(),
+                    pattern: r"(?i)^section\s+\d+[a-z]?".into(),
+                },
+                TiebreakerKeyword {
+                    name: "appendix".into(),
+                    pattern: r"(?i)^appendix\s+[A-Z\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "schedule".into(),
+                    pattern: r"(?i)^schedule\s+\d+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "annex".into(),
+                    pattern: r"(?i)^annex\s+[IVX\d]+".into(),
+                },
+                TiebreakerKeyword {
+                    name: "numbered".into(),
+                    pattern: r"^\d+\s+[A-Z]".into(),
+                },
             ],
         }
     }
@@ -1034,6 +1183,7 @@ impl ConfigManager {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         };
         self.configs
             .insert(DocumentType::AcademicPaper, academic_config);
@@ -1088,6 +1238,7 @@ impl ConfigManager {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         };
         self.configs
             .insert(DocumentType::LegalContract, legal_config);
@@ -1135,6 +1286,7 @@ impl ConfigManager {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         }
     }
 }
@@ -1152,7 +1304,7 @@ impl ParsingConfig {
         let config: ParsingConfig = serde_yaml::from_str(&content)?;
         Ok(config)
     }
-    
+
     /// Load config with fallback to default
     pub fn load_with_fallback(path: Option<&str>) -> Self {
         match path {
@@ -1197,6 +1349,7 @@ impl Default for ParsingConfig {
             section_detection_v2: SectionDetectionV2Config::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
+            dump_analytics: true,
         }
     }
 }

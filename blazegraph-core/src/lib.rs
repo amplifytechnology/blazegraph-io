@@ -3,23 +3,25 @@
 // Provides document processing with pluggable preprocessor architecture.
 // Main interface for converting documents to semantic graphs.
 
-pub mod types;
+pub mod analytics;
+pub mod cache;
+pub mod classifier;
+pub mod config;
+pub mod graphs;
 pub mod preprocessors;
 pub mod processor;
-pub mod graphs;
-pub mod cache;
-pub mod config;
 pub mod rules;
-pub mod classifier;
 pub mod storage;
+pub mod types;
 
 // Re-export main types and functions for easy use
-pub use types::*;
-pub use preprocessors::{Preprocessor, PdfPreprocessor, TikaPreprocessor};
-pub use processor::{DocumentProcessor, PipelineStages};
+pub use analytics::DocumentAnalysis;
 pub use config::ParsingConfig;
-pub use storage::{CachePoint, FreshFrom, CacheDefaults};
 pub use graphs::NodeIdGenerator;
+pub use preprocessors::{PdfPreprocessor, Preprocessor, TikaPreprocessor};
+pub use processor::{DocumentProcessor, PipelineStages};
+pub use storage::{CacheDefaults, CachePoint, FreshFrom};
+pub use types::*;
 
 // Re-export backends for direct use
 #[cfg(feature = "jni-backend")]

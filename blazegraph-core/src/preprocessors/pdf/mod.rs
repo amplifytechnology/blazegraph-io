@@ -85,7 +85,11 @@ impl PdfPreprocessor {
     /// let preprocessor = PdfPreprocessor::new_with_jni_args(&jre_path, &jar_path, &jvm_args)?;
     /// ```
     #[cfg(feature = "jni-backend")]
-    pub fn new_with_jni_args(jre_path: &Path, jar_path: &Path, jvm_args: &[String]) -> Result<Self> {
+    pub fn new_with_jni_args(
+        jre_path: &Path,
+        jar_path: &Path,
+        jvm_args: &[String],
+    ) -> Result<Self> {
         Ok(Self {
             backend: PdfBackendImpl::Jni(TikaJniBackend::new_with_args(
                 jre_path, jar_path, jvm_args,

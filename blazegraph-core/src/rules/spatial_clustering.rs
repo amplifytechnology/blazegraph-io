@@ -76,10 +76,7 @@ impl<'a> SpatialClusteringRule<'a> {
         for element in elements {
             let placement = element.pdf_placement();
             let key = (placement.page_number, placement.paragraph_number);
-            paragraph_groups
-                .entry(key)
-                .or_default()
-                .push(element);
+            paragraph_groups.entry(key).or_default().push(element);
         }
 
         let original_count = paragraph_groups.values().map(|v| v.len()).sum::<usize>();
@@ -118,15 +115,16 @@ impl<'a> SpatialClusteringRule<'a> {
 
                     for element in type_group_iter {
                         // Merge text with space separator
-                        merged_element.text =
-                            format!("{} {}", merged_element.text, element.text);
+                        merged_element.text = format!("{} {}", merged_element.text, element.text);
 
                         // Expand bounding box to encompass all segments
                         let merged_bbox = self.merge_bounding_boxes(
                             &merged_element.pdf_placement().bounding_box.clone(),
                             &element.pdf_placement().bounding_box.clone(),
                         );
-                        merged_element.placement.as_mut()
+                        merged_element
+                            .placement
+                            .as_mut()
                             .expect("PDF-sourced element must have placement")
                             .bounding_box = merged_bbox;
 
@@ -144,7 +142,8 @@ impl<'a> SpatialClusteringRule<'a> {
 
         // Sort the final result by page and reading order for consistent output
         clustered_elements.sort_by(|a, b| {
-            a.pdf_placement().page_number
+            a.pdf_placement()
+                .page_number
                 .cmp(&b.pdf_placement().page_number)
                 .then(a.reading_order.cmp(&b.reading_order))
         });
@@ -236,7 +235,9 @@ impl<'a> SpatialClusteringRule<'a> {
             &cluster.pdf_placement().bounding_box.clone(),
             &element.pdf_placement().bounding_box.clone(),
         );
-        cluster.placement.as_mut()
+        cluster
+            .placement
+            .as_mut()
             .expect("PDF-sourced element must have placement")
             .bounding_box = merged_bbox;
 
@@ -255,7 +256,10 @@ impl<'a> SpatialClusteringRule<'a> {
             ParsedElementType::Section => &self.config.spatial_clustering.sections,
             ParsedElementType::Paragraph
             | ParsedElementType::List
-            | ParsedElementType::ListItem => &self.config.spatial_clustering.paragraphs,
+            | ParsedElementType::ListItem
+            | ParsedElementType::Header
+            | ParsedElementType::Footer
+            | ParsedElementType::Margin => &self.config.spatial_clustering.paragraphs,
         }
     }
 

@@ -5,18 +5,27 @@
 //!
 //! The Blazegraph XHTML format includes:
 //! - Page divs with data-page attributes
-//! - Bands: `<div class="band" data-band="N" data-columns="K">` — Y-band containers
+//! - Per-page meta: `<div class="page-meta" data-page data-width data-height />`
 //! - Asides: `<aside data-rotation="N">` — rotated content (e.g., arxiv sidebars)
-//! - Spans with data-bbox, data-line, data-segment, data-column attributes
+//! - Paragraphs (`<p>`) wrapping body lines as a parsing convenience
+//! - Spans with data-bbox, data-line, data-segment attributes
 //! - CSS font classes in <style> block
 //! - Document metadata in <meta> tags
 //! - Bookmarks/TOC in <ul> structure
 //!
+//! Note: `<div class="band">` and `data-column` were emitted by Tika prior to
+//! the layout-reasoning consolidation flow (2026-05-03). Tika no longer emits
+//! either; structural reasoning lives on the Rust side. The legacy Placement
+//! fields `band`, `column`, `nr_band_columns` were dropped in schema 0.5.0
+//! (Block 06b — reading-order resort); region tagging is now produced post-
+//! analytics via `analytics::reading_order::tag_and_resort` and lives on
+//! `Placement.region_label`.
+//!
 //! Parser approach: quick-xml pull-parser in event mode. A lightweight state
-//! machine tracks the current page, band context, and aside/rotation context
-//! as the parser walks the event stream. This avoids the fragility of regex
-//! on nested XHTML and naturally handles context propagation (band → span,
-//! aside → span) without building a full DOM.
+//! machine tracks the current page and aside/rotation context as the parser
+//! walks the event stream. This avoids the fragility of regex on nested XHTML
+//! and naturally handles context propagation (aside → span) without building
+//! a full DOM.
 //!
 //! quick-xml was chosen because it is already a workspace dependency, is
 //! widely used in the Rust ecosystem, and supports pull-mode parsing with
@@ -24,10 +33,10 @@
 
 use crate::types::*;
 use anyhow::Result;
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use quick_xml::escape::unescape;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
@@ -36,9 +45,8 @@ use unicode_normalization::UnicodeNormalization;
 /// Extracts raw tag fragments from a span's inner content.
 /// Matches self-closing tags (`<br/>`) and paired open/close tags (`<a href="...">text</a>`).
 /// Valid XHTML guarantees text content is entity-escaped, so any literal `<` is a real tag.
-static RAW_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)(?:<[^>]+/>|<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>)").unwrap()
-});
+static RAW_TAG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)(?:<[^>]+/>|<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>)").unwrap());
 
 static META_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<meta\s+name="([^"]*)"[^>]*content="([^"]*)"[^>]*/?>"#).unwrap()
@@ -61,16 +69,28 @@ static FONT_CLASS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Main entry point. Extracts text elements (with full structural context),
 /// document metadata, style data, and bookmark data.
 pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
+    let t0 = Instant::now();
     let metadata = extract_enhanced_metadata(xhtml)?;
+    let t1 = Instant::now();
     let style_data = extract_style_data(xhtml)?;
+    let t2 = Instant::now();
     let bookmark_data = extract_bookmark_data(xhtml)?;
+    let t3 = Instant::now();
     let text_elements = extract_text_elements(xhtml, &style_data, &bookmark_data)?;
+    let t4 = Instant::now();
 
     println!(
-        "XHTML parsing complete: {} text elements, {} font classes, {} bookmarks",
+        "XHTML parsing complete: {} text elements, {} font classes, {} bookmarks (meta={}ms, style={}ms, bookmark={}ms, text={}ms)",
         text_elements.len(),
         style_data.font_classes.len(),
-        bookmark_data.as_ref().map(|b| b.sections.len()).unwrap_or(0)
+        bookmark_data
+            .as_ref()
+            .map(|b| b.sections.len())
+            .unwrap_or(0),
+        (t1 - t0).as_millis(),
+        (t2 - t1).as_millis(),
+        (t3 - t2).as_millis(),
+        (t4 - t3).as_millis(),
     );
 
     Ok(PreprocessorOutput {
@@ -82,304 +102,261 @@ pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
 }
 
 // ============================================================================
-// Text element extraction — pull-parser state machine
+// Text element extraction — regex-driven flat scanner (CR-40)
 // ============================================================================
+//
+// Post-Block-1 strip (`ccabf4291`, 2026-05-03), the XHTML structure is
+// essentially flat: <div class="page"> contains <p> contains <span>. The only
+// optional structural element is <aside data-rotation="..."> for rotated
+// content. Spans are leaf elements with plain text plus optional one-level
+// inner tags (the future-<link> extension point, captured via raw_tags).
+//
+// We scan with a single alternation regex (`EVENT_REGEX`) plus a `find_at(pos)`
+// advancement loop. After matching a span open, we advance pos past `</span>`
+// so any inner tags (e.g. <link>) don't trigger spurious top-level matches.
+//
+// Coupling: the patterns are tied to the emission style of BlazePDF2XHTML.java.
+// New optional `data-*` attrs on existing tags are tolerated (we capture the
+// whole tag and parse attrs by name within); new structural tags require
+// updating this regex.
 
-/// Parser context: which structural container are we currently inside?
-#[derive(Debug, Clone, PartialEq)]
-enum Container {
-    None,
-    Aside,
-    Band,
-}
+/// Top-level event regex. Each alternation is "the next interesting boundary".
+/// Whichever matches first at `pos` is the next event. Span dispatch advances
+/// past `</span>`, so inner tags inside a span are not matched as events.
+static EVENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"<div class="page">"#,
+        r#"|<div class="page-meta"[^/]*/>"#,
+        r#"|<aside\s[^>]*>"#,
+        r#"|</aside>"#,
+        r#"|<p>"#,
+        r#"|</p>"#,
+        r#"|<span\s[^>]*>"#,
+    ))
+    .unwrap()
+});
 
-/// State machine context threaded through the event loop.
-struct ParseContext {
-    // Page-level
-    in_page: bool,
+/// State carried across the regex scan, mutated as alternations match.
+struct ParseState {
     page_number: u32,
-    // div nesting depth: 1 = page div open, 2 = band div open inside page, etc.
-    // Used to correctly identify which </div> closes which container.
-    div_depth: usize,
-
-    // Structural container (mutually exclusive at the immediate child-of-page level)
-    container: Container,
-    // div_depth at which the current band opened — so we know which </div> closes it
-    band_div_depth: usize,
-
-    // Band state (valid when container == Band)
-    current_band: u32,
-    current_nr_band_columns: u32,
-
-    // Aside/rotation state (valid when container == Aside)
+    /// Dimensions of the current page in PDF points, sourced from the
+    /// `<div class="page-meta" data-width data-height />` self-closing tag.
+    /// Reset to 0.0 on each new page; stays 0.0 if page-meta is absent
+    /// (older Tika output). Downstream analytics treats 0.0 as "unknown".
+    current_page_width: f32,
+    current_page_height: f32,
+    /// Set on `<aside data-rotation="...">`, cleared on `</aside>`.
+    /// Spans emitted inside an aside inherit the rotation.
     current_rotation: i32,
-
-    // Paragraph tracking
-    in_paragraph: bool,
+    /// Global, 0-indexed paragraph counter, incremented at each `</p>`.
+    /// (Behavior preserved from the prior pull-parser implementation.)
     paragraph_number: u32,
-
-    // Span state
-    in_span: bool,
-    span_nesting: u32,    // nested <span> depth inside the primary span (0 when in primary)
-    span_start_pos: usize, // byte offset in the source XHTML right after the primary span's `>`
-    span_class: String,
-    span_bbox: String,
-    span_line: u32,
-    span_segment: u32,
-    span_column: u32,
-    span_text: String,
-    span_raw_tags: Vec<String>,
+    page_elements: Vec<PdfTextElement>,
 }
 
-impl ParseContext {
+impl ParseState {
     fn new() -> Self {
-        ParseContext {
-            in_page: false,
+        ParseState {
             page_number: 0,
-            div_depth: 0,
-            container: Container::None,
-            band_div_depth: 0,
-            current_band: 0,
-            current_nr_band_columns: 1,
+            current_page_width: 0.0,
+            current_page_height: 0.0,
             current_rotation: 0,
-            in_paragraph: false,
             paragraph_number: 0,
-            in_span: false,
-            span_nesting: 0,
-            span_start_pos: 0,
-            span_class: String::new(),
-            span_bbox: String::new(),
-            span_line: 0,
-            span_segment: 0,
-            span_column: 0,
-            span_text: String::new(),
-            span_raw_tags: vec![],
+            page_elements: Vec::new(),
         }
     }
-
-    fn reset_span(&mut self) {
-        self.in_span = false;
-        self.span_nesting = 0;
-        self.span_start_pos = 0;
-        self.span_class.clear();
-        self.span_bbox.clear();
-        self.span_line = 0;
-        self.span_segment = 0;
-        self.span_column = 0;
-        self.span_text.clear();
-        self.span_raw_tags.clear();
-    }
 }
 
-/// Get the string value of a named attribute from a quick-xml Attributes iterator.
-fn get_attr(attrs: &quick_xml::events::attributes::Attributes, name: &[u8]) -> Option<String> {
-    for attr in attrs.clone() {
-        if let Ok(a) = attr {
-            if a.key.as_ref() == name {
-                return String::from_utf8(a.value.to_vec()).ok();
+/// Read a quoted attribute value from a tag string.
+/// Returns `Some("…")` if `name="…"` is found; `None` otherwise.
+/// Order-independent — new optional attrs don't break this.
+fn parse_attr_str<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!(" {}=\"", name);
+    let start = tag.find(&needle)?;
+    let value_start = start + needle.len();
+    let rest = &tag[value_start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn parse_attr_f32(tag: &str, name: &str) -> Option<f32> {
+    parse_attr_str(tag, name).and_then(|s| s.parse().ok())
+}
+
+fn parse_attr_i32(tag: &str, name: &str) -> Option<i32> {
+    parse_attr_str(tag, name).and_then(|s| s.parse().ok())
+}
+
+fn parse_attr_u32(tag: &str, name: &str) -> Option<u32> {
+    parse_attr_str(tag, name).and_then(|s| s.parse().ok())
+}
+
+/// Walk a span's inner content and accumulate text outside any inner tag
+/// region. Equivalent to the prior pull-parser semantics where Event::Text
+/// was captured only when span_nesting == 0 — i.e., text inside
+/// `<link>...</link>` is skipped (the link itself is captured via raw_tags).
+/// Self-closing tags (`<br/>`) don't change nesting.
+fn extract_text_skipping_inner_tags(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut nesting: u32 = 0;
+    let mut pos = 0;
+    while pos < inner.len() {
+        match inner[pos..].find('<') {
+            Some(rel) => {
+                let lt = pos + rel;
+                if nesting == 0 {
+                    out.push_str(&inner[pos..lt]);
+                }
+                let Some(rel_gt) = inner[lt..].find('>') else {
+                    if nesting == 0 {
+                        out.push_str(&inner[lt..]);
+                    }
+                    break;
+                };
+                let gt = lt + rel_gt + 1;
+                let tag = &inner[lt..gt];
+                let is_close = tag.starts_with("</");
+                let is_self = tag.ends_with("/>");
+                if is_close {
+                    nesting = nesting.saturating_sub(1);
+                } else if !is_self {
+                    nesting += 1;
+                }
+                pos = gt;
+            }
+            None => {
+                if nesting == 0 {
+                    out.push_str(&inner[pos..]);
+                }
+                break;
             }
         }
     }
-    None
+    out
 }
 
-/// Extract text elements using a pull-parser state machine.
+/// Extract text elements via a flat regex-driven scan.
 ///
-/// The state machine tracks:
-///   current page → current container (aside/band/none) → paragraph → span
-///
-/// Band and aside attributes are propagated to every span they contain.
+/// Replaces the previous quick_xml pull-parser state machine. EVENT_REGEX
+/// finds the next structural event; each match is dispatched. Span events
+/// use `str::find("</span>")` to locate the close, then advance past it
+/// so inner tags don't trigger spurious matches.
 fn extract_text_elements(
     xhtml: &str,
     style_data: &StyleData,
     bookmark_data: &Option<BookmarkData>,
 ) -> Result<Vec<PdfTextElement>> {
-    let bookmark_sections: Vec<BookmarkSection> = bookmark_data
-        .as_ref()
-        .map(|bd| bd.sections.clone())
-        .unwrap_or_default();
+    // Precompute bookmark lookup keyed by NFKC+whitespace-folded title. Without
+    // this, build_element ran `normalize_match` on every bookmark title for every
+    // text element — O(N×B) with NFKC inside the inner loop. For docs like
+    // rfc-quic (9469 elements × 219 bookmarks) that was ~2M normalize calls per
+    // parse. Now: normalize each title once here, O(1) lookup per element.
+    //
+    // `or_insert_with` preserves "first occurrence wins" semantics matching
+    // the prior `bookmark_sections.iter().find(...)` behavior, regardless of
+    // HashMap insertion order.
+    let bookmark_lookup: HashMap<String, BookmarkSection> = match bookmark_data.as_ref() {
+        Some(bd) => {
+            let mut lookup = HashMap::with_capacity(bd.sections.len());
+            for section in &bd.sections {
+                lookup
+                    .entry(normalize_for_match(&section.title))
+                    .or_insert_with(|| section.clone());
+            }
+            lookup
+        }
+        None => HashMap::new(),
+    };
 
-    let mut reader = Reader::from_str(xhtml);
-    // Default trim_text is false in quick-xml — text is returned verbatim.
-    // We trim at emit time (span_text.trim()) to handle whitespace from pretty-printed XHTML.
-
-    let mut ctx = ParseContext::new();
-    let mut page_elements: Vec<PdfTextElement> = Vec::new();
+    let mut state = ParseState::new();
     let mut all_elements: Vec<PdfTextElement> = Vec::new();
     let mut global_reading_order: u32 = 0;
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let tag_name = e.name();
-                let tag_str = std::str::from_utf8(tag_name.as_ref()).unwrap_or("");
+    let mut pos = 0;
+    while let Some(m) = EVENT_REGEX.find_at(xhtml, pos) {
+        let matched = &xhtml[m.start()..m.end()];
 
-                match tag_str {
-                    "div" => {
-                        // Track structural div depth only when not inside a span
-                        if !ctx.in_span {
-                            ctx.div_depth += 1;
-                        }
-                        let class = get_attr(&e.attributes(), b"class").unwrap_or_default();
-                        if class == "page" {
-                            // Flush previous page elements
-                            if !page_elements.is_empty() {
-                                finalize_page_elements(
-                                    &mut page_elements,
-                                    &mut all_elements,
-                                    &mut global_reading_order,
-                                );
-                            }
-                            ctx.in_page = true;
-                            ctx.page_number += 1;
-                            ctx.container = Container::None;
-                            ctx.band_div_depth = 0;
-                            ctx.current_band = 0;
-                            ctx.current_nr_band_columns = 1;
-                            ctx.current_rotation = 0;
-                        } else if class == "band" && ctx.in_page {
-                            ctx.container = Container::Band;
-                            ctx.band_div_depth = ctx.div_depth;
-                            ctx.current_band = get_attr(&e.attributes(), b"data-band")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                            ctx.current_nr_band_columns =
-                                get_attr(&e.attributes(), b"data-columns")
-                                    .and_then(|v| v.parse().ok())
-                                    .unwrap_or(1);
-                            // Rotation resets when we enter a band (aside is sibling, not ancestor)
-                            ctx.current_rotation = 0;
-                        }
-                        // other divs (e.g., inside a band) are tracked by div_depth but
-                        // do not change container state.
-                    }
-                    "aside" if ctx.in_page => {
-                        ctx.container = Container::Aside;
-                        ctx.current_rotation =
-                            get_attr(&e.attributes(), b"data-rotation")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                        ctx.current_band = 0;
-                        ctx.current_nr_band_columns = 1;
-                    }
-                    "p" if ctx.in_page => {
-                        ctx.in_paragraph = true;
-                    }
-                    "span" if ctx.in_page && ctx.in_paragraph => {
-                        if ctx.in_span {
-                            // Nested span inside the primary span: track depth only.
-                            // Its bytes are captured via buffer_position slicing at close.
-                            ctx.span_nesting += 1;
-                        } else {
-                            // Opening the primary span
-                            ctx.in_span = true;
-                            ctx.span_nesting = 0;
-                            ctx.span_start_pos = reader.buffer_position();
-                            ctx.span_class =
-                                get_attr(&e.attributes(), b"class").unwrap_or_default();
-                            ctx.span_bbox =
-                                get_attr(&e.attributes(), b"data-bbox").unwrap_or_default();
-                            ctx.span_line = get_attr(&e.attributes(), b"data-line")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                            ctx.span_segment = get_attr(&e.attributes(), b"data-segment")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                            ctx.span_column = get_attr(&e.attributes(), b"data-column")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                            ctx.span_text.clear();
-                            ctx.span_raw_tags.clear();
-                        }
-                    }
-                    _ => {}
+        if matched == r#"<div class="page">"# {
+            // New page: flush in-flight page_elements, reset page-scoped state.
+            if !state.page_elements.is_empty() {
+                finalize_page_elements(
+                    &mut state.page_elements,
+                    &mut all_elements,
+                    &mut global_reading_order,
+                );
+            }
+            state.page_number += 1;
+            state.current_rotation = 0;
+            state.current_page_width = 0.0;
+            state.current_page_height = 0.0;
+            pos = m.end();
+        } else if matched.starts_with(r#"<div class="page-meta""#) {
+            state.current_page_width = parse_attr_f32(matched, "data-width").unwrap_or(0.0);
+            state.current_page_height = parse_attr_f32(matched, "data-height").unwrap_or(0.0);
+            pos = m.end();
+        } else if matched.starts_with("<aside") {
+            state.current_rotation = parse_attr_i32(matched, "data-rotation").unwrap_or(0);
+            pos = m.end();
+        } else if matched == "</aside>" {
+            state.current_rotation = 0;
+            pos = m.end();
+        } else if matched == "<p>" {
+            // Paragraph open: no state change; counter increments at </p>.
+            pos = m.end();
+        } else if matched == "</p>" {
+            state.paragraph_number += 1;
+            pos = m.end();
+        } else if matched.starts_with("<span") {
+            // Span: parse attrs, find </span>, slice inner, build element.
+            let class = parse_attr_str(matched, "class").unwrap_or("").to_string();
+            let bbox = parse_attr_str(matched, "data-bbox").unwrap_or("").to_string();
+            let line = parse_attr_u32(matched, "data-line").unwrap_or(0);
+            let segment = parse_attr_u32(matched, "data-segment").unwrap_or(0);
+
+            let inner_start = m.end();
+            let close_offset = match xhtml[inner_start..].find("</span>") {
+                Some(off) => off,
+                None => break, // Graceful: malformed XHTML, stop.
+            };
+            let inner = &xhtml[inner_start..inner_start + close_offset];
+
+            // Inner content: text + optional inner tags (e.g. future <link>).
+            // raw_tags collects tag fragments; the text portion is everything else.
+            let raw_tags = extract_raw_tags(inner);
+            let inner_text_raw = extract_text_skipping_inner_tags(inner);
+            let text_content = match unescape(&inner_text_raw) {
+                Ok(cow) => normalize_segment_text(&cow),
+                Err(_) => normalize_segment_text(&inner_text_raw),
+            };
+
+            if !text_content.trim().is_empty() {
+                if let Some(element) = build_element(
+                    &state,
+                    &class,
+                    &bbox,
+                    line,
+                    segment,
+                    text_content,
+                    raw_tags,
+                    style_data,
+                    &bookmark_lookup,
+                ) {
+                    state.page_elements.push(element);
                 }
             }
 
-            Ok(Event::Empty(_)) => {}
-
-            Ok(Event::Text(ref e)) => {
-                // Capture direct text of the primary span (not text inside nested tags).
-                if ctx.in_span && ctx.span_nesting == 0 {
-                    if let Ok(text) = e.unescape() {
-                        ctx.span_text.push_str(&text);
-                    }
-                }
-            }
-
-            Ok(Event::End(ref e)) => {
-                let tag_name = e.name();
-                let tag_str = std::str::from_utf8(tag_name.as_ref()).unwrap_or("");
-
-                match tag_str {
-                    "span" if ctx.in_span => {
-                        if ctx.span_nesting > 0 {
-                            ctx.span_nesting -= 1;
-                        } else {
-                            // Closing the primary span: slice inner content, extract raw_tags, emit
-                            let end_pos = reader.buffer_position() - 7; // len("</span>") == 7
-                            ctx.span_raw_tags =
-                                extract_raw_tags(xhtml.get(ctx.span_start_pos..end_pos).unwrap_or(""));
-                            // Preserve boundary whitespace (collapse internal runs, keep at most one
-                            // leading/trailing space) so downstream same-line concatenation can see
-                            // whether Tika emitted a separator at the segment join.
-                            let text_content = normalize_segment_text(&ctx.span_text);
-                            if !text_content.trim().is_empty() {
-                                if let Some(element) = build_element(
-                                    &ctx,
-                                    text_content,
-                                    style_data,
-                                    &bookmark_sections,
-                                ) {
-                                    page_elements.push(element);
-                                }
-                            }
-                            ctx.reset_span();
-                        }
-                    }
-                    "p" if ctx.in_paragraph => {
-                        ctx.in_paragraph = false;
-                        ctx.paragraph_number += 1;
-                    }
-                    "aside" if ctx.container == Container::Aside => {
-                        ctx.container = Container::None;
-                        ctx.current_rotation = 0;
-                    }
-                    "div" if !ctx.in_span => {
-                        // Use div_depth to distinguish which </div> closes which container.
-                        // Band div was opened at band_div_depth; page div was opened at depth 1.
-                        // (When inside a span, </div> is caught by the raw_tags wildcard arm above.)
-                        if ctx.container == Container::Band
-                            && ctx.div_depth == ctx.band_div_depth
-                        {
-                            // Closing the band div
-                            ctx.container = Container::None;
-                            ctx.current_band = 0;
-                            ctx.current_nr_band_columns = 1;
-                            ctx.band_div_depth = 0;
-                        } else if ctx.in_page && ctx.div_depth == 1 {
-                            // Closing the page div (outermost page div is at depth 1)
-                            ctx.in_page = false;
-                        }
-                        // Decrement after checks (depth was at current value during checks)
-                        if ctx.div_depth > 0 {
-                            ctx.div_depth -= 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            Ok(Event::Eof) => break,
-            Err(_) => break, // Graceful: stop on malformed XML, return what we have
-            _ => {}
+            // Advance past </span> so inner tags can't trigger spurious matches.
+            pos = inner_start + close_offset + "</span>".len();
+        } else {
+            // Defensive: unmatched alternation case. Advance to avoid stalling.
+            pos = m.end();
         }
     }
 
-    // Flush the last page
-    if !page_elements.is_empty() {
+    // Flush the final page.
+    if !state.page_elements.is_empty() {
         finalize_page_elements(
-            &mut page_elements,
+            &mut state.page_elements,
             &mut all_elements,
             &mut global_reading_order,
         );
@@ -388,7 +365,7 @@ fn extract_text_elements(
     println!(
         "Total extraction: {} text elements across {} pages",
         all_elements.len(),
-        ctx.page_number
+        state.page_number
     );
 
     Ok(all_elements)
@@ -401,27 +378,49 @@ fn finalize_page_elements(
     global_reading_order: &mut u32,
 ) {
     page_elements.sort_unstable_by(|a, b| {
-        a.placement.bounding_box
+        a.placement
+            .bounding_box
             .y
             .total_cmp(&b.placement.bounding_box.y)
-            .then_with(|| a.placement.bounding_box.x.total_cmp(&b.placement.bounding_box.x))
+            .then_with(|| {
+                a.placement
+                    .bounding_box
+                    .x
+                    .total_cmp(&b.placement.bounding_box.x)
+            })
     });
     for el in page_elements.iter_mut() {
         el.reading_order = *global_reading_order;
         *global_reading_order += 1;
     }
-    all_elements.extend(page_elements.drain(..));
+    all_elements.append(page_elements);
 }
 
-/// Build a `PdfTextElement` from the current span context.
+/// NFKC + whitespace fold for cross-source string equivalence. Used to align
+/// PDF-extracted glyph runs (which can contain ligatures like ﬀ ﬁ) with
+/// bookmark titles (which usually decompose to plain ASCII). Also collapses
+/// any internal whitespace runs to a single space so layout-driven word
+/// breaks don't defeat matching.
+fn normalize_for_match(s: &str) -> String {
+    let nfkc: String = s.nfkc().collect();
+    nfkc.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Build a `PdfTextElement` from the current parse state and span attrs.
+#[allow(clippy::too_many_arguments)]
 fn build_element(
-    ctx: &ParseContext,
+    state: &ParseState,
+    span_class: &str,
+    span_bbox: &str,
+    line_number: u32,
+    segment_number: u32,
     text_content: String,
+    raw_tags: Vec<String>,
     style_data: &StyleData,
-    bookmark_sections: &[BookmarkSection],
+    bookmark_lookup: &HashMap<String, BookmarkSection>,
 ) -> Option<PdfTextElement> {
     // Parse bounding box: "x,y,width,height"
-    let bbox_parts: Vec<&str> = ctx.span_bbox.split(',').collect();
+    let bbox_parts: Vec<&str> = span_bbox.split(',').collect();
     if bbox_parts.len() != 4 {
         return None;
     }
@@ -436,42 +435,40 @@ fn build_element(
     };
 
     // Resolve font class
-    let font_class = if let Some(fc) = style_data.font_classes.get(&ctx.span_class) {
+    let font_class = if let Some(fc) = style_data.font_classes.get(span_class) {
         fc.clone()
     } else {
-        fallback_font(&ctx.span_class)
+        fallback_font(span_class)
     };
 
-    // Check for bookmark match — NFKC + whitespace fold both sides so a
-    // segment containing "oﬀer" matches a bookmark title with "offer".
-    let normalize_match = |s: &str| -> String {
-        let nfkc: String = s.nfkc().collect();
-        nfkc.split_whitespace().collect::<Vec<_>>().join(" ")
-    };
-    let text_normalized = normalize_match(&text_content);
-    let bookmark_match = bookmark_sections
-        .iter()
-        .find(|s| normalize_match(&s.title) == text_normalized)
+    // Bookmark match — O(1) via precomputed lookup keyed on normalized title.
+    let bookmark_match = bookmark_lookup
+        .get(&normalize_for_match(&text_content))
         .cloned();
 
     Some(PdfTextElement {
         text: text_content.clone(),
         style_info: font_class,
         placement: Placement {
-            page_number: ctx.page_number,
-            bounding_box: BoundingBox { x, y, width, height },
-            band: ctx.current_band,
-            column: ctx.span_column,
-            nr_band_columns: ctx.current_nr_band_columns,
-            line_number: ctx.span_line,
-            segment_number: ctx.span_segment,
-            rotation: ctx.current_rotation,
-            paragraph_number: ctx.paragraph_number,
+            page_number: state.page_number,
+            bounding_box: BoundingBox {
+                x,
+                y,
+                width,
+                height,
+            },
+            line_number,
+            segment_number,
+            rotation: state.current_rotation,
+            paragraph_number: state.paragraph_number,
+            region_label: None,
+            page_width: state.current_page_width,
+            page_height: state.current_page_height,
         },
         reading_order: 0, // Assigned later in finalize_page_elements
         bookmark_match,
         token_count: estimate_token_count(&text_content),
-        raw_tags: ctx.span_raw_tags.clone(),
+        raw_tags,
     })
 }
 
@@ -496,8 +493,7 @@ fn normalize_segment_text(s: &str) -> String {
     if body.is_empty() {
         return String::new();
     }
-    let mut out =
-        String::with_capacity(body.len() + leading as usize + trailing as usize);
+    let mut out = String::with_capacity(body.len() + leading as usize + trailing as usize);
     if leading {
         out.push(' ');
     }
@@ -595,7 +591,7 @@ fn extract_style_data(xhtml: &str) -> Result<StyleData> {
             if let Some(style_cap) = STYLE_REGEX.captures(style_block) {
                 if let Some(css_content) = style_cap.get(1) {
                     let css = css_content.as_str();
-                    let mut font_classes = HashMap::new();
+                    let mut font_classes = BTreeMap::new();
 
                     for cap in FONT_CLASS_REGEX.captures_iter(css) {
                         if let (
@@ -642,7 +638,7 @@ fn extract_style_data(xhtml: &str) -> Result<StyleData> {
 
     println!("No CSS styles found in XHTML — returning empty StyleData");
     Ok(StyleData {
-        font_classes: HashMap::new(),
+        font_classes: BTreeMap::new(),
     })
 }
 
@@ -718,5 +714,112 @@ fn extract_bookmark_data(xhtml: &str) -> Result<Option<BookmarkData>> {
         Ok(None)
     } else {
         Ok(Some(BookmarkData { sections }))
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wrap a body fragment in a minimal valid Blazegraph XHTML document.
+    fn xhtml_with(body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta name="dc:title" content="Test" />
+<style type="text/css">.f1 {{ font-family: Test; font-size: 10px; font-style: normal; font-weight: normal; color: #000000; }}
+</style>
+<title>Test</title>
+</head>
+<body>
+{body}
+</body>
+</html>"#
+        )
+    }
+
+    /// CR-40 acceptance: spans containing inner tags (e.g. future PDF goto
+    /// `<link>` elements) get their text content correctly extracted (link
+    /// inner text excluded) and the full tag fragment captured in raw_tags.
+    #[test]
+    fn span_with_inner_link_captures_raw_tag_and_excludes_link_text() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="100.0" data-height="100.0" />
+<p>
+<span class="f1" data-bbox="10,10,50,12" data-line="0" data-segment="0">See <link href="page:42">section 4.2</link> for details</span>
+</p>
+</div>"#,
+        );
+        let output = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(output.text_elements.len(), 1, "exactly one span emits");
+        let el = &output.text_elements[0];
+
+        // Text excludes the link's inner text (matches span_nesting==0 semantics
+        // from the prior pull-parser implementation).
+        assert!(
+            el.text.contains("See") && el.text.contains("for details"),
+            "text content should contain prefix and suffix; got: {:?}",
+            el.text
+        );
+        assert!(
+            !el.text.contains("section 4.2"),
+            "text should not include link inner content; got: {:?}",
+            el.text
+        );
+
+        // raw_tags captures the full <link>...</link> fragment for downstream
+        // consumers (e.g. corpus connection graph in closed-source modes).
+        assert!(
+            el.raw_tags
+                .iter()
+                .any(|t| t.contains("<link") && t.contains("section 4.2")),
+            "raw_tags should contain the link fragment; got: {:?}",
+            el.raw_tags
+        );
+    }
+
+    /// CR-40 acceptance: spans inside `<aside data-rotation="...">` inherit
+    /// the rotation; spans outside the aside have rotation=0.
+    #[test]
+    fn aside_propagates_rotation_to_inner_spans_only() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="100.0" data-height="100.0" />
+<aside data-rotation="90">
+<p>
+<span class="f1" data-bbox="10,10,50,12" data-line="0" data-segment="0">Rotated text</span>
+</p>
+</aside>
+<p>
+<span class="f1" data-bbox="20,20,50,12" data-line="0" data-segment="0">Normal text</span>
+</p>
+</div>"#,
+        );
+        let output = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(output.text_elements.len(), 2);
+
+        let rotated = output
+            .text_elements
+            .iter()
+            .find(|e| e.text.trim() == "Rotated text")
+            .expect("rotated element");
+        let normal = output
+            .text_elements
+            .iter()
+            .find(|e| e.text.trim() == "Normal text")
+            .expect("normal element");
+
+        assert_eq!(
+            rotated.placement.rotation, 90,
+            "span inside <aside data-rotation=\"90\"> should inherit rotation"
+        );
+        assert_eq!(
+            normal.placement.rotation, 0,
+            "span outside aside should have rotation=0"
+        );
     }
 }

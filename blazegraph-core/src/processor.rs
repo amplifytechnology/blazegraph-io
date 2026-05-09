@@ -1,3 +1,7 @@
+use crate::analytics::{
+    AnalysisBuilder, DocumentAnalysis, FontStatsBuilder, GeometryStatsBuilder, PageStatsBuilder,
+    RegionStatsBuilder, Statistic,
+};
 use crate::cache::{self, GraphCacheKey};
 use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
@@ -144,7 +148,9 @@ impl DocumentProcessor {
         println!("📄 Processing: {}", input_path);
 
         // --- C3: Graph cache check ---
-        if fresh_from.should_use_cache(CachePoint::C3) && cache_defaults.should_write(CachePoint::C3) {
+        if fresh_from.should_use_cache(CachePoint::C3)
+            && cache_defaults.should_write(CachePoint::C3)
+        {
             let config_hash = calculate_config_hash(config)?;
             let cache_key = GraphCacheKey::new(pdf_hash.clone(), config_hash);
             if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
@@ -158,11 +164,8 @@ impl DocumentProcessor {
 
         // Create deterministic ID generator: version + pdf_hash + config_hash
         let config_hash = calculate_config_hash(config)?;
-        let id_gen = NodeIdGenerator::new(
-            cache::versions::BLAZEGRAPH_VERSION,
-            &pdf_hash,
-            &config_hash,
-        );
+        let id_gen =
+            NodeIdGenerator::new(cache::versions::BLAZEGRAPH_VERSION, &pdf_hash, &config_hash);
 
         // --- C2: Preprocessor cache check ---
         let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {
@@ -170,22 +173,39 @@ impl DocumentProcessor {
                 println!("🎯 C2 preprocessor cache hit — skipping extraction + parsing");
                 cached
             } else {
-                self.extract_and_parse(input_path, &pdf_bytes, &pdf_hash, &fresh_from, cache_defaults, &mut profiler)?
+                self.extract_and_parse(
+                    input_path,
+                    &pdf_bytes,
+                    &pdf_hash,
+                    &fresh_from,
+                    cache_defaults,
+                    &mut profiler,
+                )?
             }
         } else {
-            self.extract_and_parse(input_path, &pdf_bytes, &pdf_hash, &fresh_from, cache_defaults, &mut profiler)?
+            self.extract_and_parse(
+                input_path,
+                &pdf_bytes,
+                &pdf_hash,
+                &fresh_from,
+                cache_defaults,
+                &mut profiler,
+            )?
         };
 
         // --- Stages 2-5: Classification → Rules → Graph → Post-processing ---
-        let graph = self.rules_and_graph(&preprocessor_output, config, &id_gen, &mut profiler)?;
+        let graph = self.rules_and_graph(
+            &preprocessor_output,
+            config,
+            &id_gen,
+            &pdf_hash,
+            &mut profiler,
+        )?;
 
         if enable_profiling {
             profiler.print_summary();
         }
-        println!(
-            "⏱️  Total: {:.0}ms",
-            start_time.elapsed().as_millis()
-        );
+        println!("⏱️  Total: {:.0}ms", start_time.elapsed().as_millis());
 
         Ok(graph)
     }
@@ -227,6 +247,7 @@ impl DocumentProcessor {
     ) -> Result<PipelineStages> {
         let input_path_ref = Path::new(input_path);
         let pdf_bytes = std::fs::read(input_path_ref)?;
+        let pdf_hash = calculate_pdf_hash(&pdf_bytes);
 
         // Stage 1a: PDF → XHTML (always fresh for diagnostics)
         let xhtml = self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)?;
@@ -236,24 +257,36 @@ impl DocumentProcessor {
         let preprocessor_output = self
             .preprocessor
             .parse_markup_to_preprocessor_output(&xhtml)?;
-        let text_elements = preprocessor_output.text_elements.clone();
-        println!("📋 Stage 1b: {} TextElements captured", text_elements.len());
+        println!(
+            "📋 Stage 1b: {} TextElements captured",
+            preprocessor_output.text_elements.len()
+        );
 
         // Stage 2: Classification + Rules → ParsedElements
         let classification = self.classifier.classify(&preprocessor_output)?;
-        let document_analysis =
-            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements);
+        let document_analysis = run_analytics(&preprocessor_output.text_elements);
+        if config.dump_analytics {
+            dump_stats(&*self.storage, &pdf_hash, &document_analysis)?;
+        }
+
+        // Reading-order resort + region tagging (Block 06b). Capture the
+        // post-resort stream as the canonical Stage 1b snapshot — this is
+        // the version that flows into rules and carries `region_label`.
+        let text_elements = crate::analytics::tag_and_resort(
+            preprocessor_output.text_elements.clone(),
+            &document_analysis,
+        );
+        let resorted_elements = text_elements.clone();
 
         let parsed_elements = if config.minimal_parse {
             self.rule_engine
-                .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
+                .convert_text_elements_to_parsed(&resorted_elements)
         } else {
-            let font_size_analysis = self.rule_engine.analyze_font_sizes(
-                &preprocessor_output.text_elements,
-                &preprocessor_output.style_data,
-            );
+            let font_size_analysis = self
+                .rule_engine
+                .analyze_font_sizes(&resorted_elements, &preprocessor_output.style_data);
             self.rule_engine.apply_rules_with_config(
-                &preprocessor_output.text_elements,
+                &resorted_elements,
                 &classification,
                 &document_analysis,
                 &font_size_analysis,
@@ -280,16 +313,12 @@ impl DocumentProcessor {
             .document_info
             .document_metadata
             .merge_extracted(preprocessor_output.metadata);
-        graph.document_info.document_analysis = document_analysis;
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
         crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
 
-        println!(
-            "📋 Stage 3: Graph captured ({} nodes)",
-            graph.nodes.len()
-        );
+        println!("📋 Stage 3: Graph captured ({} nodes)", graph.nodes.len());
 
         Ok(PipelineStages {
             xhtml,
@@ -347,8 +376,7 @@ impl DocumentProcessor {
         })?;
 
         if cache_defaults.should_write(CachePoint::C2) {
-            self.storage
-                .store_preprocessor_output(pdf_hash, &output)?;
+            self.storage.store_preprocessor_output(pdf_hash, &output)?;
             println!("💾 C2: PreprocessorOutput cached");
         }
 
@@ -365,6 +393,7 @@ impl DocumentProcessor {
         preprocessor_output: &PreprocessorOutput,
         config: &ParsingConfig,
         id_gen: &NodeIdGenerator,
+        pdf_hash: &str,
         profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
         // Classification
@@ -372,27 +401,43 @@ impl DocumentProcessor {
             self.classifier.classify(preprocessor_output)
         })?;
 
-        // Document analysis (used by rules + stored in DocumentInfo)
-        let document_analysis = profiler.time_step("Document Analysis", || {
-            DocumentAnalysis::analyze_text_elements(&preprocessor_output.text_elements)
+        // Document analytics pre-pass (read by rules; sidecar-dumped to
+        // `{cache_dir}/stat/<name>/<pdf_hash>.json` when `config.dump_analytics`).
+        // No longer persisted into graph.json — that field went away with schema 0.4.0.
+        let document_analysis = profiler.time_step("Document Analytics", || {
+            run_analytics(&preprocessor_output.text_elements)
+        });
+        if config.dump_analytics {
+            dump_stats(&*self.storage, pdf_hash, &document_analysis)?;
+        }
+
+        // Reading-order resort + region tagging (Block 06b). Annotates each
+        // element with its Region tree leaf label and reorders the stream so
+        // multi-column pages no longer interleave columns. Owned-clone of
+        // `text_elements` because PreprocessorOutput is borrowed immutably
+        // here; the cost is one Vec clone per document, negligible vs the
+        // rules / graph-build work that follows.
+        let text_elements = profiler.time_step("Reading-Order Resort", || {
+            crate::analytics::tag_and_resort(
+                preprocessor_output.text_elements.clone(),
+                &document_analysis,
+            )
         });
 
         // Rule processing
         let parsed_elements = if config.minimal_parse {
             println!("🔄 Minimal parse mode — skipping rule processing");
             self.rule_engine
-                .convert_text_elements_to_parsed(&preprocessor_output.text_elements)
+                .convert_text_elements_to_parsed(&text_elements)
         } else {
             let font_size_analysis = profiler.time_step("Font Analysis", || {
-                self.rule_engine.analyze_font_sizes(
-                    &preprocessor_output.text_elements,
-                    &preprocessor_output.style_data,
-                )
+                self.rule_engine
+                    .analyze_font_sizes(&text_elements, &preprocessor_output.style_data)
             });
 
             profiler.time_step("Rules Processing", || {
                 self.rule_engine.apply_rules_with_config(
-                    &preprocessor_output.text_elements,
+                    &text_elements,
                     &classification,
                     &document_analysis,
                     &font_size_analysis,
@@ -407,7 +452,8 @@ impl DocumentProcessor {
 
         // Graph construction (deterministic UUIDv5 node IDs)
         let mut graph = profiler.time_step("Graph Construction", || {
-            self.graph_builder.build_graph_deterministic(parsed_elements, id_gen)
+            self.graph_builder
+                .build_graph_deterministic(parsed_elements, id_gen)
         })?;
 
         // Post-processing: metadata, analysis, breadcrumbs
@@ -418,7 +464,6 @@ impl DocumentProcessor {
             .document_info
             .document_metadata
             .merge_extracted(preprocessor_output.metadata.clone());
-        graph.document_info.document_analysis = document_analysis;
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data.clone();
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
@@ -426,4 +471,44 @@ impl DocumentProcessor {
 
         Ok(graph)
     }
+}
+
+/// Run the document-analytics pre-pass over a slice of text elements.
+///
+/// Single-pass walk: dispatches each element to every enabled stat kind via
+/// `AnalysisBuilder`, then finalizes in dependency order. Output is consumed
+/// in pipeline memory by downstream rules and (when `dump_analytics`) written
+/// to per-stat sidecar files via [`dump_stats`].
+fn run_analytics(text_elements: &[PdfTextElement]) -> DocumentAnalysis {
+    let mut builder = AnalysisBuilder::new();
+    for element in text_elements {
+        builder.observe(element);
+    }
+    builder.finalize()
+}
+
+/// Per-stat sidecar dump. One JSON file per stat kind under
+/// `{cache_dir}/stat/<Statistic::NAME>/<pdf_hash>.json`. Folder-per-stat
+/// scoping (Marcus, Block 05) lets future stat kinds (RegionStats,
+/// PageOutlier, …) drop in without colliding. The full composite is the
+/// in-memory shape; the sidecar splits it for grep-ability and per-stat diff
+/// against Python prototype outputs.
+fn dump_stats(
+    storage: &dyn DocumentStorage,
+    pdf_hash: &str,
+    analysis: &DocumentAnalysis,
+) -> Result<()> {
+    let font_json = serde_json::to_string_pretty(&analysis.font)?;
+    storage.store_stat(pdf_hash, FontStatsBuilder::NAME, &font_json)?;
+
+    let geometry_json = serde_json::to_string_pretty(&analysis.geometry)?;
+    storage.store_stat(pdf_hash, GeometryStatsBuilder::NAME, &geometry_json)?;
+
+    let page_stats_json = serde_json::to_string_pretty(&analysis.page_stats)?;
+    storage.store_stat(pdf_hash, PageStatsBuilder::NAME, &page_stats_json)?;
+
+    let region_json = serde_json::to_string_pretty(&analysis.region)?;
+    storage.store_stat(pdf_hash, RegionStatsBuilder::NAME, &region_json)?;
+
+    Ok(())
 }

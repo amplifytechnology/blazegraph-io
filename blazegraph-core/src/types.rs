@@ -55,15 +55,29 @@ pub struct DocumentInfo {
     pub root_id: NodeId,
     /// Metadata extracted from the source format (title, author, page count, etc.)
     pub document_metadata: DocumentMetadata,
-    /// Analysis computed from text elements (font distributions, style stats)
-    pub document_analysis: DocumentAnalysis,
     /// PDF bookmarks/table of contents (if available in the source PDF)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark_data: Option<BookmarkData>,
 }
 /// The schema version stamped on every graph output.
 /// Bump this when the output shape changes.
-pub const SCHEMA_VERSION: &str = "0.3.0";
+///
+/// 0.4.0 — Block 05 of the document-analytics flow: dropped `document_info.document_analysis`.
+/// Analytics live in pipeline memory + sidecar dumps under `cache/stat/<name>/<hash>.json`,
+/// not in the graph output schema.
+///
+/// 0.5.0 — Block 06b reading-order resort: dropped legacy `Placement.band`,
+/// `Placement.column`, `Placement.nr_band_columns` (zeroed out since the
+/// Block 1 layout-reasoning consolidation); added `Placement.region_label`
+/// for region tree leaf annotation produced by `analytics::reading_order::tag_and_resort`.
+///
+/// 0.5.1 — Block 07 header/footer/margin classification: added `Header`,
+/// `Footer`, `Margin` variants to `ParsedElementType` (and matching
+/// `GroupType` variants). Element type is assigned at the
+/// `PdfTextElement` → `ParsedPdfElement` boundary from `region_label`
+/// (`H-*` → Header, `F-*` → Footer, `None` → Margin, body leaf labels →
+/// Paragraph). Section detection skips Header / Footer / Margin.
+pub const SCHEMA_VERSION: &str = "0.5.1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -248,13 +262,11 @@ pub enum DocumentType {
 // ===== ENHANCED GRAPH ANALYTICS STRUCTURES =====
 
 /// Histogram-based token distribution for comprehensive statistical analysis
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenDistribution {
     pub by_node_type: HashMap<String, TokenHistogram>,
     pub overall: TokenHistogram,
 }
-
 
 /// Histogram representation enabling statistical calculations (mean, median, mode, variance)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,13 +303,11 @@ pub struct HistogramBin {
     pub token_sum: usize, // Total tokens in this range
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeTypeDistribution {
     pub counts: HashMap<String, usize>,
     pub percentages: HashMap<String, f32>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepthDistribution {
@@ -335,15 +345,6 @@ pub struct Placement {
     /// Bounding box on the PDF page.
     pub bounding_box: BoundingBox,
 
-    /// 0-indexed Y-band container index on the page (CR-16).
-    pub band: u32,
-
-    /// 0-indexed column identity within the band (CR-15).
-    pub column: u32,
-
-    /// Number of columns in this band (CR-16). Values > 2 suggest table-like content.
-    pub nr_band_columns: u32,
-
     /// 0-indexed line number within the paragraph. From `data-line` on span.
     pub line_number: u32,
 
@@ -356,16 +357,50 @@ pub struct Placement {
     /// Tika's paragraph number within the page (per-page counter, reset each page).
     /// This is a Y-gap heuristic — reliable for clean prose, less so for math/list content.
     pub paragraph_number: u32,
+
+    /// Region tree leaf label this element belongs to. Set by Block 06b
+    /// (`analytics::reading_order::tag_and_resort`) when the analytics
+    /// pre-pass runs. Values:
+    ///   - `Some("1")`, `Some("2-1")`, etc. — body element in the named
+    ///     Region tree leaf (depth-first reading-order path from
+    ///     `RegionStats.per_page[…].root`).
+    ///   - `Some("H-1")`, `Some("H-2")`, … — header element (y-asc within
+    ///     the page's headers above `geometry.header_y`).
+    ///   - `Some("F-1")`, `Some("F-2")`, … — footer element (y-asc within
+    ///     the page's footers below `geometry.doc_footer_y`).
+    ///   - `None` — orphan element (within body Y range but outside the
+    ///     body X range — marginalia, sidebar). Placed at the end of the
+    ///     page's reading order in original Tika sequence.
+    ///
+    /// Internal pipeline state — not a public schema field. Optional via
+    /// `#[serde(default)]` so caches that predate this field deserialize
+    /// cleanly with `region_label = None`.
+    #[serde(default)]
+    pub region_label: Option<String>,
+
+    /// Width of the source PDF page in points. Sourced from Tika's
+    /// `<div class="page-meta" data-width=…>` (added by Tika as part of
+    /// the layout-reasoning consolidation flow). Carried on every
+    /// element so analytics can size per-page heatmaps without a
+    /// per-page side-channel.
+    /// `#[serde(default)]` keeps c2-preprocessor caches written before
+    /// this field existed deserializable; the value is 0.0 in that case
+    /// and consumers should treat 0.0 as "unknown".
+    #[serde(default)]
+    pub page_width: f32,
+
+    /// Height of the source PDF page in points. See `page_width`.
+    #[serde(default)]
+    pub page_height: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PdfTextElement {
     pub text: String,
     pub style_info: FontClass,
-    pub placement: Placement,                   // REPLACES: bounding_box, page_number,
-                                                //   paragraph_number, line_number,
-                                                //   segment_number, rotation, band,
-                                                //   column, nr_band_columns
+    pub placement: Placement, // REPLACES: bounding_box, page_number,
+    //   paragraph_number, line_number,
+    //   segment_number, rotation
     pub reading_order: u32,
     pub bookmark_match: Option<BookmarkSection>,
     pub token_count: usize,
@@ -390,16 +425,6 @@ impl PdfTextElement {
     /// Text rotation in degrees.
     pub fn rotation(&self) -> i32 {
         self.placement.rotation
-    }
-
-    /// Band index from enclosing band div.
-    pub fn band(&self) -> u32 {
-        self.placement.band
-    }
-
-    /// Column index within the band.
-    pub fn column(&self) -> u32 {
-        self.placement.column
     }
 
     /// 0-indexed line number within the paragraph.
@@ -441,25 +466,53 @@ impl DocumentMetadata {
     /// Non-None fields from `extracted` overwrite; None fields preserve existing.
     /// page_count overwrites if > 0.
     pub fn merge_extracted(&mut self, extracted: DocumentMetadata) {
-        if extracted.title.is_some() { self.title = extracted.title; }
-        if extracted.author.is_some() { self.author = extracted.author; }
-        if extracted.language.is_some() { self.language = extracted.language; }
-        if extracted.page_count > 0 { self.page_count = extracted.page_count; }
-        if extracted.publisher.is_some() { self.publisher = extracted.publisher; }
-        if extracted.creator_tool.is_some() { self.creator_tool = extracted.creator_tool; }
-        if extracted.producer.is_some() { self.producer = extracted.producer; }
-        if extracted.pdf_version.is_some() { self.pdf_version = extracted.pdf_version; }
-        if extracted.created.is_some() { self.created = extracted.created; }
-        if extracted.modified.is_some() { self.modified = extracted.modified; }
-        if extracted.description.is_some() { self.description = extracted.description; }
-        if extracted.encrypted.is_some() { self.encrypted = extracted.encrypted; }
-        if extracted.has_marked_content.is_some() { self.has_marked_content = extracted.has_marked_content; }
+        if extracted.title.is_some() {
+            self.title = extracted.title;
+        }
+        if extracted.author.is_some() {
+            self.author = extracted.author;
+        }
+        if extracted.language.is_some() {
+            self.language = extracted.language;
+        }
+        if extracted.page_count > 0 {
+            self.page_count = extracted.page_count;
+        }
+        if extracted.publisher.is_some() {
+            self.publisher = extracted.publisher;
+        }
+        if extracted.creator_tool.is_some() {
+            self.creator_tool = extracted.creator_tool;
+        }
+        if extracted.producer.is_some() {
+            self.producer = extracted.producer;
+        }
+        if extracted.pdf_version.is_some() {
+            self.pdf_version = extracted.pdf_version;
+        }
+        if extracted.created.is_some() {
+            self.created = extracted.created;
+        }
+        if extracted.modified.is_some() {
+            self.modified = extracted.modified;
+        }
+        if extracted.description.is_some() {
+            self.description = extracted.description;
+        }
+        if extracted.encrypted.is_some() {
+            self.encrypted = extracted.encrypted;
+        }
+        if extracted.has_marked_content.is_some() {
+            self.has_marked_content = extracted.has_marked_content;
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleData {
-    pub font_classes: std::collections::HashMap<String, FontClass>,
+    /// Sorted by key (font class name) so JSON serialization is deterministic.
+    /// Required for content-addressed cache stability — see CR-40.
+    pub font_classes: std::collections::BTreeMap<String, FontClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,108 +589,11 @@ pub struct ListSequence {
 /// Future candidates: largest font on page 1, first bold text, etc.
 pub fn infer_title(elements: &[ParsedPdfElement]) -> Option<String> {
     // Strategy 1: First section element
-    elements.iter()
+    elements
+        .iter()
         .find(|e| e.element_type == ParsedElementType::Section)
         .map(|e| e.text.trim().to_string())
         .filter(|t| !t.is_empty())
-}
-
-/// Document analysis meta-attributes calculated from text elements
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentAnalysis {
-    /// Count of each exact font size found in the document
-    pub font_size_counts: HashMap<String, usize>, // Use String for JSON compatibility
-    /// Count of each font family found in the document
-    pub font_family_counts: HashMap<String, usize>,
-    /// Count of bold vs non-bold text elements (bold_count, non_bold_count)
-    pub bold_counts: (usize, usize),
-    /// Count of italic vs non-italic text elements (italic_count, non_italic_count)
-    pub italic_counts: (usize, usize),
-
-    /// Most frequently occurring font size in the document
-    pub most_common_font_size: f32,
-    /// Most frequently occurring font family in the document
-    pub most_common_font_family: String,
-    /// All font sizes found, sorted for analysis
-    pub all_font_sizes: Vec<f32>,
-}
-
-impl DocumentAnalysis {
-    /// Create document analysis from text elements
-    pub fn analyze_text_elements(text_elements: &[PdfTextElement]) -> Self {
-        let mut font_size_counts: HashMap<String, usize> = HashMap::new();
-        let mut font_family_counts: HashMap<String, usize> = HashMap::new();
-        let mut bold_count = 0;
-        let mut non_bold_count = 0;
-        let mut italic_count = 0;
-        let mut non_italic_count = 0;
-        let mut font_sizes = Vec::new();
-
-        for element in text_elements {
-            // Exclude rotated elements (rotation != 0) from font hierarchy statistics.
-            // Rotated content (e.g. arxiv sidebar at rotation=90) corrupts most_common_font_size
-            // and potential_header_sizes with non-body-flow sizes. CR-10 / Block 02.
-            if element.rotation() != 0 {
-                continue;
-            }
-
-            let style = &element.style_info;
-
-            // Count font sizes
-            let size_key = format!("{:.1}", style.font_size);
-            *font_size_counts.entry(size_key).or_insert(0) += 1;
-            font_sizes.push(style.font_size);
-
-            // Count font families
-            *font_family_counts
-                .entry(style.font_family.clone())
-                .or_insert(0) += 1;
-
-            // Count bold/non-bold
-            let is_bold = style.font_weight.to_lowercase().contains("bold");
-            if is_bold {
-                bold_count += 1;
-            } else {
-                non_bold_count += 1;
-            }
-
-            // Count italic/non-italic
-            let is_italic = style.font_style.to_lowercase().contains("italic");
-            if is_italic {
-                italic_count += 1;
-            } else {
-                non_italic_count += 1;
-            }
-        }
-
-        // Find most common font size
-        let most_common_font_size = font_size_counts
-            .iter()
-            .max_by_key(|(_, &count)| count)
-            .and_then(|(size_str, _)| size_str.parse::<f32>().ok())
-            .unwrap_or(12.0);
-
-        // Find most common font family
-        let most_common_font_family = font_family_counts
-            .iter()
-            .max_by_key(|(_, &count)| count)
-            .map(|(family, _)| family.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Sort and deduplicate font sizes for analysis
-        font_sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        font_sizes.dedup();
-
-        Self {
-            font_size_counts,
-            font_family_counts,
-            bold_counts: (bold_count, non_bold_count),
-            italic_counts: (italic_count, non_italic_count),
-            most_common_font_size,
-            most_common_font_family,
-            all_font_sizes: font_sizes,
-        }
-    }
 }
 
 // ===== GRAPH ANALYTICS IMPLEMENTATION =====
@@ -666,6 +622,9 @@ pub struct ElementGroup {
 pub enum GroupType {
     Section,
     Paragraph,
+    Header,
+    Footer,
+    Margin,
 }
 /// Complete output from document preprocessing
 ///
@@ -693,8 +652,8 @@ pub struct ParsedPdfElement {
     pub hierarchy_level: u32,
     pub position: usize,
     pub style_info: FontClass,
-    pub placement: Option<Placement>,            // REPLACES: bounding_box, page_number, paragraph_number
-                                                 // None for non-PDF sources (future HTML/Markdown).
+    pub placement: Option<Placement>, // REPLACES: bounding_box, page_number, paragraph_number
+    // None for non-PDF sources (future HTML/Markdown).
     pub reading_order: u32,
     pub bookmark_match: Option<BookmarkSection>,
     pub token_count: usize,
@@ -704,7 +663,9 @@ impl ParsedPdfElement {
     /// Return the placement for PDF-sourced elements.
     /// Panics with a clear message if called on a non-PDF element (placement is None).
     pub fn pdf_placement(&self) -> &Placement {
-        self.placement.as_ref().expect("PDF-sourced ParsedPdfElement must have placement")
+        self.placement
+            .as_ref()
+            .expect("PDF-sourced ParsedPdfElement must have placement")
     }
 }
 
@@ -714,4 +675,92 @@ pub enum ParsedElementType {
     Paragraph,
     List,
     ListItem,
+    Header,
+    Footer,
+    Margin,
+}
+
+impl ParsedElementType {
+    /// Initial element type derived from a region label produced by
+    /// `analytics::reading_order::tag_and_resort`.
+    ///
+    /// - `Some("H-*")` → `Header` (running header element)
+    /// - `Some("F-*")` → `Footer` (running footer element)
+    /// - `None` → `Margin` (orphan: sidebar / rotated / out-of-region content)
+    /// - any other label (body leaf path like `"1"`, `"2-1"`, `"2-4-1"`) → `Paragraph`
+    pub fn from_region_label(label: Option<&str>) -> Self {
+        match label {
+            Some(l) if l.starts_with("H-") => Self::Header,
+            Some(l) if l.starts_with("F-") => Self::Footer,
+            Some(_) => Self::Paragraph,
+            None => Self::Margin,
+        }
+    }
+}
+
+#[cfg(test)]
+mod parsed_element_type_tests {
+    use super::ParsedElementType;
+
+    #[test]
+    fn header_label_maps_to_header() {
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("H-1")),
+            ParsedElementType::Header
+        );
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("H-12")),
+            ParsedElementType::Header
+        );
+    }
+
+    #[test]
+    fn footer_label_maps_to_footer() {
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("F-1")),
+            ParsedElementType::Footer
+        );
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("F-3")),
+            ParsedElementType::Footer
+        );
+    }
+
+    #[test]
+    fn body_leaf_label_maps_to_paragraph() {
+        // Region tree leaf paths from `analytics::reading_order` —
+        // depth-first DF order on the per-page Region tree.
+        for label in ["1", "2-1", "2-4-1", "10"] {
+            assert_eq!(
+                ParsedElementType::from_region_label(Some(label)),
+                ParsedElementType::Paragraph,
+                "label {label:?} should map to Paragraph",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_label_maps_to_margin() {
+        // `region_label = None` covers orphans: rotated content, sidebar
+        // marginalia, elements outside any region tree leaf, pages with
+        // no Region tree (e.g., NonBody pages where xy_cut bailed).
+        assert_eq!(
+            ParsedElementType::from_region_label(None),
+            ParsedElementType::Margin
+        );
+    }
+
+    #[test]
+    fn header_footer_prefix_is_strict() {
+        // A label that merely contains "H-" or "F-" mid-string is a body
+        // leaf path, not a header / footer. Only the leading prefix counts.
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("1-H-2")),
+            ParsedElementType::Paragraph
+        );
+        assert_eq!(
+            ParsedElementType::from_region_label(Some("Hello")),
+            ParsedElementType::Paragraph
+        );
+    }
 }

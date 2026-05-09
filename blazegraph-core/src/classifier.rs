@@ -1,7 +1,6 @@
 use crate::types::*;
 use anyhow::Result;
 
-
 pub struct DocumentClassifier;
 
 impl Default for DocumentClassifier {
@@ -15,14 +14,17 @@ impl DocumentClassifier {
         Self
     }
 
-    pub fn classify(&self, _preprocessor_output: &PreprocessorOutput) -> Result<ClassificationResult> {
+    pub fn classify(
+        &self,
+        _preprocessor_output: &PreprocessorOutput,
+    ) -> Result<ClassificationResult> {
         println!("🔍 Classifying document type...");
 
         // TODO: There is a large question we want to answer here.
         // Would we like the classifyer to work on the TextElement Vec
         // Or work on the markuplanuage directly? It is very possilbe that
-        // One is a lot faster than the other so we might consider adding 
-        // the raw markup to the preprocessor_output. 
+        // One is a lot faster than the other so we might consider adding
+        // the raw markup to the preprocessor_output.
 
         // Simple pattern-based classification for MVP
         // let (doc_type, confidence) = if self.is_legal_contract(content) {

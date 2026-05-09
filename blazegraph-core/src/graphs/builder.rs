@@ -1,5 +1,5 @@
-use crate::types::*;
 use super::node_id::NodeIdGenerator;
+use crate::types::*;
 use anyhow::Result;
 
 pub struct GraphBuilder;
@@ -255,6 +255,9 @@ impl GraphBuilder {
                 crate::types::ParsedElementType::List => GroupType::Paragraph,
                 crate::types::ParsedElementType::ListItem => GroupType::Paragraph,
                 crate::types::ParsedElementType::Paragraph => GroupType::Paragraph,
+                crate::types::ParsedElementType::Header => GroupType::Header,
+                crate::types::ParsedElementType::Footer => GroupType::Footer,
+                crate::types::ParsedElementType::Margin => GroupType::Margin,
             };
 
             groups.push(ElementGroup {
@@ -277,7 +280,8 @@ impl GraphBuilder {
     ) -> Result<DocumentNode> {
         let (node_type_str, physical) = self.extract_node_type_and_physical(group);
 
-        let mut node = DocumentNode::new_with_id(node_id, node_type_str, group.combined_text.clone());
+        let mut node =
+            DocumentNode::new_with_id(node_id, node_type_str, group.combined_text.clone());
         node.location.physical = physical;
         node.text_order = Some(order);
         node.token_count = group.elements.iter().map(|e| e.token_count).sum();
@@ -299,13 +303,19 @@ impl GraphBuilder {
         Ok(node)
     }
 
-    fn extract_node_type_and_physical(&self, group: &ElementGroup) -> (&str, Option<PhysicalLocation>) {
+    fn extract_node_type_and_physical(
+        &self,
+        group: &ElementGroup,
+    ) -> (&str, Option<PhysicalLocation>) {
         if let Some(first_element) = group.elements.first() {
             let node_type = match first_element.element_type {
                 crate::types::ParsedElementType::Section => "Section",
                 crate::types::ParsedElementType::List => "List",
                 crate::types::ParsedElementType::ListItem => "ListItem",
                 crate::types::ParsedElementType::Paragraph => "Paragraph",
+                crate::types::ParsedElementType::Header => "Header",
+                crate::types::ParsedElementType::Footer => "Footer",
+                crate::types::ParsedElementType::Margin => "Margin",
             };
 
             let placement = first_element.pdf_placement();
@@ -319,6 +329,9 @@ impl GraphBuilder {
             let node_type = match group.group_type {
                 GroupType::Section => "Section",
                 GroupType::Paragraph => "Paragraph",
+                GroupType::Header => "Header",
+                GroupType::Footer => "Footer",
+                GroupType::Margin => "Margin",
             };
             (node_type, None)
         }
