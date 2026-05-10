@@ -2,7 +2,7 @@ use crate::analytics::{
     AnalysisBuilder, DocumentAnalysis, FontStatsBuilder, GeometryStatsBuilder, PageStatsBuilder,
     RegionStatsBuilder, Statistic,
 };
-use crate::cache::{self, GraphCacheKey};
+use crate::cache::GraphCacheKey;
 use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
 use crate::graphs::builder::GraphBuilder;
@@ -163,10 +163,28 @@ impl DocumentProcessor {
             }
         }
 
-        // Create deterministic ID generator: version + pdf_hash + config_hash
+        // Build the provenance triple that identifies this parse run.
+        // The same `(blazegraph_version, source_sha256, config_hash)`
+        // values feed `NodeIdGenerator::new` (so node IDs depend only on
+        // these three things), and `parse_provenance` is persisted on
+        // the graph so the bgraph.md emitter (B2) can populate the
+        // document-level identity block without re-reading the source.
         let config_hash = calculate_config_hash(config)?;
-        let id_gen =
-            NodeIdGenerator::new(cache::versions::BLAZEGRAPH_VERSION, &pdf_hash, &config_hash);
+        let provenance = ParseProvenance {
+            blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_format: "pdf".to_string(),
+            source_filename: Path::new(input_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| input_path.to_string()),
+            source_sha256: pdf_hash.clone(),
+            config_hash: config_hash.clone(),
+        };
+        let id_gen = NodeIdGenerator::new(
+            &provenance.blazegraph_version,
+            &provenance.source_sha256,
+            &provenance.config_hash,
+        );
 
         // --- C2: Preprocessor cache check ---
         let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {
@@ -199,6 +217,7 @@ impl DocumentProcessor {
             &preprocessor_output,
             config,
             &id_gen,
+            provenance,
             &pdf_hash,
             &mut profiler,
         )?;
@@ -397,6 +416,7 @@ impl DocumentProcessor {
         preprocessor_output: &PreprocessorOutput,
         config: &ParsingConfig,
         id_gen: &NodeIdGenerator,
+        parse_provenance: ParseProvenance,
         pdf_hash: &str,
         profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
@@ -462,8 +482,11 @@ impl DocumentProcessor {
 
         // Graph construction (deterministic UUIDv5 node IDs)
         let mut graph = profiler.time_step("Graph Construction", || {
-            self.graph_builder
-                .build_graph_deterministic(semantic_elements, id_gen)
+            self.graph_builder.build_graph_deterministic(
+                semantic_elements,
+                id_gen,
+                parse_provenance,
+            )
         })?;
 
         // Post-processing: metadata, analysis, breadcrumbs

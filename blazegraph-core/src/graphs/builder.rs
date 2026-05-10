@@ -26,10 +26,19 @@ impl GraphBuilder {
     /// walk-and-zip: each `SemanticTreeElement` becomes one
     /// `DocumentNode`, with a deterministic ID salted from
     /// `text_order` (which equals vec index, asserted in debug builds).
+    ///
+    /// `parse_provenance` is persisted on
+    /// `graph.document_info.parse_provenance` so downstream consumers
+    /// (notably the bgraph.md emitter) can reproduce the graph and
+    /// emit round-trippable identity fields without re-deriving them.
+    /// The same `(blazegraph_version, source_sha256, config_hash)`
+    /// triple feeds `id_gen`; callers should construct
+    /// `ParseProvenance` from the same data.
     pub fn build_graph_deterministic(
         &self,
         elements: Vec<SemanticTreeElement>,
         id_gen: &NodeIdGenerator,
+        parse_provenance: ParseProvenance,
     ) -> Result<DocumentGraph> {
         println!(
             "🏗️  Building document graph from {} elements",
@@ -116,6 +125,11 @@ impl GraphBuilder {
         // Update structural profile node count
         graph.structural_profile.total_nodes = graph.nodes.len();
         graph.structural_profile.document_type = DocumentType::Generic;
+
+        // Persist origin so the bgraph.md emitter (B2) and any future
+        // round-trip consumer can reproduce the graph deterministically
+        // without re-reading the source bytes.
+        graph.document_info.parse_provenance = Some(parse_provenance);
 
         println!("✅ Graph built: {} nodes", graph.nodes.len());
 
