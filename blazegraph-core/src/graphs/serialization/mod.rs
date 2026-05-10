@@ -1,3 +1,23 @@
+//! Output-format serialization for `DocumentGraph`.
+//!
+//! This module covers *output*-shaped concerns — projecting an
+//! in-memory graph onto a wire format consumers expect. Input-shaped
+//! concerns (parsing PDFs, markdown, DOCX into a graph) live under
+//! `crate::preprocessors`.
+//!
+//! Submodules:
+//!
+//! - [`canonical`] — canonical JSON + `graph_sha256` (used as the
+//!   stable input to identity hashes and round-trip verification).
+//! - [`markdown`] — bgraph.md emitter (forward emitter B2 of the
+//!   MD+DOCX format expansion flow).
+//!
+//! The existing `to_sequential_format` / `to_flat_format` impl block
+//! lives in this file (legacy output shapes pre-dating bgraph.md).
+
+pub mod canonical;
+pub mod markdown;
+
 use crate::types::*;
 use anyhow::Result;
 
