@@ -1,5 +1,5 @@
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{anyhow, Result};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use std::path::Path;
 
 // Import from blazegraph-io-core
@@ -16,66 +16,111 @@ const DEFAULT_CONFIG_YAML: &str = include_str!("../configs/processing/config.yam
 #[cfg(feature = "jni-backend")]
 use blazegraph_io::JreManager;
 
+// =========================================================================
+// CLI surface
+// =========================================================================
+//
+// B5 (2026-05-10) introduced an explicit subcommand surface — `parse`
+// and `strip` — alongside markdown input/output support. There is no
+// flag-only fallthrough mode: prior to B5 the CLI was a bare-args
+// invocation (`blazegraph -i foo.pdf`), but the design dialogue locked
+// in subcommands for clarity (no real users to preserve). The README
+// and example invocations use `blazegraph parse ...` and
+// `blazegraph strip ...` as the canonical forms.
+
 #[derive(Parser)]
 #[command(name = "blazegraph")]
 #[command(about = "A semantic document graph parser with configurable rules")]
-struct Args {
-    /// Path to the PDF file to process
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Parse a document into a semantic graph (or emit it back to bgraph.md).
+    ///
+    /// Input formats: `.pdf` (existing PDF channel) and `.bgraph.md` /
+    /// `.md` (the round-trip artifact from `-f markdown`). The input
+    /// format is auto-detected from extension and content-sniffed for
+    /// unknown extensions.
+    Parse(ParseArgs),
+
+    /// Strip bgraph fences from a bgraph.md file.
+    ///
+    /// Three modes: `body-only` (default) removes every bgraph fence
+    /// for Unstructured-equivalent body-only output; `keep-metadata`
+    /// preserves the doc-level identity block while stripping
+    /// per-element fences; `noise-only` removes only Header/Footer/
+    /// Margin fences (and their inside-fence bodies).
+    Strip(StripArgs),
+}
+
+#[derive(ClapArgs)]
+struct ParseArgs {
+    /// Path to the input file (PDF, .bgraph.md, or .md).
     #[arg(short, long, default_value = "../sample_pdfs/sample3.pdf")]
     input: String,
 
-    /// Path to custom config file (YAML format)
+    /// Path to custom config file (YAML format). PDF channel only.
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Output format: graph, sequential, or flat
+    /// Output format: `graph` (default JSON), `sequential`, `flat`, or `markdown`.
+    ///
+    /// `markdown` emits the bgraph.md round-trip artifact (B2) and is the
+    /// inverse of bgraph.md input.
     #[arg(short = 'f', long, default_value = "graph")]
     output_format: String,
 
-    /// Show available config options and exit
+    /// Show available config options and exit.
     #[arg(long)]
     show_configs: bool,
 
-    /// Output file path (if not specified, auto-generated based on input)
+    /// Output file path (if not specified, auto-generated based on input).
+    ///
+    /// Auto-generated suffix is `.bgraph.md` for `-f markdown`, otherwise
+    /// `_blazegraph.json`.
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Enable minimal parse mode (bypass all rule processing)
+    /// Enable minimal parse mode (bypass all rule processing). PDF channel only.
     #[arg(long)]
     minimal_parse: bool,
 
-    /// Path to JRE directory (for JNI backend)
-    /// If not specified, JRE will be auto-downloaded on first use
+    /// Path to JRE directory (for JNI backend). PDF channel only.
+    /// If not specified, JRE will be auto-downloaded on first use.
     #[arg(long)]
     jre_path: Option<String>,
 
-    /// Path to Tika JAR file (for JNI backend)
-    /// If not specified, uses bundled JAR
+    /// Path to Tika JAR file (for JNI backend). PDF channel only.
+    /// If not specified, uses bundled JAR.
     #[arg(long)]
     jar_path: Option<String>,
 
-    /// Enable detailed profiling of all pipeline steps
+    /// Enable detailed profiling of all pipeline steps. PDF channel only.
     #[arg(long)]
     profile: bool,
 
     /// Include style_info on each node (font_class, font_size, font_family, bold, italic, color).
-    /// Stripped by default to reduce output size (~20%). Useful for authoring parsing configs.
+    /// Stripped by default to reduce output size (~20%). PDF channel only.
     #[arg(long)]
     include_style_info: bool,
 
-    /// Dump all intermediate pipeline stage outputs to a directory
-    /// Captures: XHTML, TextElements, ParsedElements, and final Graph as separate files
+    /// Dump all intermediate pipeline stage outputs to a directory.
+    /// Captures: XHTML, TextElements, ParsedElements, and final Graph as separate files.
+    /// PDF channel only.
     #[arg(long)]
     dump_stages: bool,
 
-    /// Directory for stage dump output (default: {cache_dir}/debug)
+    /// Directory for stage dump output (default: {cache_dir}/debug).
     #[arg(long)]
     stages_dir: Option<String>,
 
     // =========================================================================
     // Cache control (CR-11)
     // =========================================================================
-
     /// Override cache directory location.
     /// Default: ~/.local/share/blazegraph/cache/
     /// Also configurable via BLAZEGRAPH_CACHE_DIR env var.
@@ -93,14 +138,79 @@ struct Args {
     #[arg(long)]
     clear_cache: Option<String>,
 
-    /// Alias for --fresh-from c0 (reprocess everything from scratch)
+    /// Alias for --fresh-from c0 (reprocess everything from scratch).
     #[arg(long)]
     skip_cache: bool,
+
+    // =========================================================================
+    // Markdown-input flags (B5)
+    // =========================================================================
+    /// Accept hash-drifted bgraph.md input. When the recomputed
+    /// `graph_sha256` does not match the value embedded in the
+    /// doc-level block, return a derivative graph instead of erroring.
+    /// Only meaningful when the input is markdown.
+    #[arg(long)]
+    accept_drift: bool,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+#[derive(ClapArgs)]
+struct StripArgs {
+    /// Path to the bgraph.md file to strip.
+    #[arg(short, long)]
+    input: String,
 
+    /// Output file path. If omitted, stripped content is written to stdout.
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Strip mode. Default: `body-only` (Unstructured-equivalent body text).
+    #[arg(long, value_enum, default_value_t = CliStripMode::BodyOnly)]
+    mode: CliStripMode,
+}
+
+/// CLI mirror of [`blazegraph_io_core::preprocessors::md::StripMode`].
+///
+/// Held separately so the CLI surface can use clap's `ValueEnum`
+/// derive without imposing it on the lib type.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliStripMode {
+    /// Remove all bgraph fences (Unstructured-equivalent body output).
+    BodyOnly,
+    /// Keep doc-level + Section/Paragraph bodies; strip per-element fences.
+    KeepMetadata,
+    /// Strip only Header/Footer/Margin (noise) fences and their bodies.
+    NoiseOnly,
+}
+
+impl From<CliStripMode> for blazegraph_io_core::preprocessors::md::StripMode {
+    fn from(m: CliStripMode) -> Self {
+        use blazegraph_io_core::preprocessors::md::StripMode as Core;
+        match m {
+            CliStripMode::BodyOnly => Core::BodyOnly,
+            CliStripMode::KeepMetadata => Core::KeepMetadata,
+            CliStripMode::NoiseOnly => Core::NoiseOnly,
+        }
+    }
+}
+
+// =========================================================================
+// Entry point
+// =========================================================================
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Parse(args) => run_parse(args),
+        Command::Strip(args) => run_strip(args),
+    }
+}
+
+// =========================================================================
+// `parse` subcommand
+// =========================================================================
+
+fn run_parse(args: ParseArgs) -> Result<()> {
     println!("🦀 Blazegraph Document Parser");
 
     if args.show_configs {
@@ -134,11 +244,40 @@ fn main() -> Result<()> {
 
     // Check if input file exists
     if !Path::new(&args.input).exists() {
-        println!("⚠️  Input PDF not found at: {}", args.input);
+        println!("⚠️  Input file not found at: {}", args.input);
         println!("   Please check the file path.");
         return Ok(());
     }
 
+    // Branch on input format: markdown vs PDF.
+    //
+    // The markdown channel bypasses the PDF pipeline (no JRE / Tika /
+    // rule engine). We detect by extension first, content-sniff
+    // fallback for unknown extensions (see `detect_input_format`).
+    match detect_input_format(Path::new(&args.input))? {
+        InputFormat::BgraphMd { content } => run_parse_markdown(args, content),
+        InputFormat::Pdf => run_parse_pdf(args, cache_dir),
+        InputFormat::Unknown => Err(anyhow!(
+            "❌ Input format not recognized: {}\n\
+             \n\
+             Supported formats:\n\
+             \t.pdf            — PDF documents (full parsing pipeline)\n\
+             \t.bgraph.md      — Blazegraph markdown round-trip artifact\n\
+             \t.md, .markdown  — Generic markdown (NOT YET SUPPORTED; tracked in CR)\n\
+             \n\
+             For generic markdown files that aren't a bgraph.md round-trip\n\
+             artifact, see the format expansion roadmap.",
+            args.input
+        )),
+    }
+}
+
+// =========================================================================
+// PDF channel (existing behavior, unchanged except for being inside
+// `run_parse_pdf`)
+// =========================================================================
+
+fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
     // Create processor with resolved cache dir
     let mut processor = create_processor(&args, &cache_dir)?;
 
@@ -180,7 +319,10 @@ fn main() -> Result<()> {
 
     // Stage dump mode: capture and save all intermediates
     if args.dump_stages {
-        let stages_dir = args.stages_dir.unwrap_or_else(|| format!("{}/debug", cache_dir));
+        let stages_dir = args
+            .stages_dir
+            .clone()
+            .unwrap_or_else(|| format!("{}/debug", cache_dir));
         println!("\n🔬 Pipeline stage dump mode");
         match processor.process_document_capture_stages(&args.input, &config) {
             Ok(stages) => {
@@ -217,30 +359,14 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Generate output path
-            let output_path = if let Some(output) = &args.output {
-                output.clone()
-            } else {
-                let input_name = Path::new(&args.input)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
-                let config_suffix = args
-                    .config
-                    .as_ref()
-                    .and_then(|p| Path::new(p).file_stem())
-                    .and_then(|s| s.to_str())
-                    .map(|s| format!("_{s}"))
-                    .unwrap_or_default();
-                format!("{input_name}{config_suffix}_blazegraph.json")
-            };
-
-            // Save the graph
+            let output_path = resolve_output_path(&args);
             save_graph(&graph, &output_path, &args.output_format)?;
 
             // Fast exit - skip JVM shutdown sequence
             #[cfg(feature = "jni-backend")]
             std::process::exit(0);
+            #[cfg(not(feature = "jni-backend"))]
+            Ok(())
         }
         Err(e) => {
             eprintln!("❌ Processing failed: {e}");
@@ -249,8 +375,236 @@ fn main() -> Result<()> {
     }
 }
 
+// =========================================================================
+// Markdown channel (B5)
+// =========================================================================
+
+fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
+    use blazegraph_io_core::preprocessors::md::{
+        parse_markdown, ParseError, ParseIdentity, ParseOptions,
+    };
+
+    println!("📄 Parsing bgraph.md: {}", args.input);
+
+    let opts = ParseOptions {
+        accept_drift: args.accept_drift,
+    };
+    let result = match parse_markdown(&content, opts) {
+        Ok(r) => r,
+        Err(ParseError::HashMismatch {
+            original,
+            recomputed,
+        }) => {
+            eprintln!(
+                "\n❌ bgraph.md graph_sha256 mismatch.\n\
+                 \toriginal:   {original}\n\
+                 \trecomputed: {recomputed}\n\
+                 \n\
+                 This means the bgraph.md has been edited since emission.\n\
+                 To accept the drifted content as a new derivative graph,\n\
+                 re-run with --accept-drift.\n"
+            );
+            std::process::exit(2);
+        }
+        Err(ParseError::GenericMarkdownNotYetSupported) => {
+            eprintln!(
+                "\n❌ Input is generic markdown (not a bgraph.md round-trip artifact).\n\
+                 \tGeneric markdown ingestion is not yet supported.\n\
+                 \tSupported input is the bgraph.md format emitted by\n\
+                 \t`blazegraph parse -f markdown`.\n"
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("\n❌ bgraph.md parse failed: {e}\n");
+            std::process::exit(1);
+        }
+    };
+
+    match result.identity {
+        ParseIdentity::Verified => {
+            println!("✅ Round-trip identity verified (graph_sha256 matches).");
+        }
+        ParseIdentity::Derivative {
+            original_sha256,
+            recomputed_sha256,
+        } => {
+            eprintln!(
+                "⚠️  Graph reconstructed from drifted bgraph.md (--accept-drift):\n\
+                 \toriginal graph_sha256:   {original_sha256}\n\
+                 \trecomputed graph_sha256: {recomputed_sha256}\n\
+                 \tThe reconstructed graph is a derivative, not an identity round-trip."
+            );
+        }
+    }
+
+    let mut graph = result.graph;
+    println!("📊 Graph: {} nodes", graph.nodes.len());
+
+    if !args.include_style_info {
+        // bgraph.md v1.0.0 doesn't carry style_info, but the toggle
+        // is symmetric with the PDF path — keep behavior consistent.
+        for node in graph.nodes.values_mut() {
+            node.style_info = None;
+        }
+    }
+
+    let output_path = resolve_output_path(&args);
+    save_graph(&graph, &output_path, &args.output_format)?;
+    Ok(())
+}
+
+// =========================================================================
+// `strip` subcommand
+// =========================================================================
+
+fn run_strip(args: StripArgs) -> Result<()> {
+    use blazegraph_io_core::preprocessors::md::{strip, ParseError};
+
+    let content = std::fs::read_to_string(&args.input)
+        .map_err(|e| anyhow!("failed to read {}: {e}", args.input))?;
+
+    let stripped = match strip(&content, args.mode.into()) {
+        Ok(s) => s,
+        Err(ParseError::MalformedFence(msg)) => {
+            eprintln!("❌ strip failed: malformed bgraph fence — {msg}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("❌ strip failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &stripped)
+                .map_err(|e| anyhow!("failed to write {}: {e}", path))?;
+            let mode_label = match args.mode {
+                CliStripMode::BodyOnly => "body-only",
+                CliStripMode::KeepMetadata => "keep-metadata",
+                CliStripMode::NoiseOnly => "noise-only",
+            };
+            println!(
+                "💾 Stripped ({mode_label}, {} bytes) saved to: {path}",
+                stripped.len()
+            );
+        }
+        None => {
+            // stdout, no decoration
+            print!("{stripped}");
+        }
+    }
+    Ok(())
+}
+
+// =========================================================================
+// Helpers
+// =========================================================================
+
+/// Detected input shape. The `BgraphMd` variant carries the loaded file
+/// contents so the caller doesn't re-read.
+enum InputFormat {
+    /// PDF — dispatch to the existing PDF channel. Bytes are loaded
+    /// lazily by the PDF processor itself; we do not pre-read here.
+    Pdf,
+    /// bgraph.md round-trip artifact. Contents are loaded eagerly so
+    /// we can content-sniff them; pass through to `parse_markdown`.
+    BgraphMd { content: String },
+    /// Unknown extension and content does not sniff as bgraph.md.
+    Unknown,
+}
+
+/// Resolve input format by extension first, content-sniff for `.md` /
+/// unknown extensions.
+///
+/// - `.pdf` → `InputFormat::Pdf` (no file read; PDF pipeline reads bytes itself).
+/// - `.bgraph.md` → read content, return `BgraphMd { content }` (the sniff
+///   would always pass on a valid round-trip artifact, but we still read
+///   the file so the caller can pass `&content` straight through).
+/// - `.md`, `.markdown` → read content; sniff with
+///   `is_bgraph_md` to distinguish round-trip artifact from generic
+///   prose. Plain markdown is `Unknown` (we surface a clear error rather
+///   than silently routing through the PDF channel).
+/// - Unknown extension → try reading as UTF-8 and content-sniff. If it
+///   sniffs as bgraph.md, treat it as such; otherwise `Unknown`.
+fn detect_input_format(path: &Path) -> Result<InputFormat> {
+    use blazegraph_io_core::preprocessors::md::is_bgraph_md;
+
+    let ext_lower = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    match ext_lower.as_deref() {
+        Some("pdf") => Ok(InputFormat::Pdf),
+        Some("md") | Some("markdown") => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
+            if is_bgraph_md(&content) {
+                Ok(InputFormat::BgraphMd { content })
+            } else {
+                Ok(InputFormat::Unknown)
+            }
+        }
+        _ => {
+            // Unknown extension — content sniff. If the file isn't valid
+            // UTF-8 (likely binary), bail to Unknown rather than reading
+            // an arbitrary-size binary into memory just to detect it.
+            let bytes = std::fs::read(path)
+                .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
+            let Ok(content) = String::from_utf8(bytes) else {
+                return Ok(InputFormat::Unknown);
+            };
+            if is_bgraph_md(&content) {
+                Ok(InputFormat::BgraphMd { content })
+            } else {
+                Ok(InputFormat::Unknown)
+            }
+        }
+    }
+}
+
+/// Resolve the output path for `parse`. Explicit `-o` wins; otherwise
+/// derive from input stem + a format-aware suffix.
+///
+/// Suffix table:
+/// - `markdown` → `.bgraph.md`
+/// - everything else → `_blazegraph.json`
+///
+/// The `config` suffix (`_{config_stem}`) is preserved from pre-B5
+/// behavior on the JSON formats; it is intentionally NOT applied to
+/// markdown output (the round-trip artifact's identity is the
+/// `config_hash` embedded in the doc-level block, not a filename
+/// suffix).
+fn resolve_output_path(args: &ParseArgs) -> String {
+    if let Some(output) = &args.output {
+        return output.clone();
+    }
+    let input_name = Path::new(&args.input)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    // For .bgraph.md inputs, `file_stem()` strips the trailing `.md`
+    // but leaves the `.bgraph` infix. That's intentional — the
+    // intermediate `.bgraph` carries provenance information for
+    // human readers (e.g., `paper.bgraph.json` is clearly derived
+    // from `paper.bgraph.md`).
+    if args.output_format == "markdown" {
+        return format!("{input_name}.bgraph.md");
+    }
+    let config_suffix = args
+        .config
+        .as_ref()
+        .and_then(|p| Path::new(p).file_stem())
+        .and_then(|s| s.to_str())
+        .map(|s| format!("_{s}"))
+        .unwrap_or_default();
+    format!("{input_name}{config_suffix}_blazegraph.json")
+}
+
 /// Resolve cache directory: CLI flag > env var > default (~/.local/share/blazegraph/cache/)
-fn resolve_cache_dir(args: &Args) -> Result<String> {
+fn resolve_cache_dir(args: &ParseArgs) -> Result<String> {
     if let Some(ref dir) = args.cache_dir {
         return Ok(dir.clone());
     }
@@ -274,7 +628,7 @@ fn resolve_cache_dir(args: &Args) -> Result<String> {
 
 /// Create DocumentProcessor with JNI backend (cross-platform, auto-downloads JRE)
 #[cfg(feature = "jni-backend")]
-fn create_processor(args: &Args, cache_dir: &str) -> Result<DocumentProcessor> {
+fn create_processor(args: &ParseArgs, cache_dir: &str) -> Result<DocumentProcessor> {
     // Get JRE path - either from args, JAVA_HOME, or auto-download
     let jre_path = if let Some(path) = &args.jre_path {
         println!("🔧 Using specified JRE: {}", path);
@@ -308,7 +662,7 @@ fn create_processor(args: &Args, cache_dir: &str) -> Result<DocumentProcessor> {
 
 /// Fallback when no backend is compiled in
 #[cfg(not(feature = "jni-backend"))]
-fn create_processor(_args: &Args, _cache_dir: &str) -> Result<DocumentProcessor> {
+fn create_processor(_args: &ParseArgs, _cache_dir: &str) -> Result<DocumentProcessor> {
     Err(anyhow::anyhow!(
         "No PDF backend compiled in!\n\
          Compile with: --features jni-backend"
@@ -316,42 +670,58 @@ fn create_processor(_args: &Args, _cache_dir: &str) -> Result<DocumentProcessor>
 }
 
 fn show_help() {
-    println!("\n📋 Available Configuration Options:");
-    println!("  --config <path>         Load custom config file");
-    println!("  --input <path>          PDF file to process");
+    println!("\n📋 Subcommands:");
+    println!("  parse    Parse a PDF or bgraph.md into a graph (or back to markdown)");
+    println!("  strip    Remove bgraph fences from a bgraph.md file");
+
+    println!("\n📋 `parse` options:");
+    println!("  --config <path>         Load custom config file (PDF only)");
+    println!("  --input <path>          Input file (PDF, .bgraph.md, or .md)");
     println!("  --output <path>         Output file path (auto-generated if not specified)");
-    println!("  --output-format <fmt>   Output format: graph, sequential, or flat");
-    println!("  --minimal-parse         Enable minimal parse mode (bypass all rule processing)");
+    println!("  --output-format <fmt>   Output format: graph, sequential, flat, or markdown");
+    println!("  --accept-drift          Accept hash-drifted bgraph.md input (returns derivative)");
+    println!("  --minimal-parse         Enable minimal parse mode (PDF only)");
     println!("  --jre-path <path>       Path to JRE directory (default: auto-download)");
     println!("  --jar-path <path>       Path to Tika JAR file (default: bundled)");
 
-    println!("\n🗄️  Cache Control:");
-    println!("  --cache-dir <path>      Override cache directory (default: ~/.local/share/blazegraph/cache/)");
+    println!("\n🗄️  Cache Control (PDF only):");
+    println!("  --cache-dir <path>      Override cache directory");
     println!("  --fresh-from <point>    Reprocess from cache point: c0, c1, c2, c3");
     println!("  --clear-cache <point>   Clear cache (cascading): c0, c1, c2, c3, all");
     println!("  --skip-cache            Alias for --fresh-from c0");
 
-    println!("\n📄 Output Formats:");
+    println!("\n📄 Output Formats (parse):");
     println!("  graph       - Full graph structure with nodes and relationships (default)");
     println!("  sequential  - Ordered segments with level info (good for RAG + hierarchy)");
     println!("  flat        - Simple array of text chunks (minimal format)");
+    println!("  markdown    - bgraph.md round-trip artifact (B2)");
 
-    println!("\n📁 Example config files in ./configs/:");
-    println!("  generic-conservative.yaml  - Fewer, higher-confidence sections");
-    println!("  generic-balanced.yaml      - Balanced section detection");
-    println!("  generic-aggressive.yaml    - More sections, deeper hierarchy");
+    println!("\n📥 Input Formats (parse, auto-detected):");
+    println!("  .pdf                    PDF channel (full pipeline)");
+    println!("  .bgraph.md              bgraph.md round-trip artifact");
+    println!("  .md / .markdown         Generic markdown — only bgraph.md content accepted");
+
+    println!("\n🪓 `strip` modes:");
+    println!(
+        "  --mode body-only        Remove all bgraph fences (default; Unstructured-equivalent)"
+    );
+    println!("  --mode keep-metadata    Keep doc-level block + body; strip per-element fences");
+    println!("  --mode noise-only       Strip Header/Footer/Margin fences and their bodies only");
 
     println!("\n📝 Usage Examples:");
-    println!("  cargo run -- -i document.pdf");
-    println!("  cargo run -- -i document.pdf -o /path/to/output.json");
-    println!("  cargo run -- -i document.pdf -c config.yaml -f sequential");
-    println!("  cargo run -- --fresh-from c2    # reparse from cached XHTML");
-    println!("  cargo run -- --clear-cache c1   # clear XHTML + downstream caches");
+    println!("  blazegraph parse -i document.pdf");
+    println!("  blazegraph parse -i document.pdf -f markdown -o document.bgraph.md");
+    println!("  blazegraph parse -i document.bgraph.md -o document.json");
+    println!("  blazegraph parse -i document.bgraph.md --accept-drift -o derived.json");
+    println!("  blazegraph strip -i document.bgraph.md -o document_body.md");
+    println!("  blazegraph strip -i document.bgraph.md --mode keep-metadata -o document_meta.md");
 
     #[cfg(feature = "jni-backend")]
     {
         println!("\n🔧 JNI Backend:");
-        println!("  First run will auto-download Java Runtime (~60MB) to ~/.local/share/blazegraph/jre");
+        println!(
+            "  First run will auto-download Java Runtime (~60MB) to ~/.local/share/blazegraph/jre"
+        );
         println!("  Or specify your own JRE: --jre-path /path/to/jre");
     }
 }
@@ -375,7 +745,11 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
     let pe_path = format!("{}/stage2_parsed_elements.json", output_dir);
     let pe_json = serde_json::to_string_pretty(&stages.parsed_elements)?;
     fs::write(&pe_path, &pe_json)?;
-    println!("  💾 {} ({} elements)", pe_path, stages.parsed_elements.len());
+    println!(
+        "  💾 {} ({} elements)",
+        pe_path,
+        stages.parsed_elements.len()
+    );
 
     // Stage 3: Final graph
     let graph_path = format!("{}/stage3_graph.json", output_dir);
@@ -400,20 +774,29 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
 }
 
 fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<()> {
-    graph.save_with_format(output_path, format)?;
-
     match format {
-        "sequential" => println!("💾 Sequential format saved to: {}", output_path),
-        "flat" => println!("💾 Flat format saved to: {}", output_path),
-        "graph" => println!("💾 Graph saved to: {}", output_path),
-        _ => {
-            println!(
-                "⚠️  Unknown output format '{}', using default graph format",
-                format
-            );
+        "markdown" => {
+            let md = blazegraph_io_core::graphs::serialization::markdown::emit_markdown(graph);
+            std::fs::write(output_path, md)?;
+            println!("💾 Markdown saved to: {}", output_path);
+        }
+        "sequential" => {
+            graph.save_with_format(output_path, "sequential")?;
+            println!("💾 Sequential format saved to: {}", output_path);
+        }
+        "flat" => {
+            graph.save_with_format(output_path, "flat")?;
+            println!("💾 Flat format saved to: {}", output_path);
+        }
+        "graph" => {
+            graph.save_with_format(output_path, "graph")?;
+            println!("💾 Graph saved to: {}", output_path);
+        }
+        other => {
+            println!("⚠️  Unknown output format '{other}', using default graph format");
+            graph.save_with_format(output_path, "graph")?;
             println!("💾 Graph saved to: {}", output_path);
         }
     }
-
     Ok(())
 }
