@@ -100,14 +100,9 @@ impl GraphAnalytics {
         } else {
             0.0
         };
-        // `is_multiple_of` is stable from Rust 1.87 — kept as `% 2 == 0`
-        // to preserve the MSRV 1.83 floor (PR #5 hotfix). The `allow` is
-        // pinned to this expression rather than a crate-wide opt-out so a
-        // future MSRV bump surfaces the cleanup.
-        #[allow(clippy::manual_is_multiple_of)]
         let median = if sorted_tokens.is_empty() {
             0.0
-        } else if sorted_tokens.len() % 2 == 0 {
+        } else if sorted_tokens.len().is_multiple_of(2) {
             let mid = sorted_tokens.len() / 2;
             (sorted_tokens[mid - 1] + sorted_tokens[mid]) as f32 / 2.0
         } else {
