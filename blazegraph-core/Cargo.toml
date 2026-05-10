@@ -37,6 +37,12 @@ unicode-normalization = "0.1"
 # Cryptographic hashing for caching
 sha2 = "0.10"
 
+# CommonMark parser — drives the bgraph.md reverse parser (B3 of the
+# MD+DOCX format expansion flow). No GFM features needed; bgraph.md is
+# a tightly-constrained subset of CommonMark whose shape is controlled
+# by our own emitter at `graphs/serialization/markdown.rs`.
+pulldown-cmark = { version = "0.10", default-features = false }
+
 # JNI for Java interop (when jni-backend feature enabled)
 # Requires 'invocation' feature to create JVMs
 jni = { version = "0.21", features = ["invocation"], optional = true }
