@@ -37,9 +37,10 @@ pub struct PhysicalLocation {
 }
 
 /// Signals whether physical location data is meaningful for this document
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum FlowType {
     /// PDF — has physical layout, physical_location is present
+    #[default]
     Fixed,
     /// Markdown, DOCX — reflows, physical_location is None
     Free,
@@ -58,6 +59,49 @@ pub struct DocumentInfo {
     /// PDF bookmarks/table of contents (if available in the source PDF)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark_data: Option<BookmarkData>,
+
+    /// Origin of this graph — the (version, source, config) triple that
+    /// reproduces it. Persisted on the graph so the bgraph.md emitter
+    /// (and any future round-trip consumer) has the load-bearing
+    /// identity inputs without re-deriving them.
+    ///
+    /// `None` for legacy graphs loaded from pre-0.6.0 graph.json files
+    /// and for graphs built via the legacy `GraphBuilder::build_graph`
+    /// path (random UUIDv4 IDs, no hash inputs anyway).
+    /// `Some(_)` for any graph built fresh through
+    /// `GraphBuilder::build_graph_deterministic`.
+    /// Schema 0.6.0 (B2 of MD+DOCX flow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_provenance: Option<ParseProvenance>,
+}
+
+/// The (version, source, config) triple that identifies a specific parse
+/// run. Persisted on `DocumentInfo` so consumers can reproduce the graph
+/// deterministically and emit round-trippable bgraph.md.
+///
+/// Mirrors the inputs to `NodeIdGenerator::new`, plus the source
+/// filename and source-format identifier needed for the bgraph.md
+/// document-level block. See
+/// `docs/P2/core/architecture/08-bgraph-md-format.md` (the v1.0.0 wire
+/// format) for the consumer contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParseProvenance {
+    /// Parser version that produced this graph (e.g. `"0.2.2"`).
+    /// Sourced from `env!("CARGO_PKG_VERSION")` at build time.
+    pub blazegraph_version: String,
+
+    /// Source format identifier (`"pdf"`, `"markdown"`, `"docx"`, …).
+    pub source_format: String,
+
+    /// Original source filename (basename, e.g. `"rfc-quic.pdf"`).
+    pub source_filename: String,
+
+    /// SHA-256 of the source bytes (hex-encoded).
+    pub source_sha256: String,
+
+    /// Hash of the parsing config that produced this graph
+    /// (hex-encoded).
+    pub config_hash: String,
 }
 /// The schema version stamped on every graph output.
 /// Bump this when the output shape changes.
@@ -77,7 +121,23 @@ pub struct DocumentInfo {
 /// `PdfTextElement` → `ParsedPdfElement` boundary from `region_label`
 /// (`H-*` → Header, `F-*` → Footer, `None` → Margin, body leaf labels →
 /// Paragraph). Section detection skips Header / Footer / Margin.
-pub const SCHEMA_VERSION: &str = "0.5.1";
+///
+/// 0.6.0 — B2 of MD+DOCX flow:
+///   1. Added `DocumentInfo.parse_provenance: Option<ParseProvenance>`
+///      so the bgraph.md emitter can produce real (not placeholder)
+///      doc-level identity fields and downstream round-trip consumers
+///      can re-derive deterministic node IDs without re-reading the
+///      source bytes.
+///   2. Moved `created_at` from `StructuralProfile` to
+///      `SortedDocumentGraph` (the on-disk wrapper). `DocumentGraph`
+///      is now time-free, which is the canonical-input invariant
+///      required for `canonical_json(&DocumentGraph)` to be byte-
+///      deterministic across runs of the same logical graph.
+///
+/// Backwards-compatible: existing 0.5.1 graphs deserialize cleanly
+/// with `parse_provenance = None` and `SortedDocumentGraph.created_at`
+/// defaulting to the Unix epoch (clearly "no real value").
+pub const SCHEMA_VERSION: &str = "0.6.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -91,9 +151,28 @@ pub struct DocumentGraph {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
     pub schema_version: String,
+    /// Wall-clock time at which this graph was serialized to disk.
+    /// Lives on the wrapper (not on `DocumentGraph`) so `canonical_json`
+    /// is deterministic across runs of the same logical graph — see
+    /// the canonical-input invariant in
+    /// `docs/P2/core/architecture/08-bgraph-md-format.md`.
+    /// `#[serde(default)]` keeps pre-0.6.0 graph.json fixtures (which
+    /// carried `created_at` on `StructuralProfile` instead) loadable;
+    /// the default is the Unix epoch — a clearly "no real value"
+    /// sentinel rather than the misleading `Utc::now()`.
+    #[serde(default = "default_created_at")]
+    pub created_at: DateTime<Utc>,
     pub nodes: Vec<DocumentNode>,
     pub document_info: DocumentInfo,
     pub structural_profile: StructuralProfile,
+}
+
+/// Sentinel default for `SortedDocumentGraph.created_at` when loading
+/// pre-0.6.0 fixtures that did not carry the field. Returns the Unix
+/// epoch (1970-01-01T00:00:00Z) — clearly "no real value", in contrast
+/// to `Utc::now()` which would silently lie about emission time.
+fn default_created_at() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is always valid")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,9 +307,19 @@ pub type StyleInfo = StyleMetadata;
 /// Quantitative measurement of graph shape — deterministic, mechanically computed from structure.
 /// Travels with graph.json. Describes the L0 tree's statistical properties.
 /// See AmplifyNotes/09-Profile-Types.md for design rationale.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// **Canonical-input invariant (B2 of MD+DOCX flow):** this struct must
+/// contain no time- or environment-dependent fields. The previous
+/// `created_at: DateTime<Utc>` field moved to
+/// `SortedDocumentGraph.created_at` (the on-disk wrapper) in schema
+/// 0.6.0 so `canonical_json(&DocumentGraph)` is byte-deterministic
+/// across runs of the same logical graph.
+/// `#[serde(default)]` on the struct lets older fixtures (which had
+/// `created_at` here) still deserialize cleanly — serde silently drops
+/// the unknown field.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct StructuralProfile {
-    pub created_at: DateTime<Utc>,
     pub document_type: DocumentType,
     pub flow_type: FlowType,
     pub total_nodes: usize,
@@ -242,28 +331,14 @@ pub struct StructuralProfile {
     pub depth_distribution: DepthDistribution,
 }
 
-impl Default for StructuralProfile {
-    fn default() -> Self {
-        Self {
-            created_at: Utc::now(),
-            document_type: DocumentType::Unknown,
-            flow_type: FlowType::Fixed,
-            total_nodes: 0,
-            total_tokens: 0,
-            token_distribution: TokenDistribution::default(),
-            node_type_distribution: NodeTypeDistribution::default(),
-            depth_distribution: DepthDistribution::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum DocumentType {
     LegalContract,
     AcademicPaper,
     TechnicalManual,
     BusinessReport,
     Generic,
+    #[default]
     Unknown,
 }
 
