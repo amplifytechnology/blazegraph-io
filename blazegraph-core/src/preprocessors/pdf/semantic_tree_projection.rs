@@ -28,7 +28,6 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
         .enumerate()
         .map(|(index, parsed)| {
             let element_type = project_element_type(&parsed.element_type);
-            let hierarchy_level = normalize_hierarchy_level(element_type, parsed.hierarchy_level);
             let physical_location = parsed.placement.as_ref().map(|p| PhysicalLocation {
                 page: p.page_number,
                 bounding_box: p.bounding_box.clone(),
@@ -38,7 +37,7 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
             SemanticTreeElement {
                 text: parsed.text,
                 element_type,
-                hierarchy_level,
+                hierarchy_level: parsed.hierarchy_level,
                 text_order: index as u32,
                 physical_location,
                 style,
@@ -64,20 +63,6 @@ fn project_element_type(input: &ParsedElementType) -> SemanticElementType {
         ParsedElementType::Header => SemanticElementType::Header,
         ParsedElementType::Footer => SemanticElementType::Footer,
         ParsedElementType::Margin => SemanticElementType::Margin,
-    }
-}
-
-/// Sentinel-level rule: only `Section` carries a meaningful hierarchy
-/// level (1 = top-level, 2 = nested, ...). For `Paragraph` / `Header` /
-/// `Footer` / `Margin`, normalize to `0` — these are leaves attached to
-/// the current open Section. See `SemanticTreeElement::hierarchy_level`.
-fn normalize_hierarchy_level(element_type: SemanticElementType, input_level: u32) -> u32 {
-    match element_type {
-        SemanticElementType::Section => input_level,
-        SemanticElementType::Paragraph
-        | SemanticElementType::Header
-        | SemanticElementType::Footer
-        | SemanticElementType::Margin => 0,
     }
 }
 
@@ -239,12 +224,15 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_level_normalized_to_zero_for_non_section_types() {
-        // Even if the input has hierarchy_level = 1 (the rule-engine
-        // default for non-Section types), the projection must normalize
-        // to 0 — the sentinel value for "leaf attached to current
-        // open Section".
-        for non_section in [
+    fn hierarchy_level_passes_through_unchanged() {
+        // The rule engine assigns hierarchy_level for every element such
+        // that the existing GraphBuilder algorithm (find_parent + section
+        // stack) attaches each element to the right parent. The projection
+        // is a pure carrier — we pass hierarchy_level through unchanged.
+        // Whether to reshape this convention (sentinel-zero for non-Section
+        // types + matching find_parent change) is tracked as CR-44.
+        for element_type in [
+            ParsedElementType::Section,
             ParsedElementType::Paragraph,
             ParsedElementType::Header,
             ParsedElementType::Footer,
@@ -252,22 +240,14 @@ mod tests {
             ParsedElementType::List,
             ParsedElementType::ListItem,
         ] {
-            let input = fixture(non_section.clone(), 5); // arbitrary nonzero
+            let input = fixture(element_type.clone(), 5);
             let projected = project_to_semantic_tree(vec![input]);
             assert_eq!(
-                projected[0].hierarchy_level, 0,
-                "{non_section:?} should normalize hierarchy_level to 0, got {}",
+                projected[0].hierarchy_level, 5,
+                "{element_type:?} should pass hierarchy_level through unchanged, got {}",
                 projected[0].hierarchy_level,
             );
         }
-
-        // Sanity-check: Section preserves its hierarchy_level.
-        let section = fixture(ParsedElementType::Section, 3);
-        let projected = project_to_semantic_tree(vec![section]);
-        assert_eq!(
-            projected[0].hierarchy_level, 3,
-            "Section must preserve hierarchy_level (it carries real depth info)",
-        );
     }
 
     #[test]
