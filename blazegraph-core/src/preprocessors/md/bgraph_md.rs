@@ -415,7 +415,10 @@ fn scan_segments(input: &str) -> Result<Vec<Segment>, ParseError> {
 /// `bgraph-paragraph`, `bgraph-header`, `bgraph-footer`,
 /// `bgraph-margin`. Any other ` ```bgraph* ` line-start is rejected by
 /// the caller as a reserved-prefix violation.
-fn bgraph_fence_open_tag(line: &str) -> Option<String> {
+///
+/// Visible at `pub(super)` so the sibling [`super::strip`] module can
+/// reuse the same fence-recognition rules without re-implementing them.
+pub(super) fn bgraph_fence_open_tag(line: &str) -> Option<String> {
     let info = line.strip_prefix("```")?;
     if info == "bgraph"
         || info == "bgraph-bookmarks"
@@ -445,14 +448,20 @@ fn bgraph_fence_open_tag(line: &str) -> Option<String> {
 
 /// Trim the trailing `\n` (and optional preceding `\r`) from a line
 /// produced by `split_inclusive('\n')`.
-fn strip_trailing_newline(line: &str) -> &str {
+///
+/// Visible at `pub(super)` so the sibling [`super::strip`] module can
+/// reuse the same line-trim convention without duplicating it.
+pub(super) fn strip_trailing_newline(line: &str) -> &str {
     let line = line.strip_suffix('\n').unwrap_or(line);
     line.strip_suffix('\r').unwrap_or(line)
 }
 
 /// `true` if `line` is exactly `` ``` `` (no info string, no other
 /// chars). Used as the fence-close sentinel.
-fn is_bare_fence_close(line: &str) -> bool {
+///
+/// Visible at `pub(super)` so the sibling [`super::strip`] module can
+/// reuse the same close-sentinel rule without duplicating it.
+pub(super) fn is_bare_fence_close(line: &str) -> bool {
     line == "```"
 }
 

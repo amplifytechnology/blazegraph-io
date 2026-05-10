@@ -65,6 +65,44 @@ pub enum ParseIdentity {
     },
 }
 
+/// Strip mode for the [`crate::preprocessors::md::strip`] operation.
+///
+/// Three variants per the spec's [Strip ergonomics] table — one for
+/// each of the sed patterns the v1.0.0 wire format was designed to be
+/// compatible with. The dash discriminator (`bgraph-[a-z-]*` vs.
+/// `bgraph[a-z-]*`) is load-bearing, hence the three named modes
+/// rather than a single boolean.
+///
+/// [Strip ergonomics]:
+/// https://github.com/AmplifyTechnology/blazegraph-io-app/blob/main/docs/P2/core/architecture/08-bgraph-md-format.md#strip-ergonomics
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripMode {
+    /// Remove all bgraph fences (doc-level + bookmarks + every
+    /// per-element fence, including Header/Footer/Margin inside-fence
+    /// bodies). Section/Paragraph body text survives.
+    ///
+    /// Equivalent to `sed -E '/^```bgraph[a-z-]*$/,/^```$/d'`.
+    /// Output is Unstructured-equivalent body-only prose suitable for
+    /// AI tools / RAG ingestion.
+    BodyOnly,
+    /// Keep the doc-level `bgraph` block. Strip per-element fences
+    /// (and any inside-fence body for Header/Footer/Margin), but
+    /// preserve Section/Paragraph body text.
+    ///
+    /// Equivalent to `sed -E '/^```bgraph-[a-z-]*$/,/^```$/d'`.
+    /// Useful when you want plain prose + provenance + graph identity.
+    KeepMetadata,
+    /// Strip only Header/Footer/Margin fences (and their inside-fence
+    /// bodies). Doc-level block, bookmarks, and Section/Paragraph
+    /// fences + bodies all survive.
+    ///
+    /// Equivalent to
+    /// `sed -E '/^```bgraph-(header|footer|margin)$/,/^```$/d'`.
+    /// Removes running-noise (page headers/footers/margins) while
+    /// preserving full structural metadata.
+    NoiseOnly,
+}
+
 /// Errors from markdown parsing.
 ///
 /// `HashMismatch` is the load-bearing variant for B5 (CLI). Other

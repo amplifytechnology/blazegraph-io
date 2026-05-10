@@ -26,9 +26,11 @@
 //! `ParseError::GenericMarkdownNotYetSupported`.
 
 pub mod bgraph_md;
+pub mod strip;
 pub mod types;
 
-pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult};
+pub use strip::strip;
+pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode};
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
