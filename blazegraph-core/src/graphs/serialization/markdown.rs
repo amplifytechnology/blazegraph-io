@@ -43,9 +43,18 @@ pub fn emit_markdown(graph: &DocumentGraph) -> String {
          build the graph via GraphBuilder::build_graph_deterministic with provenance",
     );
 
-    let mut parts: Vec<String> = Vec::with_capacity(graph.nodes.len() + 2);
+    let mut parts: Vec<String> = Vec::with_capacity(graph.nodes.len() + 4);
     parts.push(emit_document_level_block(graph, provenance));
     parts.push(String::new()); // blank line after doc-level block
+
+    // Optional `bgraph-bookmarks` fence — emitted only when the source
+    // graph carries an outline. Placed immediately after the doc-level
+    // block so the doc-level block stays a single readable JSON line
+    // even when the bookmark payload is large (rfc-quic ~14 KB).
+    if let Some(bookmarks_block) = emit_bookmarks_block(graph) {
+        parts.push(bookmarks_block);
+        parts.push(String::new());
+    }
 
     // Walk by text_order ascending. Document root has text_order = None
     // and is skipped (filtered out before sorting).
@@ -64,6 +73,16 @@ pub fn emit_markdown(graph: &DocumentGraph) -> String {
     }
 
     parts.join("\n")
+}
+
+/// Document-level bookmarks block. Tag: `bgraph-bookmarks`. Optional —
+/// returns `None` when `graph.document_info.bookmark_data` is `None`.
+/// JSON shape mirrors `BookmarkData` exactly (one `serde_json::to_string`
+/// pass, compact, single line).
+fn emit_bookmarks_block(graph: &DocumentGraph) -> Option<String> {
+    let bookmarks = graph.document_info.bookmark_data.as_ref()?;
+    let json = serde_json::to_string(bookmarks).expect("BookmarkData is always serializable");
+    Some(format!("```bgraph-bookmarks\n{json}\n```"))
 }
 
 /// Document-level metadata block. Tag: `bgraph` (no suffix). Flat JSON
@@ -169,12 +188,14 @@ fn node_metadata_json(node: &DocumentNode) -> String {
         node_type: &'a String,
         location: &'a NodeLocation,
         text_order: &'a Option<u32>,
+        token_count: usize,
     }
     let meta = NodeMetadata {
         id: &node.id,
         node_type: &node.node_type,
         location: &node.location,
         text_order: &node.text_order,
+        token_count: node.token_count,
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
 }
@@ -445,16 +466,96 @@ mod tests {
         let expected = format!(
             "# Intro\n\
              ```bgraph-section\n\
-             {{\"id\":\"{section_id}\",\"node_type\":\"Section\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0}}\n\
+             {{\"id\":\"{section_id}\",\"node_type\":\"Section\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":1}}\n\
              ```\n\
              \n\
              Hello.\n\
              ```bgraph-paragraph\n\
-             {{\"id\":\"{paragraph_id}\",\"node_type\":\"Paragraph\",\"location\":{{\"semantic\":{{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":1}}\n\
+             {{\"id\":\"{paragraph_id}\",\"node_type\":\"Paragraph\",\"location\":{{\"semantic\":{{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":1,\"token_count\":1}}\n\
              ```\n\
              ",
         );
         assert_eq!(after_doc, expected, "body shape drifted from template");
+    }
+
+    #[test]
+    fn emit_includes_token_count_in_per_element_metadata() {
+        // Spec Amendment D (v1.0.0): every per-element bgraph block
+        // carries `token_count` so external consumers can query
+        // token-weighted slices without re-tokenizing body content.
+        let graph = build_graph(vec![
+            ("Section", "Intro", 1, 0),
+            ("Paragraph", "Hello world.", 1, 1),
+            ("Header", "Running header", 1, 2),
+        ]);
+        let md = emit_markdown(&graph);
+        // build_graph sets token_count = 1 for every body node, so every
+        // per-element block should contain `"token_count":1`.
+        let occurrences = md.matches("\"token_count\":1").count();
+        assert_eq!(
+            occurrences, 3,
+            "expected 3 token_count fields (one per body node); got:\n{md}",
+        );
+    }
+
+    #[test]
+    fn bookmarks_fence_is_omitted_when_bookmark_data_is_none() {
+        let graph = build_graph(vec![("Section", "Intro", 1, 0)]);
+        // build_graph sets bookmark_data: None.
+        let md = emit_markdown(&graph);
+        assert!(
+            !md.contains("```bgraph-bookmarks"),
+            "bgraph-bookmarks fence should be omitted when bookmark_data is None; got:\n{md}",
+        );
+    }
+
+    #[test]
+    fn bookmarks_fence_is_emitted_when_bookmark_data_is_present() {
+        let mut graph = build_graph(vec![("Section", "Intro", 1, 0)]);
+        graph.document_info.bookmark_data = Some(BookmarkData {
+            sections: vec![
+                BookmarkSection {
+                    title: "Introduction".to_string(),
+                    order: 0,
+                    level: 1,
+                },
+                BookmarkSection {
+                    title: "Background".to_string(),
+                    order: 1,
+                    level: 2,
+                },
+            ],
+        });
+        let md = emit_markdown(&graph);
+
+        // Fence appears.
+        assert!(
+            md.contains("```bgraph-bookmarks\n"),
+            "bgraph-bookmarks fence should be present when bookmark_data is Some; got:\n{md}",
+        );
+
+        // Fence content parses as JSON with the expected shape.
+        let start = md
+            .find("```bgraph-bookmarks\n")
+            .expect("fence open present")
+            + "```bgraph-bookmarks\n".len();
+        let end = md[start..].find("\n```").expect("fence close present") + start;
+        let json_line = &md[start..end];
+        let parsed: BookmarkData =
+            serde_json::from_str(json_line).expect("bookmarks JSON parses as BookmarkData");
+        assert_eq!(parsed.sections.len(), 2);
+        assert_eq!(parsed.sections[0].title, "Introduction");
+
+        // Placement: bookmarks fence sits between the doc-level block
+        // and the first per-element fence.
+        let doc_level_close = md.find("```\n\n```bgraph-bookmarks").expect(
+            "bookmarks fence should follow the doc-level block, separated by exactly one blank line",
+        );
+        let first_section = md.find("```bgraph-section").expect("section fence");
+        assert!(
+            doc_level_close < first_section,
+            "bookmarks fence must precede the first per-element fence",
+        );
     }
 
     #[test]
