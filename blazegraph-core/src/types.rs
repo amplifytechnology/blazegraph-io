@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 pub type NodeId = Uuid;
@@ -137,7 +137,28 @@ pub struct ParseProvenance {
 /// Backwards-compatible: existing 0.5.1 graphs deserialize cleanly
 /// with `parse_provenance = None` and `SortedDocumentGraph.created_at`
 /// defaulting to the Unix epoch (clearly "no real value").
-pub const SCHEMA_VERSION: &str = "0.6.0";
+///
+/// 0.7.0 — B6 of MD+DOCX flow:
+///   1. Added `CodeBlock`, `List`, `Blockquote`, `Table` variants to
+///      `SemanticElementType` (and their string counterparts in
+///      `DocumentNode.node_type`). These are produced by the markdown
+///      channel; the PDF channel never produces them. The union schema
+///      absorbs this asymmetry by design — graphs from one channel are
+///      a subset of `SemanticElementType` and that is a feature.
+///   2. Added canonical frontmatter fields to `DocumentMetadata`:
+///      `date: Option<String>`, `tags: Vec<String>` (default empty),
+///      `draft: Option<bool>`. These are the starting point for
+///      normalizing metadata across MD / PDF / DOCX.
+///   3. Added `DocumentMetadata.extras: BTreeMap<String,
+///      serde_json::Value>` — an opaque pass-through bucket for
+///      non-canonical frontmatter keys. YAML values are converted to
+///      JSON values at the frontmatter-parse boundary so the schema
+///      does not depend on the YAML library.
+///
+/// Backwards-compatible: existing 0.6.0 graphs deserialize cleanly
+/// because all new fields default (`Option::None` / `Vec::new` /
+/// `BTreeMap::new`), and the new enum variants are additive.
+pub const SCHEMA_VERSION: &str = "0.7.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -542,6 +563,28 @@ pub struct DocumentMetadata {
     pub description: Option<String>,      // dc:description
     pub encrypted: Option<bool>,          // pdf:encrypted
     pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
+
+    // Schema 0.7.0+ (B6): canonical frontmatter fields from the
+    // markdown channel. Free-form strings (rather than typed Date /
+    // tag-vocabulary types) because frontmatter is user-authored and
+    // lenient — we capture what's there, not normalize it.
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub draft: Option<bool>,
+
+    // Schema 0.7.0+ (B6): opaque pass-through for non-canonical
+    // frontmatter keys. YAML values from the markdown channel are
+    // converted to `serde_json::Value` at the frontmatter-parse
+    // boundary (in `preprocessors::md::frontmatter`) so the schema
+    // type does not depend on the YAML library.
+    //
+    // `BTreeMap` (not `HashMap`) so canonical JSON serialization is
+    // deterministic — same input must produce the same `graph_sha256`.
+    #[serde(default)]
+    pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 impl DocumentMetadata {
@@ -744,10 +787,21 @@ pub struct SemanticTreeElement {
 
 /// Element kinds carried at the SemanticTreeElement boundary.
 ///
-/// v1 set: the Section/Paragraph/Header/Footer/Margin "labeled paragraph"
-/// shape. List/ListItem/Table/Figure/CodeBlock are deferred — the design
-/// flow defers them, and YAGNI applies until a downstream consumer needs
-/// them.
+/// Two clusters:
+/// - **PDF-cluster:** `Section`, `Paragraph`, `Header`, `Footer`,
+///   `Margin`. Produced by the PDF channel. `Header` / `Footer` /
+///   `Margin` exist because they're PDF "running noise" — page numbers,
+///   chapter headers, sidebars — that the markdown channel never
+///   produces.
+/// - **Markdown-cluster:** `CodeBlock`, `List`, `Blockquote`, `Table`.
+///   Produced by the markdown channel. Each is one node holding the
+///   verbatim raw markdown source for the block (with delimiters
+///   preserved — fence + language tag, `>` markers, list bullets, table
+///   pipes). The PDF channel never produces these; PDFs render to
+///   prose `Paragraph` nodes regardless of source structure.
+///
+/// The asymmetry is a feature of the union schema, not a gap. Each
+/// channel produces a subset; `SemanticElementType` is the full union.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SemanticElementType {
     Section,
@@ -755,6 +809,11 @@ pub enum SemanticElementType {
     Header,
     Footer,
     Margin,
+    // Schema 0.7.0+ (B6): markdown-channel block types.
+    CodeBlock,
+    List,
+    Blockquote,
+    Table,
 }
 /// Complete output from document preprocessing
 ///

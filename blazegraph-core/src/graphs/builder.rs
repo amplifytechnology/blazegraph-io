@@ -284,12 +284,17 @@ impl GraphBuilder {
 /// Map `SemanticElementType` to the string the serialized graph carries
 /// in `DocumentNode.node_type`. Kept as a free function (no `&self`) so
 /// it doesn't pretend to depend on `GraphBuilder` state.
-fn node_type_for(t: SemanticElementType) -> &'static str {
+pub fn node_type_for(t: SemanticElementType) -> &'static str {
     match t {
         SemanticElementType::Section => "Section",
         SemanticElementType::Paragraph => "Paragraph",
         SemanticElementType::Header => "Header",
         SemanticElementType::Footer => "Footer",
         SemanticElementType::Margin => "Margin",
+        // Schema 0.7.0+ (B6): markdown-channel block types.
+        SemanticElementType::CodeBlock => "CodeBlock",
+        SemanticElementType::List => "List",
+        SemanticElementType::Blockquote => "Blockquote",
+        SemanticElementType::Table => "Table",
     }
 }
