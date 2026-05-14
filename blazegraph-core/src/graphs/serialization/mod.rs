@@ -11,12 +11,16 @@
 //!   stable input to identity hashes and round-trip verification).
 //! - [`markdown`] — bgraph.md emitter (forward emitter B2 of the
 //!   MD+DOCX format expansion flow).
+//! - [`markdown_generic`] — plain markdown emitter (the generic
+//!   markdown channel from B6; the inverse of
+//!   `preprocessors::md::generic_md::parse`).
 //!
 //! The existing `to_sequential_format` / `to_flat_format` impl block
 //! lives in this file (legacy output shapes pre-dating bgraph.md).
 
 pub mod canonical;
 pub mod markdown;
+pub mod markdown_generic;
 
 use crate::types::*;
 use anyhow::Result;
