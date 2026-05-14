@@ -11,7 +11,7 @@ use crate::preprocessors::pdf::project_to_semantic_tree;
 use crate::preprocessors::{Preprocessor, TikaPreprocessor};
 use crate::rules::RuleEngine;
 use crate::storage::{
-    calculate_config_hash, calculate_pdf_hash, CacheDefaults, CachePoint, DocumentStorage,
+    calculate_config_hash, calculate_source_hash, CacheDefaults, CachePoint, DocumentStorage,
     FileStorage, FreshFrom,
 };
 use crate::types::*;
@@ -144,7 +144,7 @@ impl DocumentProcessor {
 
         // Read PDF and calculate hash
         let pdf_bytes = std::fs::read(input_path)?;
-        let pdf_hash = calculate_pdf_hash(&pdf_bytes);
+        let pdf_hash = calculate_source_hash(&pdf_bytes);
 
         println!("📄 Processing: {}", input_path);
 
@@ -163,12 +163,15 @@ impl DocumentProcessor {
             }
         }
 
-        // Build the provenance triple that identifies this parse run.
-        // The same `(blazegraph_version, source_sha256, config_hash)`
-        // values feed `NodeIdGenerator::new` (so node IDs depend only on
-        // these three things), and `parse_provenance` is persisted on
-        // the graph so the bgraph.md emitter (B2) can populate the
-        // document-level identity block without re-reading the source.
+        // Build the provenance record that identifies this parse run.
+        // The `(source_sha256, config_hash)` pair feeds
+        // `NodeIdGenerator::new` (CR-47: node IDs depend on source +
+        // config only — `blazegraph_version` no longer enters the
+        // namespace, so node IDs survive parser version bumps).
+        // `parse_provenance` is persisted on the graph so the bgraph.md
+        // emitter (B2) can populate the document-level identity block
+        // without re-reading the source. `blazegraph_version` rides
+        // along as provenance documentation only.
         let config_hash = calculate_config_hash(config)?;
         let provenance = ParseProvenance {
             blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -180,11 +183,7 @@ impl DocumentProcessor {
             source_sha256: pdf_hash.clone(),
             config_hash: config_hash.clone(),
         };
-        let id_gen = NodeIdGenerator::new(
-            &provenance.blazegraph_version,
-            &provenance.source_sha256,
-            &provenance.config_hash,
-        );
+        let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
 
         // --- C2: Preprocessor cache check ---
         let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {
@@ -267,7 +266,7 @@ impl DocumentProcessor {
     ) -> Result<PipelineStages> {
         let input_path_ref = Path::new(input_path);
         let pdf_bytes = std::fs::read(input_path_ref)?;
-        let pdf_hash = calculate_pdf_hash(&pdf_bytes);
+        let pdf_hash = calculate_source_hash(&pdf_bytes);
 
         // Stage 1a: PDF → XHTML (always fresh for diagnostics)
         let xhtml = self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)?;

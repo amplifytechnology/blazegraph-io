@@ -250,11 +250,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
         source_sha256: source_sha256.clone(),
         config_hash: config_hash.clone(),
     };
-    let id_gen = NodeIdGenerator::new(
-        &provenance.blazegraph_version,
-        &provenance.source_sha256,
-        &provenance.config_hash,
-    );
+    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
 
     // 4. Build the graph. The builder asserts `text_order == vec
     //    position`; we satisfied that above by pushing in order.

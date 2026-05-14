@@ -145,8 +145,10 @@ pub enum ParseError {
     },
 
     /// The doc-level block carried a `schema` field whose major
-    /// version is not `1`.
-    #[error("unsupported schema version {0}; expected 1.0.x")]
+    /// version is not `1`. The current bgraph.md wire-format major is
+    /// 1; older/newer majors are rejected rather than silently
+    /// misinterpreted.
+    #[error("unsupported schema version {0}; expected 1.x.y")]
     UnsupportedSchema(String),
 
     /// Body content contained a line starting with the reserved

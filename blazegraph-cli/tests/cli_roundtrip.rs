@@ -53,11 +53,7 @@ fn build_synthetic_graph() -> DocumentGraph {
         source_sha256: "cli-test-source-sha".to_string(),
         config_hash: "cli-test-config-hash".to_string(),
     };
-    let id_gen = NodeIdGenerator::new(
-        &provenance.blazegraph_version,
-        &provenance.source_sha256,
-        &provenance.config_hash,
-    );
+    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
     let elements = vec![
         SemanticTreeElement {
             text: "Introduction".to_string(),
