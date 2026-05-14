@@ -140,6 +140,10 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 ///   `bgraph-section` fence; metadata-only inside fence.
 /// - `Paragraph`: body on the line *preceding* the `bgraph-paragraph`
 ///   fence; metadata-only inside fence.
+/// - `CodeBlock` / `List` / `Blockquote` / `Table` (Amendment F):
+///   body on the line(s) *preceding* the `bgraph-{tag}` fence;
+///   metadata-only inside fence. Body markdown is preserved verbatim
+///   so a plain markdown renderer shows the rendered form.
 /// - `Header` / `Footer` / `Margin`: body *inside* the fence followed
 ///   by the JSON metadata line. (See "Strip ergonomics" in the spec —
 ///   the body-inside-fence shape lets the second `sed` variant strip
@@ -160,6 +164,17 @@ fn emit_node(node: &DocumentNode) -> Option<String> {
             "{text}\n```bgraph-paragraph\n{meta}\n```",
             text = node.content.text,
         )),
+        // Amendment F (B6, schema 0.7.0+): markdown-channel variants.
+        // Body-outside pattern, same shape as Paragraph. The body
+        // markdown is the verbatim source (fences, bullets, pipes,
+        // `>` markers, all preserved).
+        "CodeBlock" | "List" | "Blockquote" | "Table" => {
+            let tag = node.node_type.to_ascii_lowercase();
+            Some(format!(
+                "{text}\n```bgraph-{tag}\n{meta}\n```",
+                text = node.content.text,
+            ))
+        }
         "Header" | "Footer" | "Margin" => {
             let tag = node.node_type.to_ascii_lowercase();
             Some(format!(
@@ -167,11 +182,16 @@ fn emit_node(node: &DocumentNode) -> Option<String> {
                 text = node.content.text,
             ))
         }
-        // Defensive — shouldn't reach here with v1.0.0 element types.
-        _ => Some(format!(
-            "```bgraph-unknown\n{text}\n{meta}\n```",
-            text = node.content.text,
-        )),
+        // Defense-in-depth: every variant in `SemanticElementType`
+        // should have an explicit arm above. Reaching here means a
+        // schema addition snuck through without a corresponding spec
+        // amendment and emitter update. Panic loudly so the next CI
+        // run catches it.
+        other => panic!(
+            "emit_markdown (bgraph.md): variant '{other}' has no fence-tag mapping; \
+             schema added a variant without a corresponding spec amendment + emitter \
+             arm in graphs/serialization/markdown.rs",
+        ),
     }
 }
 
@@ -585,5 +605,68 @@ mod tests {
         eprintln!("--- BEGIN emit_markdown sample ---");
         eprintln!("{}", emit_markdown(&graph));
         eprintln!("--- END emit_markdown sample ---");
+    }
+
+    // ----- Amendment F (B6, schema 0.7.0+) emit tests -----------------
+
+    #[test]
+    fn emit_codeblock_node_body_outside_fence_metadata_inside() {
+        let raw = "```rust\nfn main() {}\n```";
+        let graph = build_graph(vec![("CodeBlock", raw, 2, 0)]);
+        let md = emit_markdown(&graph);
+        // Body precedes the bgraph fence on the immediately adjacent
+        // line, same shape as Section/Paragraph.
+        assert!(
+            md.contains("```\n```bgraph-codeblock\n"),
+            "CodeBlock body should be outside the bgraph fence; got:\n{md}"
+        );
+        // Body itself survives verbatim (fence + language tag + body).
+        assert!(
+            md.contains("```rust\nfn main() {}\n```"),
+            "CodeBlock body should be verbatim; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn emit_list_node_body_outside() {
+        let raw = "- one\n- two";
+        let graph = build_graph(vec![("List", raw, 2, 0)]);
+        let md = emit_markdown(&graph);
+        assert!(
+            md.contains("- one\n- two\n```bgraph-list\n"),
+            "List body should be outside the bgraph fence; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn emit_blockquote_node_body_outside() {
+        let raw = "> quoted\n> still";
+        let graph = build_graph(vec![("Blockquote", raw, 2, 0)]);
+        let md = emit_markdown(&graph);
+        assert!(
+            md.contains("> quoted\n> still\n```bgraph-blockquote\n"),
+            "Blockquote body should be outside the fence; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn emit_table_node_body_outside() {
+        let raw = "| a | b |\n|---|---|\n| 1 | 2 |";
+        let graph = build_graph(vec![("Table", raw, 2, 0)]);
+        let md = emit_markdown(&graph);
+        assert!(
+            md.contains("| a | b |\n|---|---|\n| 1 | 2 |\n```bgraph-table\n"),
+            "Table body should be outside the fence; got:\n{md}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no fence-tag mapping")]
+    fn emit_panics_on_truly_unknown_variant() {
+        // Defense-in-depth: a node_type string that has no arm in
+        // emit_node must panic — the spec/schema/emitter sync is
+        // load-bearing.
+        let graph = build_graph(vec![("UnknownVariant", "x", 1, 0)]);
+        let _ = emit_markdown(&graph);
     }
 }

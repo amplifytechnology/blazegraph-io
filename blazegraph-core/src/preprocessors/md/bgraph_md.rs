@@ -187,6 +187,30 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                             metadata: meta,
                         });
                     }
+                    // Amendment F (B6, schema 0.7.0+): markdown-channel
+                    // variants. Same body-outside pattern as
+                    // Paragraph — the preceding free-text block is
+                    // the verbatim markdown source. The per-variant
+                    // line-prefix rules from the spec
+                    // (Section 11.3 of the handoff + `08-bgraph-md-format.md`)
+                    // are *recovery* rules for hand-edited bgraph.md;
+                    // for round-trip identity the body is whatever
+                    // the emitter wrote.
+                    "bgraph-codeblock" | "bgraph-list" | "bgraph-blockquote" | "bgraph-table" => {
+                        if doc_level.is_none() {
+                            return Err(ParseError::MissingDocLevelBlock);
+                        }
+                        let block_body = pending_body.take().ok_or_else(|| {
+                            ParseError::MalformedFence(format!(
+                                "{tag} fence with no preceding body line",
+                            ))
+                        })?;
+                        let meta = parse_node_metadata(body)?;
+                        parsed_elements.push(ParsedElement {
+                            body: block_body.trim_end().to_string(),
+                            metadata: meta,
+                        });
+                    }
                     "bgraph-header" | "bgraph-footer" | "bgraph-margin" => {
                         if doc_level.is_none() {
                             return Err(ParseError::MissingDocLevelBlock);
@@ -427,6 +451,11 @@ pub(super) fn bgraph_fence_open_tag(line: &str) -> Option<String> {
         || info == "bgraph-header"
         || info == "bgraph-footer"
         || info == "bgraph-margin"
+        // Amendment F (B6, schema 0.7.0+): markdown-channel variants.
+        || info == "bgraph-codeblock"
+        || info == "bgraph-list"
+        || info == "bgraph-blockquote"
+        || info == "bgraph-table"
     {
         Some(info.to_string())
     } else if let Some(rest) = info.strip_prefix("bgraph") {
@@ -601,6 +630,11 @@ fn map_node_type_to_semantic(s: &str) -> Result<SemanticElementType, ParseError>
         "Header" => Ok(SemanticElementType::Header),
         "Footer" => Ok(SemanticElementType::Footer),
         "Margin" => Ok(SemanticElementType::Margin),
+        // Schema 0.7.0+ / Amendment F (B6): markdown-channel variants.
+        "CodeBlock" => Ok(SemanticElementType::CodeBlock),
+        "List" => Ok(SemanticElementType::List),
+        "Blockquote" => Ok(SemanticElementType::Blockquote),
+        "Table" => Ok(SemanticElementType::Table),
         other => Err(ParseError::UnknownNodeType(other.to_string())),
     }
 }
@@ -647,6 +681,11 @@ mod tests {
                     "Header" => SemanticElementType::Header,
                     "Footer" => SemanticElementType::Footer,
                     "Margin" => SemanticElementType::Margin,
+                    // Amendment F (B6, schema 0.7.0+).
+                    "CodeBlock" => SemanticElementType::CodeBlock,
+                    "List" => SemanticElementType::List,
+                    "Blockquote" => SemanticElementType::Blockquote,
+                    "Table" => SemanticElementType::Table,
                     other => panic!("unsupported test node type {other:?}"),
                 };
                 SemanticTreeElement {
@@ -972,5 +1011,111 @@ mod tests {
             validate_schema("2.0.0"),
             Err(ParseError::UnsupportedSchema(_))
         ));
+    }
+
+    // ----- Amendment F (B6, schema 0.7.0+) parse tests ---------------
+
+    #[test]
+    fn parse_codeblock_fence_recovers_inner_fenced_block_as_body() {
+        let raw_codeblock = "```rust\nfn main() {}\n```";
+        let original =
+            build_synthetic_graph(vec![("CodeBlock", raw_codeblock, 1, 0)], Some("Doc"), None);
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        // The reconstructed CodeBlock's body should equal the
+        // verbatim raw fence + body + closing fence.
+        let codeblock = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "CodeBlock")
+            .expect("CodeBlock present");
+        assert_eq!(codeblock.content.text, raw_codeblock);
+    }
+
+    #[test]
+    fn parse_list_fence_recovers_multi_item_body() {
+        let raw_list = "- one\n- two\n- three";
+        let original = build_synthetic_graph(vec![("List", raw_list, 1, 0)], Some("Doc"), None);
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        let list = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "List")
+            .expect("List present");
+        assert_eq!(list.content.text, raw_list);
+    }
+
+    #[test]
+    fn parse_list_fence_handles_nested_indented_continuation() {
+        let raw_list = "- top\n  - nested\n  - also nested\n- top two";
+        let original = build_synthetic_graph(vec![("List", raw_list, 1, 0)], Some("Doc"), None);
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
+        let list = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "List")
+            .expect("List present");
+        assert_eq!(list.content.text, raw_list);
+    }
+
+    #[test]
+    fn parse_blockquote_fence_recovers_gt_prefixed_body() {
+        let raw_quote = "> a quote\n> still quoted";
+        let original =
+            build_synthetic_graph(vec![("Blockquote", raw_quote, 1, 0)], Some("Doc"), None);
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
+        let bq = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Blockquote")
+            .expect("Blockquote present");
+        assert_eq!(bq.content.text, raw_quote);
+    }
+
+    #[test]
+    fn parse_table_fence_recovers_gfm_body_with_alignment_row() {
+        let raw_table = "| h1 | h2 |\n|---|---|\n| a | b |";
+        let original = build_synthetic_graph(vec![("Table", raw_table, 1, 0)], Some("Doc"), None);
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
+        let tbl = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Table")
+            .expect("Table present");
+        assert_eq!(tbl.content.text, raw_table);
+    }
+
+    #[test]
+    fn parse_mixed_amendment_f_variants_round_trip() {
+        // One of each new variant in the same doc — verify the
+        // ordering and pairing work when multiple body-outside
+        // fences interleave.
+        let original = build_synthetic_graph(
+            vec![
+                ("Section", "Intro", 1, 0),
+                ("Paragraph", "Some prose.", 1, 1),
+                ("CodeBlock", "```rust\nfn x() {}\n```", 1, 2),
+                ("List", "- a\n- b", 1, 3),
+                ("Blockquote", "> q", 1, 4),
+                ("Table", "| h |\n|---|\n| c |", 1, 5),
+            ],
+            Some("Mixed"),
+            None,
+        );
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        assert_eq!(canonical(&result.graph), canonical(&original));
     }
 }
