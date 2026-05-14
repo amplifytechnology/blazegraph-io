@@ -31,6 +31,7 @@
 //! widely used in the Rust ecosystem, and supports pull-mode parsing with
 //! attribute access — exactly what context tracking needs.
 
+use crate::tokens::estimate_token_count;
 use crate::types::*;
 use anyhow::Result;
 use quick_xml::escape::unescape;
@@ -535,10 +536,6 @@ fn fallback_font(font_class_name: &str) -> FontClass {
         font_weight: "normal".to_string(),
         color: "#000000".to_string(),
     }
-}
-
-fn estimate_token_count(text: &str) -> usize {
-    text.len() / 4 // Rough estimation: ~4 characters per token
 }
 
 // ============================================================================

@@ -12,6 +12,7 @@ pub mod preprocessors;
 pub mod processor;
 pub mod rules;
 pub mod storage;
+pub mod tokens;
 pub mod types;
 
 // Re-export main types and functions for easy use
