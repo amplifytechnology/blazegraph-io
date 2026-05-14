@@ -27,6 +27,7 @@
 
 pub mod bgraph_md;
 pub mod frontmatter;
+pub mod generic_md;
 pub mod strip;
 pub mod types;
 
