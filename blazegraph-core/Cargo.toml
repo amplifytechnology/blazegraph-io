@@ -37,6 +37,23 @@ unicode-normalization = "0.1"
 # Cryptographic hashing for caching
 sha2 = "0.10"
 
+# CommonMark parser — drives the bgraph.md reverse parser (B3 of the
+# MD+DOCX format expansion flow) and the generic-markdown channel (B6).
+# B6 enables the `simd` feature implicitly via default features removed
+# — we keep `default-features = false` so the bgraph.md round-trip
+# remains deterministic across builds.
+pulldown-cmark = { version = "0.10", default-features = false }
+
+# Generic markdown channel (B6 of MD+DOCX flow): YAML frontmatter
+# pre-pass. `gray_matter` handles the `---\n…\n---\n` detection and
+# YAML decoding; its result (a gray_matter `Pod`) is converted to
+# `serde_json::Value` at the parse boundary so the YAML lib coupling
+# never leaks beyond `preprocessors::md::frontmatter`. See the B6 AAR
+# for why `gray_matter` is the named lib (and how the handoff's named
+# `serde_norway` doesn't compose with gray_matter — gray_matter uses
+# its own internal YAML engine, not a pluggable one).
+gray_matter = { version = "0.3", default-features = false, features = ["yaml"] }
+
 # JNI for Java interop (when jni-backend feature enabled)
 # Requires 'invocation' feature to create JVMs
 jni = { version = "0.21", features = ["invocation"], optional = true }

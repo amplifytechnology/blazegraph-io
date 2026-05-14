@@ -2,11 +2,12 @@ use crate::analytics::{
     AnalysisBuilder, DocumentAnalysis, FontStatsBuilder, GeometryStatsBuilder, PageStatsBuilder,
     RegionStatsBuilder, Statistic,
 };
-use crate::cache::{self, GraphCacheKey};
+use crate::cache::GraphCacheKey;
 use crate::classifier::DocumentClassifier;
 use crate::config::ParsingConfig;
 use crate::graphs::builder::GraphBuilder;
 use crate::graphs::NodeIdGenerator;
+use crate::preprocessors::pdf::project_to_semantic_tree;
 use crate::preprocessors::{Preprocessor, TikaPreprocessor};
 use crate::rules::RuleEngine;
 use crate::storage::{
@@ -162,10 +163,28 @@ impl DocumentProcessor {
             }
         }
 
-        // Create deterministic ID generator: version + pdf_hash + config_hash
+        // Build the provenance triple that identifies this parse run.
+        // The same `(blazegraph_version, source_sha256, config_hash)`
+        // values feed `NodeIdGenerator::new` (so node IDs depend only on
+        // these three things), and `parse_provenance` is persisted on
+        // the graph so the bgraph.md emitter (B2) can populate the
+        // document-level identity block without re-reading the source.
         let config_hash = calculate_config_hash(config)?;
-        let id_gen =
-            NodeIdGenerator::new(cache::versions::BLAZEGRAPH_VERSION, &pdf_hash, &config_hash);
+        let provenance = ParseProvenance {
+            blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_format: "pdf".to_string(),
+            source_filename: Path::new(input_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| input_path.to_string()),
+            source_sha256: pdf_hash.clone(),
+            config_hash: config_hash.clone(),
+        };
+        let id_gen = NodeIdGenerator::new(
+            &provenance.blazegraph_version,
+            &provenance.source_sha256,
+            &provenance.config_hash,
+        );
 
         // --- C2: Preprocessor cache check ---
         let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {
@@ -198,6 +217,7 @@ impl DocumentProcessor {
             &preprocessor_output,
             config,
             &id_gen,
+            provenance,
             &pdf_hash,
             &mut profiler,
         )?;
@@ -302,8 +322,11 @@ impl DocumentProcessor {
         // Infer title from content before graph build
         let inferred_title = infer_title(&parsed_elements);
 
-        // Stage 3: ParsedElements → DocumentGraph
-        let mut graph = self.graph_builder.build_graph(parsed_elements.clone())?;
+        // Stage 3: ParsedPdfElement → SemanticTreeElement (channel exit)
+        let semantic_elements = project_to_semantic_tree(parsed_elements.clone());
+
+        // Stage 4: SemanticTreeElement → DocumentGraph
+        let mut graph = self.graph_builder.build_graph(semantic_elements)?;
 
         // Wire metadata and compute post-processing
         if let Some(title) = inferred_title {
@@ -393,6 +416,7 @@ impl DocumentProcessor {
         preprocessor_output: &PreprocessorOutput,
         config: &ParsingConfig,
         id_gen: &NodeIdGenerator,
+        parse_provenance: ParseProvenance,
         pdf_hash: &str,
         profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
@@ -450,10 +474,19 @@ impl DocumentProcessor {
         // Infer title before graph build consumes elements
         let inferred_title = infer_title(&parsed_elements);
 
+        // PDF channel exit: project rule output onto SemanticTreeElement.
+        // Everything from here is channel-agnostic.
+        let semantic_elements = profiler.time_step("Channel Projection", || {
+            project_to_semantic_tree(parsed_elements)
+        });
+
         // Graph construction (deterministic UUIDv5 node IDs)
         let mut graph = profiler.time_step("Graph Construction", || {
-            self.graph_builder
-                .build_graph_deterministic(parsed_elements, id_gen)
+            self.graph_builder.build_graph_deterministic(
+                semantic_elements,
+                id_gen,
+                parse_provenance,
+            )
         })?;
 
         // Post-processing: metadata, analysis, breadcrumbs

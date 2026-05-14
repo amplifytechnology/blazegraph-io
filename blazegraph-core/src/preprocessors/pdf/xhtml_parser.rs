@@ -31,13 +31,14 @@
 //! widely used in the Rust ecosystem, and supports pull-mode parsing with
 //! attribute access — exactly what context tracking needs.
 
+use crate::tokens::estimate_token_count;
 use crate::types::*;
 use anyhow::Result;
 use quick_xml::escape::unescape;
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
-use std::time::Instant;
 use std::sync::LazyLock;
+use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
 // Pre-compiled regexes
@@ -309,7 +310,9 @@ fn extract_text_elements(
         } else if matched.starts_with("<span") {
             // Span: parse attrs, find </span>, slice inner, build element.
             let class = parse_attr_str(matched, "class").unwrap_or("").to_string();
-            let bbox = parse_attr_str(matched, "data-bbox").unwrap_or("").to_string();
+            let bbox = parse_attr_str(matched, "data-bbox")
+                .unwrap_or("")
+                .to_string();
             let line = parse_attr_u32(matched, "data-line").unwrap_or(0);
             let segment = parse_attr_u32(matched, "data-segment").unwrap_or(0);
 
@@ -533,10 +536,6 @@ fn fallback_font(font_class_name: &str) -> FontClass {
         font_weight: "normal".to_string(),
         color: "#000000".to_string(),
     }
-}
-
-fn estimate_token_count(text: &str) -> usize {
-    text.len() / 4 // Rough estimation: ~4 characters per token
 }
 
 // ============================================================================

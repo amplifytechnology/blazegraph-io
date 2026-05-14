@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 pub type NodeId = Uuid;
@@ -37,9 +37,10 @@ pub struct PhysicalLocation {
 }
 
 /// Signals whether physical location data is meaningful for this document
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum FlowType {
     /// PDF — has physical layout, physical_location is present
+    #[default]
     Fixed,
     /// Markdown, DOCX — reflows, physical_location is None
     Free,
@@ -58,6 +59,49 @@ pub struct DocumentInfo {
     /// PDF bookmarks/table of contents (if available in the source PDF)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark_data: Option<BookmarkData>,
+
+    /// Origin of this graph — the (version, source, config) triple that
+    /// reproduces it. Persisted on the graph so the bgraph.md emitter
+    /// (and any future round-trip consumer) has the load-bearing
+    /// identity inputs without re-deriving them.
+    ///
+    /// `None` for legacy graphs loaded from pre-0.6.0 graph.json files
+    /// and for graphs built via the legacy `GraphBuilder::build_graph`
+    /// path (random UUIDv4 IDs, no hash inputs anyway).
+    /// `Some(_)` for any graph built fresh through
+    /// `GraphBuilder::build_graph_deterministic`.
+    /// Schema 0.6.0 (B2 of MD+DOCX flow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_provenance: Option<ParseProvenance>,
+}
+
+/// The (version, source, config) triple that identifies a specific parse
+/// run. Persisted on `DocumentInfo` so consumers can reproduce the graph
+/// deterministically and emit round-trippable bgraph.md.
+///
+/// Mirrors the inputs to `NodeIdGenerator::new`, plus the source
+/// filename and source-format identifier needed for the bgraph.md
+/// document-level block. See
+/// `docs/P2/core/architecture/08-bgraph-md-format.md` (the v1.0.0 wire
+/// format) for the consumer contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParseProvenance {
+    /// Parser version that produced this graph (e.g. `"0.2.2"`).
+    /// Sourced from `env!("CARGO_PKG_VERSION")` at build time.
+    pub blazegraph_version: String,
+
+    /// Source format identifier (`"pdf"`, `"markdown"`, `"docx"`, …).
+    pub source_format: String,
+
+    /// Original source filename (basename, e.g. `"rfc-quic.pdf"`).
+    pub source_filename: String,
+
+    /// SHA-256 of the source bytes (hex-encoded).
+    pub source_sha256: String,
+
+    /// Hash of the parsing config that produced this graph
+    /// (hex-encoded).
+    pub config_hash: String,
 }
 /// The schema version stamped on every graph output.
 /// Bump this when the output shape changes.
@@ -77,7 +121,44 @@ pub struct DocumentInfo {
 /// `PdfTextElement` → `ParsedPdfElement` boundary from `region_label`
 /// (`H-*` → Header, `F-*` → Footer, `None` → Margin, body leaf labels →
 /// Paragraph). Section detection skips Header / Footer / Margin.
-pub const SCHEMA_VERSION: &str = "0.5.1";
+///
+/// 0.6.0 — B2 of MD+DOCX flow:
+///   1. Added `DocumentInfo.parse_provenance: Option<ParseProvenance>`
+///      so the bgraph.md emitter can produce real (not placeholder)
+///      doc-level identity fields and downstream round-trip consumers
+///      can re-derive deterministic node IDs without re-reading the
+///      source bytes.
+///   2. Moved `created_at` from `StructuralProfile` to
+///      `SortedDocumentGraph` (the on-disk wrapper). `DocumentGraph`
+///      is now time-free, which is the canonical-input invariant
+///      required for `canonical_json(&DocumentGraph)` to be byte-
+///      deterministic across runs of the same logical graph.
+///
+/// Backwards-compatible: existing 0.5.1 graphs deserialize cleanly
+/// with `parse_provenance = None` and `SortedDocumentGraph.created_at`
+/// defaulting to the Unix epoch (clearly "no real value").
+///
+/// 0.7.0 — B6 of MD+DOCX flow:
+///   1. Added `CodeBlock`, `List`, `Blockquote`, `Table` variants to
+///      `SemanticElementType` (and their string counterparts in
+///      `DocumentNode.node_type`). These are produced by the markdown
+///      channel; the PDF channel never produces them. The union schema
+///      absorbs this asymmetry by design — graphs from one channel are
+///      a subset of `SemanticElementType` and that is a feature.
+///   2. Added canonical frontmatter fields to `DocumentMetadata`:
+///      `date: Option<String>`, `tags: Vec<String>` (default empty),
+///      `draft: Option<bool>`. These are the starting point for
+///      normalizing metadata across MD / PDF / DOCX.
+///   3. Added `DocumentMetadata.extras: BTreeMap<String,
+///      serde_json::Value>` — an opaque pass-through bucket for
+///      non-canonical frontmatter keys. YAML values are converted to
+///      JSON values at the frontmatter-parse boundary so the schema
+///      does not depend on the YAML library.
+///
+/// Backwards-compatible: existing 0.6.0 graphs deserialize cleanly
+/// because all new fields default (`Option::None` / `Vec::new` /
+/// `BTreeMap::new`), and the new enum variants are additive.
+pub const SCHEMA_VERSION: &str = "0.7.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
@@ -91,9 +172,28 @@ pub struct DocumentGraph {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
     pub schema_version: String,
+    /// Wall-clock time at which this graph was serialized to disk.
+    /// Lives on the wrapper (not on `DocumentGraph`) so `canonical_json`
+    /// is deterministic across runs of the same logical graph — see
+    /// the canonical-input invariant in
+    /// `docs/P2/core/architecture/08-bgraph-md-format.md`.
+    /// `#[serde(default)]` keeps pre-0.6.0 graph.json fixtures (which
+    /// carried `created_at` on `StructuralProfile` instead) loadable;
+    /// the default is the Unix epoch — a clearly "no real value"
+    /// sentinel rather than the misleading `Utc::now()`.
+    #[serde(default = "default_created_at")]
+    pub created_at: DateTime<Utc>,
     pub nodes: Vec<DocumentNode>,
     pub document_info: DocumentInfo,
     pub structural_profile: StructuralProfile,
+}
+
+/// Sentinel default for `SortedDocumentGraph.created_at` when loading
+/// pre-0.6.0 fixtures that did not carry the field. Returns the Unix
+/// epoch (1970-01-01T00:00:00Z) — clearly "no real value", in contrast
+/// to `Utc::now()` which would silently lie about emission time.
+fn default_created_at() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is always valid")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,12 +317,30 @@ pub struct StyleMetadata {
     pub color: Option<String>, // CSS color value (e.g., "#FF0000" or "rgb(255,0,0)")
 }
 
+/// Channel-agnostic style information attached to `SemanticTreeElement`.
+///
+/// Reuses `StyleMetadata` (the shape DocumentNode already serializes) so
+/// the projection boundary can carry style data through without lossy
+/// reshaping. The v1 shape may not be final — channels populate as
+/// best-effort or `None`. See `SemanticTreeElement::style` for usage.
+pub type StyleInfo = StyleMetadata;
+
 /// Quantitative measurement of graph shape — deterministic, mechanically computed from structure.
 /// Travels with graph.json. Describes the L0 tree's statistical properties.
 /// See AmplifyNotes/09-Profile-Types.md for design rationale.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// **Canonical-input invariant (B2 of MD+DOCX flow):** this struct must
+/// contain no time- or environment-dependent fields. The previous
+/// `created_at: DateTime<Utc>` field moved to
+/// `SortedDocumentGraph.created_at` (the on-disk wrapper) in schema
+/// 0.6.0 so `canonical_json(&DocumentGraph)` is byte-deterministic
+/// across runs of the same logical graph.
+/// `#[serde(default)]` on the struct lets older fixtures (which had
+/// `created_at` here) still deserialize cleanly — serde silently drops
+/// the unknown field.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct StructuralProfile {
-    pub created_at: DateTime<Utc>,
     pub document_type: DocumentType,
     pub flow_type: FlowType,
     pub total_nodes: usize,
@@ -234,28 +352,14 @@ pub struct StructuralProfile {
     pub depth_distribution: DepthDistribution,
 }
 
-impl Default for StructuralProfile {
-    fn default() -> Self {
-        Self {
-            created_at: Utc::now(),
-            document_type: DocumentType::Unknown,
-            flow_type: FlowType::Fixed,
-            total_nodes: 0,
-            total_tokens: 0,
-            token_distribution: TokenDistribution::default(),
-            node_type_distribution: NodeTypeDistribution::default(),
-            depth_distribution: DepthDistribution::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum DocumentType {
     LegalContract,
     AcademicPaper,
     TechnicalManual,
     BusinessReport,
     Generic,
+    #[default]
     Unknown,
 }
 
@@ -459,6 +563,28 @@ pub struct DocumentMetadata {
     pub description: Option<String>,      // dc:description
     pub encrypted: Option<bool>,          // pdf:encrypted
     pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
+
+    // Schema 0.7.0+ (B6): canonical frontmatter fields from the
+    // markdown channel. Free-form strings (rather than typed Date /
+    // tag-vocabulary types) because frontmatter is user-authored and
+    // lenient — we capture what's there, not normalize it.
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub draft: Option<bool>,
+
+    // Schema 0.7.0+ (B6): opaque pass-through for non-canonical
+    // frontmatter keys. YAML values from the markdown channel are
+    // converted to `serde_json::Value` at the frontmatter-parse
+    // boundary (in `preprocessors::md::frontmatter`) so the schema
+    // type does not depend on the YAML library.
+    //
+    // `BTreeMap` (not `HashMap`) so canonical JSON serialization is
+    // deterministic — same input must produce the same `graph_sha256`.
+    #[serde(default)]
+    pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 impl DocumentMetadata {
@@ -609,22 +735,85 @@ pub struct GraphAnalyticsResult {
 /// Analytics computer that can analyze any subset of nodes in the graph
 pub struct GraphAnalytics;
 
-// Graph builder structs
-#[derive(Debug, Clone)]
-pub struct ElementGroup {
-    pub elements: Vec<ParsedPdfElement>,
-    pub group_type: GroupType,
+// ===== SEMANTIC TREE ELEMENT (channel boundary) =====
+//
+// `SemanticTreeElement` is the convergence type — what every input channel
+// (PDF, MD, DOCX) projects to before the universal `GraphBuilder` consumes
+// it. Format-specific quirks live in the channel projection; downstream
+// (GraphBuilder) is channel-agnostic.
+//
+// See `preprocessors/pdf/semantic_tree_projection.rs` for the PDF
+// channel's projection function, and `graphs/builder.rs` for the
+// downstream consumer.
+
+/// The convergence type — what every input channel (PDF, MD, DOCX) projects
+/// to before the universal `GraphBuilder` consumes it.
+///
+/// Channel contract: when a `Vec<SemanticTreeElement>` is produced, all
+/// format-specific transforms are complete. `GraphBuilder` walks-and-zips;
+/// it does not merge, reorder, or post-process. `text_order` equals
+/// projection-time vec position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticTreeElement {
+    /// The text content of this element.
+    pub text: String,
+
+    /// What kind of element this is.
+    pub element_type: SemanticElementType,
+
+    /// Hierarchy level hint. Meaningful for `Section` (1 = top-level,
+    /// 2 = nested, ...); for `Paragraph` / `Header` / `Footer` / `Margin`
+    /// it is `0` (sentinel — these are leaves attached to the current
+    /// open Section).
     pub hierarchy_level: u32,
-    pub combined_text: String,
+
+    /// Position in the channel's projection-output vec. Zero-based,
+    /// strictly sequential, no gaps. `GraphBuilder` uses this as the
+    /// salt for deterministic ID generation; it also asserts
+    /// `text_order == vec_index` as a sanity check.
+    pub text_order: u32,
+
+    /// Physical location, if the source format has it (PDF only).
+    /// `None` for free-flow formats (Markdown, DOCX).
+    pub physical_location: Option<PhysicalLocation>,
+
+    /// Style information, if the source format has it. v1 shape
+    /// may not be final — channels populate as best-effort or `None`.
+    pub style: Option<StyleInfo>,
+
+    /// Pre-computed token count.
+    pub token_count: usize,
 }
 
-#[derive(Debug, Clone)]
-pub enum GroupType {
+/// Element kinds carried at the SemanticTreeElement boundary.
+///
+/// Two clusters:
+/// - **PDF-cluster:** `Section`, `Paragraph`, `Header`, `Footer`,
+///   `Margin`. Produced by the PDF channel. `Header` / `Footer` /
+///   `Margin` exist because they're PDF "running noise" — page numbers,
+///   chapter headers, sidebars — that the markdown channel never
+///   produces.
+/// - **Markdown-cluster:** `CodeBlock`, `List`, `Blockquote`, `Table`.
+///   Produced by the markdown channel. Each is one node holding the
+///   verbatim raw markdown source for the block (with delimiters
+///   preserved — fence + language tag, `>` markers, list bullets, table
+///   pipes). The PDF channel never produces these; PDFs render to
+///   prose `Paragraph` nodes regardless of source structure.
+///
+/// The asymmetry is a feature of the union schema, not a gap. Each
+/// channel produces a subset; `SemanticElementType` is the full union.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemanticElementType {
     Section,
     Paragraph,
     Header,
     Footer,
     Margin,
+    // Schema 0.7.0+ (B6): markdown-channel block types.
+    CodeBlock,
+    List,
+    Blockquote,
+    Table,
 }
 /// Complete output from document preprocessing
 ///

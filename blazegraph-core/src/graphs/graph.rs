@@ -1,6 +1,7 @@
 use super::analytics::GraphAnalytics;
 use crate::types::*;
 use anyhow::Result;
+use chrono::Utc;
 use std::collections::HashMap;
 
 impl Default for DocumentGraph {
@@ -18,6 +19,7 @@ impl DocumentGraph {
             root_id,
             document_metadata: DocumentMetadata::default(),
             bookmark_data: None,
+            parse_provenance: None,
         };
 
         Self {
@@ -36,6 +38,7 @@ impl DocumentGraph {
             root_id: Uuid::new_v4(),
             document_metadata: DocumentMetadata::default(),
             bookmark_data: None,
+            parse_provenance: None,
         };
 
         Self {
@@ -75,6 +78,11 @@ impl DocumentGraph {
 
         SortedDocumentGraph {
             schema_version: SCHEMA_VERSION.to_string(),
+            // Wall-clock time at which this graph was serialized to disk.
+            // Lives on the wrapper so `DocumentGraph` stays time-free —
+            // see canonical-input invariant in
+            // docs/P2/core/architecture/08-bgraph-md-format.md.
+            created_at: Utc::now(),
             nodes: nodes.into_iter().cloned().collect(),
             document_info: self.document_info.clone(),
             structural_profile: self.structural_profile.clone(),

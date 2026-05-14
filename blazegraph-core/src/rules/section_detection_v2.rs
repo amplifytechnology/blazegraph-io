@@ -1266,7 +1266,10 @@ mod tests {
         config.section_detection_v2.min_alpha_ratio = 0.7;
 
         // Sanity: alpha ratio is below the gate (test fixture invariant).
-        let alpha = "10.1. Idle Timeout".chars().filter(|c| c.is_alphabetic()).count();
+        let alpha = "10.1. Idle Timeout"
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .count();
         let total = "10.1. Idle Timeout".chars().count();
         assert!(
             (alpha as f32) / (total as f32) < 0.7,

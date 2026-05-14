@@ -32,8 +32,7 @@ impl JreManager {
     pub fn get_data_dir() -> Result<PathBuf> {
         // Use ~/.local/share/blazegraph consistently on macOS/Linux
         // This is more predictable than platform-specific paths like ~/Library/Application Support
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Could not determine home directory"))?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
 
         #[cfg(windows)]
         {
@@ -104,7 +103,9 @@ impl JreManager {
         let temp_path = data_dir.join("blazing-tika-jni.jar.tmp");
 
         // Reuse the same download logic as JRE
-        let manager = Self { data_dir: data_dir.clone() };
+        let manager = Self {
+            data_dir: data_dir.clone(),
+        };
         manager.download_file(TIKA_JAR_URL, &temp_path)?;
 
         fs::rename(&temp_path, &jar_path)
