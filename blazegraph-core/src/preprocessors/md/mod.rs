@@ -26,6 +26,7 @@
 //! `ParseError::GenericMarkdownNotYetSupported`.
 
 pub mod bgraph_md;
+pub mod frontmatter;
 pub mod strip;
 pub mod types;
 
