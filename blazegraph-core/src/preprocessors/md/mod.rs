@@ -39,16 +39,16 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// Auto-detects the markdown variant:
 /// - bgraph.md (round-trip artifact emitted by the B2 forward emitter)
 ///   → full reconstruction via [`bgraph_md::parse`].
-/// - Generic markdown (no bgraph metadata) → not yet supported;
-///   returns [`ParseError::GenericMarkdownNotYetSupported`].
+/// - Generic markdown (no bgraph fences) → projection via
+///   [`generic_md::parse`]. Schema 0.7.0+ (B6 of MD+DOCX flow).
 ///
-/// Callers who already know the input is bgraph.md can skip detection
-/// by calling [`bgraph_md::parse`] directly.
+/// Callers who already know the input shape can skip detection by
+/// calling [`bgraph_md::parse`] or [`generic_md::parse`] directly.
 pub fn parse_markdown(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError> {
     if is_bgraph_md(input) {
         bgraph_md::parse(input, opts)
     } else {
-        Err(ParseError::GenericMarkdownNotYetSupported)
+        generic_md::parse(input, opts)
     }
 }
 
@@ -220,12 +220,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_markdown_returns_generic_not_yet_supported_for_plain_md() {
+    fn parse_markdown_dispatches_plain_md_to_generic_md_parser() {
+        // B6 (schema 0.7.0): generic markdown now flows through
+        // `generic_md::parse` rather than erroring out. The result
+        // should be a valid graph with the section + paragraph
+        // projected as one Section + one Paragraph.
         let input = "# Title\n\nSome prose.\n";
-        let result = parse_markdown(input, ParseOptions::default());
-        assert!(matches!(
-            result,
-            Err(ParseError::GenericMarkdownNotYetSupported)
-        ));
+        let result = parse_markdown(input, ParseOptions::default())
+            .expect("generic markdown should parse cleanly");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        let body_nodes: Vec<_> = result
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.text_order.is_some())
+            .collect();
+        assert_eq!(body_nodes.len(), 2, "expected one Section + one Paragraph");
     }
 }
