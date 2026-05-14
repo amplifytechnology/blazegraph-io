@@ -229,7 +229,7 @@ fn cli_emit_markdown_output_format_writes_bgraph_md() {
             "-o",
             output_md.to_str().unwrap(),
             "-f",
-            "markdown",
+            "bgraph-md",
         ])
         .output()
         .expect("CLI binary spawns");
@@ -506,20 +506,90 @@ fn cli_strip_to_stdout_when_no_output_path() {
 }
 
 #[test]
-fn cli_unknown_input_format_errors_with_clear_message() {
-    let dir = unique_temp_dir("unknown-format");
+fn cli_generic_markdown_input_is_accepted() {
+    // B6 (schema 0.7.0+): generic markdown is now a first-class
+    // input. The CLI should parse it cleanly and emit graph.json.
+    let dir = unique_temp_dir("generic-md");
     let plain_md = dir.join("plain.md");
     std::fs::write(
         &plain_md,
-        "# Plain heading\n\nGeneric prose, no bgraph fences.\n",
+        "# Plain Heading\n\nGeneric prose with no bgraph fences.\n",
     )
     .expect("write plain md");
 
+    let out_json = dir.join("plain.json");
     let output = Command::new(BIN)
         .args([
             "parse",
             "-i",
             plain_md.to_str().unwrap(),
+            "-o",
+            out_json.to_str().unwrap(),
+            "-f",
+            "graph",
+        ])
+        .output()
+        .expect("CLI binary spawns");
+
+    assert!(
+        output.status.success(),
+        "CLI should accept generic markdown input; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        out_json.exists(),
+        "graph.json output should be written for generic markdown input"
+    );
+}
+
+#[test]
+fn cli_generic_markdown_roundtrip_via_dash_f_markdown() {
+    // `-f markdown` (B6) emits via the generic-markdown emitter.
+    // The lib's parse → emit pair is the round-trip; the CLI
+    // exercises it end-to-end through the binary.
+    let dir = unique_temp_dir("generic-md-roundtrip");
+    let input_md = dir.join("input.md");
+    let output_md = dir.join("output.md");
+    let input = "# Heading\n\nProse text.\n\n- item one\n- item two\n";
+    std::fs::write(&input_md, input).expect("write input md");
+
+    let output = Command::new(BIN)
+        .args([
+            "parse",
+            "-i",
+            input_md.to_str().unwrap(),
+            "-o",
+            output_md.to_str().unwrap(),
+            "-f",
+            "markdown",
+        ])
+        .output()
+        .expect("CLI binary spawns");
+
+    assert!(
+        output.status.success(),
+        "CLI generic-markdown round-trip failed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written = std::fs::read_to_string(&output_md).expect("read output md");
+    assert_eq!(
+        written, input,
+        "byte-identical round-trip drift on generic markdown"
+    );
+}
+
+#[test]
+fn cli_unknown_input_format_errors_with_clear_message() {
+    let dir = unique_temp_dir("unknown-format");
+    let unknown = dir.join("data.xyz");
+    std::fs::write(&unknown, "not a recognized file format\n").expect("write file");
+
+    let output = Command::new(BIN)
+        .args([
+            "parse",
+            "-i",
+            unknown.to_str().unwrap(),
             "-o",
             dir.join("ignored.json").to_str().unwrap(),
         ])
@@ -528,7 +598,7 @@ fn cli_unknown_input_format_errors_with_clear_message() {
 
     assert!(
         !output.status.success(),
-        "CLI must reject plain markdown input until generic-markdown support lands"
+        "CLI must reject unknown file format"
     );
     let combined = format!(
         "{}{}",
@@ -536,7 +606,7 @@ fn cli_unknown_input_format_errors_with_clear_message() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        combined.contains("not recognized") || combined.contains("not yet supported"),
+        combined.contains("not recognized") || combined.contains("Unknown"),
         "expected a clear 'unsupported format' message; got:\n{combined}"
     );
 }

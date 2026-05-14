@@ -39,12 +39,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse a document into a semantic graph (or emit it back to bgraph.md).
+    /// Parse a document into a semantic graph (or emit it back to
+    /// markdown).
     ///
-    /// Input formats: `.pdf` (existing PDF channel) and `.bgraph.md` /
-    /// `.md` (the round-trip artifact from `-f markdown`). The input
-    /// format is auto-detected from extension and content-sniffed for
-    /// unknown extensions.
+    /// Input formats: `.pdf` (PDF channel) and `.bgraph.md` / `.md`
+    /// (markdown channel — bgraph.md round-trip artifact or generic
+    /// markdown, lib auto-detects). Format detection is by extension
+    /// first; content-sniff for unknown extensions.
     Parse(ParseArgs),
 
     /// Strip bgraph fences from a bgraph.md file.
@@ -67,10 +68,14 @@ struct ParseArgs {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Output format: `graph` (default JSON), `sequential`, `flat`, or `markdown`.
+    /// Output format: `graph` (default JSON), `sequential`, `flat`,
+    /// `markdown`, or `bgraph-md`.
     ///
-    /// `markdown` emits the bgraph.md round-trip artifact (B2) and is the
-    /// inverse of bgraph.md input.
+    /// - `markdown` (B6) emits plain markdown via the generic-markdown
+    ///   emitter. Inverse of generic-markdown input.
+    /// - `bgraph-md` (was `markdown` in B5) emits the bgraph.md
+    ///   round-trip artifact with embedded fences. Inverse of
+    ///   bgraph.md input.
     #[arg(short = 'f', long, default_value = "graph")]
     output_format: String,
 
@@ -254,8 +259,12 @@ fn run_parse(args: ParseArgs) -> Result<()> {
     // The markdown channel bypasses the PDF pipeline (no JRE / Tika /
     // rule engine). We detect by extension first, content-sniff
     // fallback for unknown extensions (see `detect_input_format`).
+    //
+    // Schema 0.7.0+ (B6): both bgraph.md and generic markdown flow
+    // through the unified `parse_markdown` dispatcher. Routing is
+    // the lib's job — we just pass the bytes.
     match detect_input_format(Path::new(&args.input))? {
-        InputFormat::BgraphMd { content } => run_parse_markdown(args, content),
+        InputFormat::Markdown { content } => run_parse_markdown(args, content),
         InputFormat::Pdf => run_parse_pdf(args, cache_dir),
         InputFormat::Unknown => Err(anyhow!(
             "❌ Input format not recognized: {}\n\
@@ -263,10 +272,7 @@ fn run_parse(args: ParseArgs) -> Result<()> {
              Supported formats:\n\
              \t.pdf            — PDF documents (full parsing pipeline)\n\
              \t.bgraph.md      — Blazegraph markdown round-trip artifact\n\
-             \t.md, .markdown  — Generic markdown (NOT YET SUPPORTED; tracked in CR)\n\
-             \n\
-             For generic markdown files that aren't a bgraph.md round-trip\n\
-             artifact, see the format expansion roadmap.",
+             \t.md, .markdown  — Generic markdown\n",
             args.input
         )),
     }
@@ -381,10 +387,15 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
 
 fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
     use blazegraph_io_core::preprocessors::md::{
-        parse_markdown, ParseError, ParseIdentity, ParseOptions,
+        is_bgraph_md, parse_markdown, ParseError, ParseIdentity, ParseOptions,
     };
 
-    println!("📄 Parsing bgraph.md: {}", args.input);
+    let is_bgraph = is_bgraph_md(&content);
+    if is_bgraph {
+        println!("📄 Parsing bgraph.md: {}", args.input);
+    } else {
+        println!("📄 Parsing generic markdown: {}", args.input);
+    }
 
     let opts = ParseOptions {
         accept_drift: args.accept_drift,
@@ -406,17 +417,8 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
             );
             std::process::exit(2);
         }
-        Err(ParseError::GenericMarkdownNotYetSupported) => {
-            eprintln!(
-                "\n❌ Input is generic markdown (not a bgraph.md round-trip artifact).\n\
-                 \tGeneric markdown ingestion is not yet supported.\n\
-                 \tSupported input is the bgraph.md format emitted by\n\
-                 \t`blazegraph parse -f markdown`.\n"
-            );
-            std::process::exit(1);
-        }
         Err(e) => {
-            eprintln!("\n❌ bgraph.md parse failed: {e}\n");
+            eprintln!("\n❌ markdown parse failed: {e}\n");
             std::process::exit(1);
         }
     };
@@ -502,16 +504,19 @@ fn run_strip(args: StripArgs) -> Result<()> {
 // Helpers
 // =========================================================================
 
-/// Detected input shape. The `BgraphMd` variant carries the loaded file
-/// contents so the caller doesn't re-read.
+/// Detected input shape. The `Markdown` variant carries the loaded
+/// file contents so the caller doesn't re-read; the lib's
+/// `parse_markdown` dispatcher decides between bgraph.md and generic
+/// markdown internally.
 enum InputFormat {
     /// PDF — dispatch to the existing PDF channel. Bytes are loaded
     /// lazily by the PDF processor itself; we do not pre-read here.
     Pdf,
-    /// bgraph.md round-trip artifact. Contents are loaded eagerly so
-    /// we can content-sniff them; pass through to `parse_markdown`.
-    BgraphMd { content: String },
-    /// Unknown extension and content does not sniff as bgraph.md.
+    /// Markdown input (either bgraph.md round-trip artifact or
+    /// generic markdown). The lib's `parse_markdown` dispatcher
+    /// content-sniffs and routes; the CLI just passes the bytes.
+    Markdown { content: String },
+    /// Unknown extension and content does not look like markdown.
     Unknown,
 }
 
@@ -541,11 +546,10 @@ fn detect_input_format(path: &Path) -> Result<InputFormat> {
         Some("md") | Some("markdown") => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
-            if is_bgraph_md(&content) {
-                Ok(InputFormat::BgraphMd { content })
-            } else {
-                Ok(InputFormat::Unknown)
-            }
+            // Both bgraph.md and generic markdown flow through the
+            // lib's `parse_markdown` dispatcher — no CLI-level
+            // distinction needed.
+            Ok(InputFormat::Markdown { content })
         }
         _ => {
             // Unknown extension — content sniff. If the file isn't valid
@@ -557,7 +561,7 @@ fn detect_input_format(path: &Path) -> Result<InputFormat> {
                 return Ok(InputFormat::Unknown);
             };
             if is_bgraph_md(&content) {
-                Ok(InputFormat::BgraphMd { content })
+                Ok(InputFormat::Markdown { content })
             } else {
                 Ok(InputFormat::Unknown)
             }
@@ -590,8 +594,15 @@ fn resolve_output_path(args: &ParseArgs) -> String {
     // intermediate `.bgraph` carries provenance information for
     // human readers (e.g., `paper.bgraph.json` is clearly derived
     // from `paper.bgraph.md`).
-    if args.output_format == "markdown" {
-        return format!("{input_name}.bgraph.md");
+    //
+    // Output-suffix table (B6):
+    // - `-f markdown` (generic) → `.md`
+    // - `-f bgraph-md` → `.bgraph.md`
+    // - everything else (graph/sequential/flat) → `_blazegraph.json`
+    match args.output_format.as_str() {
+        "markdown" => return format!("{input_name}.md"),
+        "bgraph-md" => return format!("{input_name}.bgraph.md"),
+        _ => {}
     }
     let config_suffix = args
         .config
@@ -694,12 +705,13 @@ fn show_help() {
     println!("  graph       - Full graph structure with nodes and relationships (default)");
     println!("  sequential  - Ordered segments with level info (good for RAG + hierarchy)");
     println!("  flat        - Simple array of text chunks (minimal format)");
-    println!("  markdown    - bgraph.md round-trip artifact (B2)");
+    println!("  markdown    - Plain markdown (generic) — B6, schema 0.7.0+");
+    println!("  bgraph-md   - bgraph.md round-trip artifact (B2; was -f markdown in B5)");
 
     println!("\n📥 Input Formats (parse, auto-detected):");
     println!("  .pdf                    PDF channel (full pipeline)");
     println!("  .bgraph.md              bgraph.md round-trip artifact");
-    println!("  .md / .markdown         Generic markdown — only bgraph.md content accepted");
+    println!("  .md / .markdown         Generic markdown (B6)");
 
     println!("\n🪓 `strip` modes:");
     println!(
@@ -710,7 +722,9 @@ fn show_help() {
 
     println!("\n📝 Usage Examples:");
     println!("  blazegraph parse -i document.pdf");
-    println!("  blazegraph parse -i document.pdf -f markdown -o document.bgraph.md");
+    println!("  blazegraph parse -i document.pdf -f bgraph-md -o document.bgraph.md");
+    println!("  blazegraph parse -i document.md -f markdown -o roundtrip.md");
+    println!("  blazegraph parse -i document.md -f graph -o document.json");
     println!("  blazegraph parse -i document.bgraph.md -o document.json");
     println!("  blazegraph parse -i document.bgraph.md --accept-drift -o derived.json");
     println!("  blazegraph strip -i document.bgraph.md -o document_body.md");
@@ -775,10 +789,38 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
 
 fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<()> {
     match format {
+        // B6: `-f markdown` is the generic-markdown emitter.
+        // `-f bgraph-md` (new) is the bgraph.md round-trip artifact
+        // emitter (which was `-f markdown` in B5).
+        //
+        // Routing is by `-f` alone — never by the input source. A
+        // PDF parsed through the full pipeline can emit to either
+        // markdown variant; a bgraph.md input parsed back can emit
+        // to either; etc.
         "markdown" => {
-            let md = blazegraph_io_core::graphs::serialization::markdown::emit_markdown(graph);
+            // Pre-emit validation: the generic emitter panics on
+            // Header/Footer/Margin (PDF-only variants that don't
+            // exist in generic markdown source). Catch them here
+            // with a clean error.
+            if let Err(msg) = check_generic_md_compatible(graph) {
+                eprintln!(
+                    "\n❌ Cannot emit generic markdown: {msg}\n\
+                     \n\
+                     Tip: use `-f bgraph-md` instead to produce the bgraph.md\n\
+                     round-trip artifact, which carries Header/Footer/Margin\n\
+                     fences.\n"
+                );
+                std::process::exit(2);
+            }
+            let md =
+                blazegraph_io_core::graphs::serialization::markdown_generic::emit_markdown(graph);
             std::fs::write(output_path, md)?;
             println!("💾 Markdown saved to: {}", output_path);
+        }
+        "bgraph-md" => {
+            let md = blazegraph_io_core::graphs::serialization::markdown::emit_markdown(graph);
+            std::fs::write(output_path, md)?;
+            println!("💾 bgraph.md saved to: {}", output_path);
         }
         "sequential" => {
             graph.save_with_format(output_path, "sequential")?;
@@ -799,4 +841,150 @@ fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<
         }
     }
     Ok(())
+}
+
+/// Pre-emit validation for the generic-markdown emitter.
+///
+/// Returns `Err` if the graph contains any PDF-only variants
+/// (`Header`, `Footer`, `Margin`) that have no representation in
+/// plain markdown source. The lib's `markdown_generic::emit_markdown`
+/// panics on these variants as a defense-in-depth safety net; this
+/// CLI-layer check catches them earlier with a clean message.
+///
+/// Visible at module scope so tests can exercise it directly.
+fn check_generic_md_compatible(graph: &DocumentGraph) -> std::result::Result<(), String> {
+    let mut incompatible: Vec<&str> = graph
+        .nodes
+        .values()
+        .filter(|n| matches!(n.node_type.as_str(), "Header" | "Footer" | "Margin"))
+        .map(|n| n.node_type.as_str())
+        .collect();
+    if incompatible.is_empty() {
+        return Ok(());
+    }
+    incompatible.sort();
+    incompatible.dedup();
+    Err(format!(
+        "graph contains PDF-only variant(s) [{}] that have no representation \
+         in generic markdown source",
+        incompatible.join(", ")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blazegraph_io_core::types::*;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    /// Build a tiny graph with a Document root + supplied body nodes.
+    /// `nodes_in` is `(node_type, text_order)`.
+    fn graph_with_types(node_types: &[&str]) -> DocumentGraph {
+        let root_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"cli-test-root");
+        let mut nodes = HashMap::new();
+        let mut child_ids = Vec::new();
+        for (i, nt) in node_types.iter().enumerate() {
+            let id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, format!("cli:{i}").as_bytes());
+            child_ids.push(id);
+            nodes.insert(
+                id,
+                DocumentNode {
+                    id,
+                    node_type: nt.to_string(),
+                    location: NodeLocation {
+                        semantic: SemanticLocation {
+                            path: format!("{}", i + 1),
+                            depth: 1,
+                            breadcrumbs: Vec::new(),
+                        },
+                        physical: None,
+                    },
+                    text_order: Some(i as u32),
+                    content: NodeContent {
+                        text: nt.to_string(),
+                    },
+                    style_info: None,
+                    token_count: 1,
+                    parent: Some(root_id),
+                    children: Vec::new(),
+                },
+            );
+        }
+        nodes.insert(
+            root_id,
+            DocumentNode {
+                id: root_id,
+                node_type: "Document".to_string(),
+                location: NodeLocation {
+                    semantic: SemanticLocation {
+                        path: String::new(),
+                        depth: 0,
+                        breadcrumbs: Vec::new(),
+                    },
+                    physical: None,
+                },
+                text_order: None,
+                content: NodeContent {
+                    text: "Document".to_string(),
+                },
+                style_info: None,
+                token_count: 0,
+                parent: None,
+                children: child_ids,
+            },
+        );
+        DocumentGraph {
+            nodes,
+            document_info: DocumentInfo {
+                root_id,
+                document_metadata: DocumentMetadata::default(),
+                bookmark_data: None,
+                parse_provenance: None,
+            },
+            structural_profile: StructuralProfile::default(),
+        }
+    }
+
+    #[test]
+    fn check_generic_md_compatible_accepts_markdown_variants() {
+        // Every variant that has a plain-markdown source-form (which
+        // covers Document/Section/Paragraph plus the four B6
+        // additions) passes the check.
+        let graph = graph_with_types(&[
+            "Section",
+            "Paragraph",
+            "CodeBlock",
+            "List",
+            "Blockquote",
+            "Table",
+        ]);
+        assert!(check_generic_md_compatible(&graph).is_ok());
+    }
+
+    #[test]
+    fn check_generic_md_compatible_rejects_header_footer_margin() {
+        for variant in ["Header", "Footer", "Margin"] {
+            let graph = graph_with_types(&[variant, "Paragraph"]);
+            let err = check_generic_md_compatible(&graph)
+                .expect_err(&format!("variant {variant} should reject"));
+            assert!(
+                err.contains(variant),
+                "error message should name the variant `{variant}`; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_generic_md_compatible_rejects_multiple_pdf_only_variants() {
+        let graph = graph_with_types(&["Header", "Footer", "Margin", "Paragraph"]);
+        let err = check_generic_md_compatible(&graph)
+            .expect_err("multi-variant PDF-only graph should reject");
+        for variant in ["Header", "Footer", "Margin"] {
+            assert!(
+                err.contains(variant),
+                "error should list all incompatible variants; missing `{variant}` in: {err}"
+            );
+        }
+    }
 }
