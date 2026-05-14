@@ -17,9 +17,11 @@ impl GraphBuilder {
 
     /// Build a document graph with deterministic node IDs.
     ///
-    /// The `NodeIdGenerator` produces UUIDv5 IDs scoped to a specific
-    /// `(version, source_hash, config_hash)` triple, ensuring identical
-    /// inputs always produce identical graphs.
+    /// The `NodeIdGenerator` produces UUIDv5 IDs scoped to a
+    /// `(source_hash, config_hash)` pair, ensuring identical inputs
+    /// always produce identical graphs — and (CR-47) that IDs are
+    /// invariant across blazegraph version bumps for the same source
+    /// and config.
     ///
     /// Channel contract: `elements` arrives at this boundary fully
     /// transformed — no merge/reorder/post-process happens here. We
@@ -31,9 +33,9 @@ impl GraphBuilder {
     /// `graph.document_info.parse_provenance` so downstream consumers
     /// (notably the bgraph.md emitter) can reproduce the graph and
     /// emit round-trippable identity fields without re-deriving them.
-    /// The same `(blazegraph_version, source_sha256, config_hash)`
-    /// triple feeds `id_gen`; callers should construct
-    /// `ParseProvenance` from the same data.
+    /// Callers should construct `ParseProvenance` from the same
+    /// `(source_sha256, config_hash)` they passed to `id_gen`, and
+    /// fill in `blazegraph_version` for provenance documentation only.
     pub fn build_graph_deterministic(
         &self,
         elements: Vec<SemanticTreeElement>,

@@ -34,6 +34,29 @@ pub mod types;
 pub use strip::strip;
 pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode};
 
+/// Current bgraph.md wire-format version. Bumps when the format spec
+/// at `docs/P2/core/architecture/08-bgraph-md-format.md` gains an
+/// Amendment that changes the on-disk shape or semantics.
+///
+/// Distinct from [`crate::types::SCHEMA_VERSION`], which versions the
+/// in-memory `DocumentGraph` schema and moves more often. The two
+/// axes are decoupled by design: the wire format can be stable while
+/// the in-memory schema iterates (adding optional fields, refining
+/// analytics shapes, etc.), and vice versa.
+///
+/// Downstream consumers that need to pin to the wire format axis —
+/// URD's compile-time bgraph-adapter assertion, future tooling that
+/// emits or parses bgraph.md — should target this constant rather
+/// than `SCHEMA_VERSION`.
+///
+/// Value follows semver. Currently v1.1.0 (post-Amendment F, B6).
+/// CR-47 (Amendment G) changed the *derivation* of `source.sha256`
+/// and node IDs but **did not** bump the major — there are no
+/// production consumers to signal a break to (no-fictional-users
+/// principle). When real consumers appear, this version policy will
+/// tighten.
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "1.1.0";
+
 /// Parse a markdown string into a `DocumentGraph`.
 ///
 /// Auto-detects the markdown variant:
@@ -89,7 +112,7 @@ mod tests {
     /// detection test, not a reconstruction test).
     fn sample_bgraph_md_header() -> &'static str {
         "```bgraph\n\
-         {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"title\":null,\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
+         {\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"title\":null,\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
          ```\n"
     }
 
@@ -217,6 +240,28 @@ mod tests {
             !matches!(result, Err(ParseError::GenericMarkdownNotYetSupported)),
             "bgraph.md input should not return GenericMarkdownNotYetSupported",
         );
+    }
+
+    /// CR-47: the constant exists so downstream consumers (URD's
+    /// compile-time pin, future tooling) can target the wire-format
+    /// version. This sanity-checks the shape — three dot-separated
+    /// non-empty numeric segments — without locking in the exact
+    /// value, which moves with each Amendment.
+    #[test]
+    fn bgraph_md_format_version_is_valid_semver() {
+        let v = BGRAPH_MD_FORMAT_VERSION;
+        let parts: Vec<&str> = v.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "BGRAPH_MD_FORMAT_VERSION must be `major.minor.patch`; got {v:?}",
+        );
+        for (i, part) in parts.iter().enumerate() {
+            assert!(
+                !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()),
+                "segment {i} of {v:?} must be a non-empty numeric run"
+            );
+        }
     }
 
     #[test]

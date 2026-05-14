@@ -405,24 +405,17 @@ impl DocumentStorage for FileStorage {
 // Hash Functions
 // =============================================================================
 
-/// Calculate a fast hash for PDF content using start + end chunks
-pub fn calculate_pdf_hash(pdf_bytes: &[u8]) -> String {
-    let chunk_size = 1024; // 1KB from start and end
+/// SHA-256 of the source file bytes. Stable per-file across parser
+/// versions; the obvious content-identity choice.
+///
+/// Renamed from `calculate_pdf_hash` (CR-47): the hash is used for
+/// non-PDF sources too (markdown, future DOCX), and the previous
+/// partial-coverage implementation (file size + first 1KB + last 1KB)
+/// had a small but real collision risk that gained us nothing —
+/// full SHA-256 on a typical document is microseconds.
+pub fn calculate_source_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-
-    // Hash file size first (for quick differentiation)
-    hasher.update(pdf_bytes.len().to_le_bytes());
-
-    // Hash first chunk
-    let start_end = std::cmp::min(chunk_size, pdf_bytes.len());
-    hasher.update(&pdf_bytes[0..start_end]);
-
-    // Hash last chunk (if file is large enough)
-    if pdf_bytes.len() > chunk_size {
-        let end_start = pdf_bytes.len() - chunk_size;
-        hasher.update(&pdf_bytes[end_start..]);
-    }
-
+    hasher.update(bytes);
     format!("{:x}", hasher.finalize())
 }
 
@@ -514,20 +507,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pdf_hash_consistency() {
-        let pdf_data = b"test pdf content with some data";
-        let hash1 = calculate_pdf_hash(pdf_data);
-        let hash2 = calculate_pdf_hash(pdf_data);
+    fn test_source_hash_consistency() {
+        let data = b"test source content with some data";
+        let hash1 = calculate_source_hash(data);
+        let hash2 = calculate_source_hash(data);
         assert_eq!(hash1, hash2);
     }
 
     #[test]
-    fn test_pdf_hash_uniqueness() {
-        let pdf1 = b"test pdf content 1";
-        let pdf2 = b"test pdf content 2";
-        let hash1 = calculate_pdf_hash(pdf1);
-        let hash2 = calculate_pdf_hash(pdf2);
+    fn test_source_hash_uniqueness() {
+        let a = b"test source content 1";
+        let b = b"test source content 2";
+        let hash1 = calculate_source_hash(a);
+        let hash2 = calculate_source_hash(b);
         assert_ne!(hash1, hash2);
+    }
+
+    /// CR-47: the previous partial-hash implementation hashed only the
+    /// first 1KB and last 1KB. Two files differing only in their middle
+    /// bytes collided. The new full SHA-256 distinguishes them.
+    #[test]
+    fn test_source_hash_distinguishes_middles() {
+        // 4 KB total: 1 KB head, 2 KB middle, 1 KB tail. Vary the
+        // middle only; head and tail are byte-identical.
+        let head = vec![0x42u8; 1024];
+        let tail = vec![0x99u8; 1024];
+        let middle_a = vec![0x01u8; 2048];
+        let middle_b = vec![0x02u8; 2048];
+
+        let mut a = Vec::with_capacity(4096);
+        a.extend_from_slice(&head);
+        a.extend_from_slice(&middle_a);
+        a.extend_from_slice(&tail);
+
+        let mut b = Vec::with_capacity(4096);
+        b.extend_from_slice(&head);
+        b.extend_from_slice(&middle_b);
+        b.extend_from_slice(&tail);
+
+        assert_eq!(a.len(), b.len(), "same length");
+        assert_eq!(a[..1024], b[..1024], "same first 1 KB");
+        assert_eq!(a[a.len() - 1024..], b[b.len() - 1024..], "same last 1 KB");
+        assert_ne!(
+            calculate_source_hash(&a),
+            calculate_source_hash(&b),
+            "different middles must produce different hashes"
+        );
+    }
+
+    /// Cross-check: the new function is exactly SHA-256 of the input.
+    #[test]
+    fn test_source_hash_matches_plain_sha256() {
+        let data = b"hello";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let expected = format!("{:x}", hasher.finalize());
+        assert_eq!(calculate_source_hash(data), expected);
     }
 
     #[test]

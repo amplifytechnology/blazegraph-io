@@ -75,14 +75,16 @@ pub struct DocumentInfo {
     pub parse_provenance: Option<ParseProvenance>,
 }
 
-/// The (version, source, config) triple that identifies a specific parse
-/// run. Persisted on `DocumentInfo` so consumers can reproduce the graph
-/// deterministically and emit round-trippable bgraph.md.
+/// Provenance record for a specific parse run. Persisted on
+/// `DocumentInfo` so consumers can reproduce the graph deterministically
+/// and emit round-trippable bgraph.md.
 ///
-/// Mirrors the inputs to `NodeIdGenerator::new`, plus the source
-/// filename and source-format identifier needed for the bgraph.md
-/// document-level block. See
-/// `docs/P2/core/architecture/08-bgraph-md-format.md` (the v1.0.0 wire
+/// `(source_sha256, config_hash)` is the identity pair that feeds
+/// `NodeIdGenerator::new`. Per CR-47, `blazegraph_version` rides
+/// along as provenance documentation only — it no longer enters the
+/// node-ID namespace, so node IDs survive parser version bumps for
+/// the same `(source, config)`. See
+/// `docs/P2/core/architecture/08-bgraph-md-format.md` (v2.0.0 wire
 /// format) for the consumer contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseProvenance {

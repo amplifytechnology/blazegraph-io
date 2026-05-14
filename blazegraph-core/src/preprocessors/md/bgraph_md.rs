@@ -284,14 +284,14 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
         });
     }
 
-    // NodeIdGenerator from doc-level provenance (NOT env! — see
-    // handoff convergent decision #7: an older bgraph.md emitted by
-    // version X must round-trip cleanly when parsed by version Y).
-    let id_gen = NodeIdGenerator::new(
-        &doc_level.blazegraph_version,
-        &doc_level.source.sha256,
-        &doc_level.config_hash,
-    );
+    // NodeIdGenerator from doc-level provenance. CR-47 dropped
+    // `blazegraph_version` from the namespace, so node IDs are
+    // already version-invariant — the parser side and the emitter
+    // side derive identical IDs from `(source_sha256, config_hash)`
+    // regardless of which blazegraph version ran which step. The
+    // `blazegraph_version` field in `doc_level` stays as provenance
+    // documentation only (see CR-47 Amendment G).
+    let id_gen = NodeIdGenerator::new(&doc_level.source.sha256, &doc_level.config_hash);
 
     let provenance = ParseProvenance {
         blazegraph_version: doc_level.blazegraph_version.clone(),
@@ -608,13 +608,22 @@ fn split_last_line(body: &str) -> Result<(String, String), ParseError> {
     Ok((body_text, json_line))
 }
 
-/// Validate that the doc-level `schema` field is v1.0.x. We accept
-/// any patch revision under 1.0 (and 1.x.y minor revisions — the spec
-/// promises forward compatibility), but reject 0.x and 2.x.
+/// Validate that the doc-level `schema` field is v1.x — the current
+/// bgraph.md wire-format major. We accept any 1.x.y revision (minor
+/// versions are additive; the spec's versioning policy promises
+/// forward compatibility within a major), and reject every other
+/// major.
+///
+/// CR-47 (Amendment G) changed the *derivation* of `source.sha256`
+/// (now full SHA-256) and node IDs (no longer include
+/// `blazegraph_version` in their namespace) without bumping the
+/// major version — there are no production consumers to signal a
+/// break to, per the project's no-fictional-users principle. Older
+/// v1.x artifacts parse but will produce drift signals when
+/// recompared against re-derived identities; that is the correct
+/// signal.
 fn validate_schema(schema: &str) -> Result<(), ParseError> {
     if let Some(rest) = schema.strip_prefix("1.") {
-        // Anything in the 1.x range is fine — minor versions are
-        // additive (spec section "Versioning policy").
         let _ = rest;
         Ok(())
     } else {
@@ -666,11 +675,7 @@ mod tests {
             source_sha256: "synthetic-source-sha".to_string(),
             config_hash: "synthetic-config-hash".to_string(),
         };
-        let id_gen = NodeIdGenerator::new(
-            &provenance.blazegraph_version,
-            &provenance.source_sha256,
-            &provenance.config_hash,
-        );
+        let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
 
         let elements: Vec<SemanticTreeElement> = nodes_in
             .iter()
@@ -918,7 +923,7 @@ mod tests {
         // new bgraph fence inside an active fence. (The scanner sees
         // this as a reserved-prefix violation.)
         let bogus = "```bgraph\n\
-                     {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"title\":null,\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
+                     {\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"title\":null,\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
                      ```bgraph-section\n\
                      ```\n";
         // The inner `bgraph-section` open without a preceding ``` close is
@@ -998,6 +1003,7 @@ mod tests {
     fn validate_schema_accepts_one_dot_x() {
         assert!(validate_schema("1.0.0").is_ok());
         assert!(validate_schema("1.0.1").is_ok());
+        assert!(validate_schema("1.1.0").is_ok());
         assert!(validate_schema("1.42.0").is_ok());
     }
 
@@ -1009,6 +1015,10 @@ mod tests {
         ));
         assert!(matches!(
             validate_schema("2.0.0"),
+            Err(ParseError::UnsupportedSchema(_))
+        ));
+        assert!(matches!(
+            validate_schema("3.0.0"),
             Err(ParseError::UnsupportedSchema(_))
         ));
     }

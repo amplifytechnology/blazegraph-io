@@ -1,8 +1,12 @@
 //! bgraph.md forward emitter — `DocumentGraph` → markdown string.
 //!
-//! Conforms to v1.0.0 of the bgraph.md format spec
-//! (`docs/P2/core/architecture/08-bgraph-md-format.md`). Reference
-//! implementation in `scripts/bgraph_md_prototype.py`.
+//! Conforms to v1.1.0 of the bgraph.md format spec
+//! (`docs/P2/core/architecture/08-bgraph-md-format.md`; post-Amendment-F,
+//! amended in place by CR-47 / Amendment G without a major bump
+//! per the no-fictional-users policy). The emitted `schema` field is
+//! sourced from
+//! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`] so a future
+//! Amendment bumping the format version only needs to touch the const.
 //!
 //! Output shape:
 //!
@@ -22,6 +26,7 @@
 //! [`emit_markdown`]; everything else is private.
 
 use super::canonical;
+use crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION;
 use crate::types::*;
 use serde::Serialize;
 
@@ -116,7 +121,7 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
     }
 
     let block = DocLevelBlock {
-        schema: "1.0.0",
+        schema: BGRAPH_MD_FORMAT_VERSION,
         blazegraph_version: &provenance.blazegraph_version,
         source: DocLevelSource {
             format: &provenance.source_format,

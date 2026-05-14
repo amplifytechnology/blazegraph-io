@@ -54,11 +54,7 @@ fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph
         source_sha256: "amendment-f-source-sha".to_string(),
         config_hash: "amendment-f-config-hash".to_string(),
     };
-    let id_gen = NodeIdGenerator::new(
-        &provenance.blazegraph_version,
-        &provenance.source_sha256,
-        &provenance.config_hash,
-    );
+    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
     let elements: Vec<SemanticTreeElement> = nodes_in
         .iter()
         .map(|(node_type, text, depth, text_order)| {

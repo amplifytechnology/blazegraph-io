@@ -2,12 +2,13 @@
 //!
 //! Removes bgraph fence regions from a bgraph.md string per a
 //! [`StripMode`]. The three modes mirror the three sed patterns called
-//! out in the v1.0.0 wire format spec's "Strip ergonomics" table; the
+//! out in the wire format spec's "Strip ergonomics" table; the
 //! dash discriminator (`bgraph-[a-z-]*` vs. `bgraph[a-z-]*`) is
 //! load-bearing.
 //!
 //! Wire-format definition:
-//! `docs/P2/core/architecture/08-bgraph-md-format.md` (v1.0.0).
+//! `docs/P2/core/architecture/08-bgraph-md-format.md` (v2.0.0; CR-47
+//! Amendment G bumped from v1.x).
 //!
 //! ## Why a line scanner (not regex, not pulldown-cmark)
 //!
@@ -19,7 +20,7 @@
 //!   unmodified. A naive regex on multi-line content would risk
 //!   gobbling these.
 //! - The reserved-prefix invariant (any line starting with
-//!   `` ```bgraph `` is reserved by v1.0.0) means we can recognize
+//!   `` ```bgraph `` is reserved by the spec) means we can recognize
 //!   fence boundaries by line-prefix alone — no CommonMark parsing
 //!   needed.
 //!
@@ -189,7 +190,7 @@ mod tests {
     fn sample_bgraph_md() -> String {
         [
             "```bgraph",
-            "{\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"src-sha\"},\"flow_type\":\"Fixed\",\"title\":\"Sample\",\"config_hash\":\"cfg-sha\",\"graph_sha256\":\"deadbeef\"}",
+            "{\"schema\":\"2.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"src-sha\"},\"flow_type\":\"Fixed\",\"title\":\"Sample\",\"config_hash\":\"cfg-sha\",\"graph_sha256\":\"deadbeef\"}",
             "```",
             "",
             "```bgraph-bookmarks",
@@ -319,7 +320,7 @@ mod tests {
         // at line-start as a fence.
         let md = "\
 ```bgraph
-{\"schema\":\"1.0.0\",\"graph_sha256\":\"x\"}
+{\"schema\":\"2.0.0\",\"graph_sha256\":\"x\"}
 ```
 
 Body text with a code sample:
@@ -348,7 +349,7 @@ End of body.
 
     #[test]
     fn unterminated_fence_errors() {
-        let md = "```bgraph\n{\"schema\":\"1.0.0\"}\n";
+        let md = "```bgraph\n{\"schema\":\"2.0.0\"}\n";
         // No closing ```; should be MalformedFence.
         match strip(md, StripMode::BodyOnly) {
             Err(ParseError::MalformedFence(_)) => {}
@@ -377,7 +378,7 @@ End of body.
         // leaves them.
         let md = "\
 ```bgraph
-{\"schema\":\"1.0.0\",\"graph_sha256\":\"x\"}
+{\"schema\":\"2.0.0\",\"graph_sha256\":\"x\"}
 ```
 
 - bullet one
