@@ -1,47 +1,28 @@
 //! bgraph.md forward emitter — `DocumentGraph` → markdown string.
 //!
-//! Conforms to v1.1.0 of the bgraph.md format spec
-//! (`docs/P2/core/architecture/08-bgraph-md-format.md`; post-Amendment-F,
-//! amended in place by CR-47 / Amendment G without a major bump
-//! per the no-fictional-users policy). The emitted `schema` field is
-//! sourced from
-//! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`] so a future
-//! Amendment bumping the format version only needs to touch the const.
+//! Wire-format spec is the source of truth:
+//! `docs/P2/core/architecture/08-bgraph-md-format.md`. The emitted
+//! `schema` field is sourced from
+//! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`].
 //!
-//! Output shape:
-//!
-//! - Top of file: a single `bgraph` fence with the document-level
-//!   metadata block (flat JSON, all 7 spec fields populated from
-//!   `graph.document_info.parse_provenance` + `graph_sha256` derived
-//!   from [`super::canonical::graph_sha256`]).
-//! - Body: per-element fences (`bgraph-section`, `bgraph-paragraph`,
-//!   `bgraph-header`, `bgraph-footer`, `bgraph-margin`) emitted in
-//!   `text_order` ascending order. Section/Paragraph bodies live
-//!   *outside* the fence; Header/Footer/Margin bodies live *inside*
-//!   the fence above the JSON metadata line. The synthetic Document
-//!   root node (`text_order = None`) is skipped.
-//! - Elements separated by a single blank line.
-//!
-//! This module exposes a single public function
-//! [`emit_markdown`]; everything else is private.
+//! Public surface: [`emit_markdown`]. Everything else is private.
 
 use super::canonical;
 use crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION;
 use crate::types::*;
 use serde::Serialize;
 
-/// Emit a `DocumentGraph` to bgraph.md format (v1.0.0).
+/// Emit a `DocumentGraph` to bgraph.md format. Targets the current
+/// [`BGRAPH_MD_FORMAT_VERSION`].
 ///
 /// # Panics
 ///
-/// Panics if `graph.document_info.parse_provenance` is `None`. The
-/// emitter requires the (version, source, config) triple to populate
-/// the document-level block; the legacy `GraphBuilder::build_graph`
-/// path (random UUIDv4 IDs, no provenance) is incompatible with
-/// round-trip identity by design and should never reach this emitter.
-/// Build the graph via
+/// Panics if `graph.document_info.parse_provenance` is `None`. Build
+/// the graph via
 /// `GraphBuilder::build_graph_deterministic(elements, &id_gen, provenance)`
-/// instead.
+/// — the legacy `build_graph` path (random UUIDv4 IDs, no provenance)
+/// is incompatible with round-trip identity and must not reach this
+/// emitter.
 pub fn emit_markdown(graph: &DocumentGraph) -> String {
     let provenance = graph.document_info.parse_provenance.as_ref().expect(
         "emit_markdown requires graph.document_info.parse_provenance; \
@@ -141,57 +122,31 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 
 /// Emit one node. Returns `None` for nodes we skip (Document root).
 ///
-/// - `Section`: heading prefix + body on the line *preceding* the
-///   `bgraph-section` fence; metadata-only inside fence.
-/// - `Paragraph`: body on the line *preceding* the `bgraph-paragraph`
-///   fence; metadata-only inside fence.
-/// - `CodeBlock` / `List` / `Blockquote` / `Table` (Amendment F):
-///   body on the line(s) *preceding* the `bgraph-{tag}` fence;
-///   metadata-only inside fence. Body markdown is preserved verbatim
-///   so a plain markdown renderer shows the rendered form.
-/// - `Header` / `Footer` / `Margin`: body *inside* the fence followed
-///   by the JSON metadata line. (See "Strip ergonomics" in the spec —
-///   the body-inside-fence shape lets the second `sed` variant strip
-///   noise + metadata in a single pass.)
+/// Body placement follows spec convention C-3: content fences carry
+/// body on the line(s) preceding the fence; metadata fences (doc-level,
+/// bookmarks) have no body outside. Section gains an `#`-prefix heading
+/// line; all other content variants emit body verbatim.
 fn emit_node(node: &DocumentNode) -> Option<String> {
     let meta = node_metadata_json(node);
+    let text = &node.content.text;
     match node.node_type.as_str() {
         "Document" => None, // synthetic root; not a content node
         "Section" => {
-            let depth = node.location.semantic.depth as usize;
-            let prefix = heading_prefix(depth);
-            Some(format!(
-                "{prefix} {text}\n```bgraph-section\n{meta}\n```",
-                text = node.content.text,
-            ))
+            let prefix = heading_prefix(node.location.semantic.depth as usize);
+            Some(format!("{prefix} {text}\n```bgraph-section\n{meta}\n```"))
         }
-        "Paragraph" => Some(format!(
-            "{text}\n```bgraph-paragraph\n{meta}\n```",
-            text = node.content.text,
-        )),
-        // Amendment F (B6, schema 0.7.0+): markdown-channel variants.
-        // Body-outside pattern, same shape as Paragraph. The body
-        // markdown is the verbatim source (fences, bullets, pipes,
-        // `>` markers, all preserved).
-        "CodeBlock" | "List" | "Blockquote" | "Table" => {
+        // All content variants share the body-outside shape under v2.0.0
+        // (spec convention C-3). Tag derives from node_type lowercased
+        // per C-2.
+        "Paragraph" | "Header" | "Footer" | "Margin" | "CodeBlock" | "List" | "Blockquote"
+        | "Table" => {
             let tag = node.node_type.to_ascii_lowercase();
-            Some(format!(
-                "{text}\n```bgraph-{tag}\n{meta}\n```",
-                text = node.content.text,
-            ))
-        }
-        "Header" | "Footer" | "Margin" => {
-            let tag = node.node_type.to_ascii_lowercase();
-            Some(format!(
-                "```bgraph-{tag}\n{text}\n{meta}\n```",
-                text = node.content.text,
-            ))
+            Some(format!("{text}\n```bgraph-{tag}\n{meta}\n```"))
         }
         // Defense-in-depth: every variant in `SemanticElementType`
         // should have an explicit arm above. Reaching here means a
         // schema addition snuck through without a corresponding spec
-        // amendment and emitter update. Panic loudly so the next CI
-        // run catches it.
+        // amendment and emitter update.
         other => panic!(
             "emit_markdown (bgraph.md): variant '{other}' has no fence-tag mapping; \
              schema added a variant without a corresponding spec amendment + emitter \
@@ -368,9 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn header_footer_margin_body_is_inside_fence() {
-        // For Header/Footer/Margin: opening fence, then body line, then
-        // metadata line, then closing fence.
+    fn header_footer_margin_body_is_outside_fence() {
+        // v2.0.0 (CR-48): H/F/M unified with Section/Paragraph —
+        // body precedes the fence on the immediately adjacent line.
         let graph = build_graph(vec![
             ("Header", "Running header text", 1, 0),
             ("Footer", "Running footer text", 1, 1),
@@ -378,16 +333,16 @@ mod tests {
         ]);
         let md = emit_markdown(&graph);
         assert!(
-            md.contains("```bgraph-header\nRunning header text\n"),
-            "header body should be inside fence (immediately after fence open); got:\n{md}",
+            md.contains("Running header text\n```bgraph-header\n"),
+            "header body should precede the fence; got:\n{md}",
         );
         assert!(
-            md.contains("```bgraph-footer\nRunning footer text\n"),
-            "footer body should be inside fence; got:\n{md}",
+            md.contains("Running footer text\n```bgraph-footer\n"),
+            "footer body should precede the fence; got:\n{md}",
         );
         assert!(
-            md.contains("```bgraph-margin\nMargin note text\n"),
-            "margin body should be inside fence; got:\n{md}",
+            md.contains("Margin note text\n```bgraph-margin\n"),
+            "margin body should precede the fence; got:\n{md}",
         );
     }
 
@@ -732,11 +687,22 @@ mod tests {
     }
 
     #[test]
-    fn convention_c3_body_outside_for_section_and_paragraph() {
-        // C-3 (partial — non-H/F/M variants): content fences have body
-        // text on the line(s) immediately preceding the fence open.
-        // H/F/M coverage lands with CR-48 (v2.0.0 unification).
-        for (variant, text_marker) in &[("Section", "Intro"), ("Paragraph", "body text")] {
+    fn convention_c3_body_outside_for_all_content_variants() {
+        // C-3 (v2.0.0): every content fence has body text on the
+        // line(s) immediately preceding the fence open. Covers all 9
+        // content variants (CR-48 unified H/F/M with the rest).
+        let cases = [
+            ("Section", "intro-marker"),
+            ("Paragraph", "para-marker"),
+            ("Header", "header-marker"),
+            ("Footer", "footer-marker"),
+            ("Margin", "margin-marker"),
+            ("CodeBlock", "code-marker"),
+            ("List", "list-marker"),
+            ("Blockquote", "quote-marker"),
+            ("Table", "table-marker"),
+        ];
+        for (variant, text_marker) in &cases {
             let graph = build_graph(vec![(variant, text_marker, 1, 0)]);
             let md = emit_markdown(&graph);
             let tag_line = format!("```bgraph-{}", variant.to_ascii_lowercase());

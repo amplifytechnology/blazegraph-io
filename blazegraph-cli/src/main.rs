@@ -50,11 +50,11 @@ enum Command {
 
     /// Strip bgraph fences from a bgraph.md file.
     ///
-    /// Three modes: `body-only` (default) removes every bgraph fence
+    /// Two modes: `body-only` (default) removes every bgraph fence
     /// for Unstructured-equivalent body-only output; `keep-metadata`
     /// preserves the doc-level identity block while stripping
-    /// per-element fences; `noise-only` removes only Header/Footer/
-    /// Margin fences (and their inside-fence bodies).
+    /// per-element fences. All body content is preserved in both modes
+    /// (v2.0.0 body-outside convention).
     Strip(StripArgs),
 }
 
@@ -181,10 +181,8 @@ struct StripArgs {
 enum CliStripMode {
     /// Remove all bgraph fences (Unstructured-equivalent body output).
     BodyOnly,
-    /// Keep doc-level + Section/Paragraph bodies; strip per-element fences.
+    /// Keep doc-level fence; strip every dashed fence. All body content survives.
     KeepMetadata,
-    /// Strip only Header/Footer/Margin (noise) fences and their bodies.
-    NoiseOnly,
 }
 
 impl From<CliStripMode> for blazegraph_io_core::preprocessors::md::StripMode {
@@ -193,7 +191,6 @@ impl From<CliStripMode> for blazegraph_io_core::preprocessors::md::StripMode {
         match m {
             CliStripMode::BodyOnly => Core::BodyOnly,
             CliStripMode::KeepMetadata => Core::KeepMetadata,
-            CliStripMode::NoiseOnly => Core::NoiseOnly,
         }
     }
 }
@@ -485,7 +482,6 @@ fn run_strip(args: StripArgs) -> Result<()> {
             let mode_label = match args.mode {
                 CliStripMode::BodyOnly => "body-only",
                 CliStripMode::KeepMetadata => "keep-metadata",
-                CliStripMode::NoiseOnly => "noise-only",
             };
             println!(
                 "💾 Stripped ({mode_label}, {} bytes) saved to: {path}",
@@ -718,7 +714,6 @@ fn show_help() {
         "  --mode body-only        Remove all bgraph fences (default; Unstructured-equivalent)"
     );
     println!("  --mode keep-metadata    Keep doc-level block + body; strip per-element fences");
-    println!("  --mode noise-only       Strip Header/Footer/Margin fences and their bodies only");
 
     println!("\n📝 Usage Examples:");
     println!("  blazegraph parse -i document.pdf");

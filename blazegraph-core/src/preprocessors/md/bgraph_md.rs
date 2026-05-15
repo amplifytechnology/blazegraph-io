@@ -1,62 +1,15 @@
 //! bgraph.md reverse parser — string → `DocumentGraph`.
 //!
-//! Mirror of the B2 forward emitter at
-//! `crate::graphs::serialization::markdown`. Together they close the
-//! round-trip loop:
+//! Mirror of the forward emitter at
+//! `crate::graphs::serialization::markdown`. Wire-format spec at
+//! `docs/P2/core/architecture/08-bgraph-md-format.md` is the source of
+//! truth; this module implements the parser side of the round-trip.
 //!
-//! ```text
-//!     DocumentGraph ──emit_markdown──▶ bgraph.md ──parse──▶ DocumentGraph
-//!                                                          (canonical-equal)
-//! ```
-//!
-//! Wire-format definition:
-//! `docs/P2/core/architecture/08-bgraph-md-format.md` (v1.0.0).
-//!
-//! ## Reconstruction algorithm
-//!
-//! 1. Scan the input line by line to identify bgraph fence regions
-//!    (`` ```bgraph `` at line-start, closed by the next bare ` ``` `).
-//!    Lines outside any fence are "free" body content; their meaning is
-//!    determined by the type of the next bgraph fence that closes
-//!    after them (Section → preceding heading line; Paragraph →
-//!    preceding paragraph line). Header/Footer/Margin bodies live
-//!    *inside* the fence, above the JSON line.
-//! 2. Parse the doc-level `bgraph` fence (must appear first).
-//! 3. Optionally parse a `bgraph-bookmarks` fence (at most one,
-//!    immediately after the doc-level block).
-//! 4. Walk per-element fences in document order, pairing each with its
-//!    body content per the placement rules above.
-//! 5. Map each parsed element to a [`crate::types::SemanticTreeElement`]
-//!    and feed the vec to
-//!    [`crate::graphs::builder::GraphBuilder::build_graph_deterministic`].
-//!    The builder handles parent/child wiring, path generation, and ID
-//!    derivation. We then populate fields the builder does not (title,
-//!    bookmarks, flow_type) and call `compute_breadcrumbs` +
-//!    `compute_structural_profile` mirroring the canonical post-build
-//!    sequence in `processor.rs`.
-//! 6. Recompute `graph_sha256` and compare to the embedded value.
-//!    Match → `ParseIdentity::Verified`. Mismatch with
-//!    `accept_drift = false` → `Err(HashMismatch)`. Mismatch with
-//!    `accept_drift = true` → `ParseIdentity::Derivative`.
-//!
-//! ## Why a line-based scan rather than pure pulldown-cmark events
-//!
-//! The format is line-anchored: fences always open at column zero, the
-//! body for Section/Paragraph is the immediately-preceding line
-//! verbatim, and the body for Header/Footer/Margin is the
-//! inside-fence content split off the JSON line. pulldown-cmark
-//! tokenizes the surrounding markdown into Events whose Text payloads
-//! lose original whitespace, line boundaries, and any nested
-//! ``` `` ``` `` ``` code blocks the user might have placed in body text.
-//! For this controlled wire format, working directly with the line
-//! buffer is both simpler and more faithful to the bytes the emitter
-//! wrote.
-//!
-//! `pulldown-cmark` is still in the workspace dependency tree per the
-//! B3 handoff (item 4) — when a future generic-markdown ingestion path
-//! lands here, it will rely on pulldown-cmark's full event stream.
-//! The bgraph.md path does not need that depth of CommonMark
-//! interpretation.
+//! Accepts both v1.x and v2.x packs per the dual-support contract: the
+//! emitter targets the current [`super::BGRAPH_MD_FORMAT_VERSION`] only,
+//! but the parser keeps every previous major's arms (currently the H/F/M
+//! body-inside-fence path for v1.x; the body-outside path for v2.x+).
+//! Future major bumps add arms, do not retire old ones.
 
 use crate::graphs::builder::GraphBuilder;
 use crate::graphs::node_id::NodeIdGenerator;
@@ -212,22 +165,40 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                         });
                     }
                     "bgraph-header" | "bgraph-footer" | "bgraph-margin" => {
-                        if doc_level.is_none() {
-                            return Err(ParseError::MissingDocLevelBlock);
+                        let doc = doc_level.as_ref().ok_or(ParseError::MissingDocLevelBlock)?;
+                        // Dual-support dispatch on schema major:
+                        // v1.x put H/F/M body inside the fence above the
+                        // JSON line; v2.x flipped to body-outside (same
+                        // shape as Paragraph). See spec § Amendment H
+                        // and CR-48.
+                        match schema_major(&doc.schema) {
+                            1 => {
+                                let (body_text, meta_json) = split_last_line(body)?;
+                                let meta = parse_node_metadata(&meta_json)?;
+                                parsed_elements.push(ParsedElement {
+                                    body: body_text,
+                                    metadata: meta,
+                                });
+                                pending_body = None;
+                            }
+                            2 => {
+                                let body_text = pending_body.take().ok_or_else(|| {
+                                    ParseError::MalformedFence(format!(
+                                        "{tag} fence with no preceding body line",
+                                    ))
+                                })?;
+                                let meta = parse_node_metadata(body)?;
+                                parsed_elements.push(ParsedElement {
+                                    body: body_text.trim().to_string(),
+                                    metadata: meta,
+                                });
+                            }
+                            _ => unreachable!(
+                                "validate_schema accepts only 1.x and 2.x; \
+                                 schema_major={} should be unreachable here",
+                                schema_major(&doc.schema)
+                            ),
                         }
-                        // Header/Footer/Margin: body lives inside the
-                        // fence, above the JSON metadata line. The
-                        // emitter writes `body\n{json}\n` — split off
-                        // the last non-empty line as the JSON.
-                        let (body_text, meta_json) = split_last_line(body)?;
-                        let meta = parse_node_metadata(&meta_json)?;
-                        parsed_elements.push(ParsedElement {
-                            body: body_text,
-                            metadata: meta,
-                        });
-                        // Any preceding free-line block was not a body
-                        // line for this fence; drop it.
-                        pending_body = None;
                     }
                     other => {
                         return Err(ParseError::MalformedFence(format!(
@@ -608,27 +579,32 @@ fn split_last_line(body: &str) -> Result<(String, String), ParseError> {
     Ok((body_text, json_line))
 }
 
-/// Validate that the doc-level `schema` field is v1.x — the current
-/// bgraph.md wire-format major. We accept any 1.x.y revision (minor
-/// versions are additive; the spec's versioning policy promises
-/// forward compatibility within a major), and reject every other
-/// major.
+/// Validate that the doc-level `schema` field is a major version this
+/// parser has an arm for. Currently accepts `1.x` (body-inside H/F/M)
+/// and `2.x` (body-outside H/F/M). Future major bumps add accepted
+/// prefixes here in lock-step with the matching parser arms.
 ///
-/// CR-47 (Amendment G) changed the *derivation* of `source.sha256`
-/// (now full SHA-256) and node IDs (no longer include
-/// `blazegraph_version` in their namespace) without bumping the
-/// major version — there are no production consumers to signal a
-/// break to, per the project's no-fictional-users principle. Older
-/// v1.x artifacts parse but will produce drift signals when
-/// recompared against re-derived identities; that is the correct
-/// signal.
+/// Per the dual-support contract (spec § Amendment H), old majors stay
+/// readable forever — adding a new major is additive, never replaces
+/// the previous arm.
 fn validate_schema(schema: &str) -> Result<(), ParseError> {
-    if let Some(rest) = schema.strip_prefix("1.") {
-        let _ = rest;
+    if schema.starts_with("1.") || schema.starts_with("2.") {
         Ok(())
     } else {
         Err(ParseError::UnsupportedSchema(schema.to_string()))
     }
+}
+
+/// Extract the major version segment from a `"X.Y.Z"` schema string.
+/// Returns 0 if the string doesn't start with a parseable integer —
+/// `validate_schema` is the gatekeeper, so callers downstream of it can
+/// treat 0 as unreachable.
+fn schema_major(schema: &str) -> u32 {
+    schema
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// Map a wire-format `node_type` string to its `SemanticElementType`.
@@ -814,7 +790,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_header_extracts_inside_fence_body() {
+    fn parse_header_extracts_outside_fence_body_v2() {
+        // v2.0.0 path: H/F/M body lives on the line preceding the
+        // fence, same shape as Paragraph.
         let graph =
             build_synthetic_graph(vec![("Header", "Running header text", 1, 0)], None, None);
         let md = emit_markdown(&graph);
@@ -826,6 +804,42 @@ mod tests {
             .find(|n| n.node_type == "Header")
             .expect("header present");
         assert_eq!(header.content.text, "Running header text");
+    }
+
+    #[test]
+    fn parse_header_extracts_inside_fence_body_v1_backward_compat() {
+        // Dual-support contract: v1.x packs (H/F/M body inside the
+        // fence above the JSON line) remain parseable by the v2.x
+        // parser. Hand-craft a v1.1.0 fixture and assert recovery.
+        //
+        // Parsed with `accept_drift: true` since graph_sha256 is a
+        // placeholder; the test asserts structural recovery of the
+        // H/F/M body line, not identity.
+        let source_sha = "src-sha";
+        let config_hash = "cfg";
+        let header_id = NodeIdGenerator::new(source_sha, config_hash).node_id(0);
+        let v1_fixture = format!(
+            "```bgraph\n\
+             {{\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"{source_sha}\"}},\"flow_type\":\"Free\",\"title\":null,\"config_hash\":\"{config_hash}\",\"graph_sha256\":\"deadbeef\"}}\n\
+             ```\n\
+             \n\
+             ```bgraph-header\n\
+             Running header text\n\
+             {{\"id\":\"{header_id}\",\"node_type\":\"Header\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":3}}\n\
+             ```\n",
+        );
+        let result = parse(&v1_fixture, ParseOptions { accept_drift: true })
+            .expect("v1.x H/F/M fixture should parse under v2.x parser");
+        let header = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Header")
+            .expect("Header node should be reconstructed from v1.x body-inside shape");
+        assert_eq!(
+            header.content.text, "Running header text",
+            "v1.x body-inside parser arm must recover the body text"
+        );
     }
 
     #[test]
@@ -1000,27 +1014,39 @@ mod tests {
     }
 
     #[test]
-    fn validate_schema_accepts_one_dot_x() {
-        assert!(validate_schema("1.0.0").is_ok());
-        assert!(validate_schema("1.0.1").is_ok());
-        assert!(validate_schema("1.1.0").is_ok());
-        assert!(validate_schema("1.42.0").is_ok());
+    fn validate_schema_accepts_supported_majors() {
+        // Dual-support: v1.x and v2.x both have parser arms.
+        for ok in [
+            "1.0.0", "1.0.1", "1.1.0", "1.42.0", "2.0.0", "2.1.0", "2.99.0",
+        ] {
+            assert!(
+                validate_schema(ok).is_ok(),
+                "{ok} should be accepted under dual-support contract"
+            );
+        }
     }
 
     #[test]
-    fn validate_schema_rejects_other_majors() {
-        assert!(matches!(
-            validate_schema("0.9.0"),
-            Err(ParseError::UnsupportedSchema(_))
-        ));
-        assert!(matches!(
-            validate_schema("2.0.0"),
-            Err(ParseError::UnsupportedSchema(_))
-        ));
-        assert!(matches!(
-            validate_schema("3.0.0"),
-            Err(ParseError::UnsupportedSchema(_))
-        ));
+    fn validate_schema_rejects_unsupported_majors() {
+        // 0.x and 3.x+ have no parser arms yet — adding a new major
+        // requires reviewing and implementing a corresponding arm.
+        for bad in ["0.9.0", "3.0.0", "4.0.0", "10.0.0"] {
+            assert!(
+                matches!(validate_schema(bad), Err(ParseError::UnsupportedSchema(_))),
+                "{bad} should be rejected (no parser arm for this major)"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_major_extracts_first_segment() {
+        assert_eq!(schema_major("1.0.0"), 1);
+        assert_eq!(schema_major("2.42.7"), 2);
+        assert_eq!(schema_major("10.0.0"), 10);
+        // Pathological input falls back to 0; validate_schema is the
+        // gatekeeper so this is unreachable from real parse paths.
+        assert_eq!(schema_major(""), 0);
+        assert_eq!(schema_major("garbage"), 0);
     }
 
     // ----- Amendment F (B6, schema 0.7.0+) parse tests ---------------
@@ -1104,6 +1130,45 @@ mod tests {
             .find(|n| n.node_type == "Table")
             .expect("Table present");
         assert_eq!(tbl.content.text, raw_table);
+    }
+
+    #[test]
+    fn parse_round_trip_with_reserved_prefix_in_body_self_referential() {
+        // v2.0.0 escape contract: a Paragraph body containing the
+        // literal reserved prefix `` ```bgraph-section `` must
+        // round-trip cleanly through emit → parse → canonical-equal.
+        // This is the "blazegraph parses its own docs" acceptance test.
+        let prose_with_fence = "Example bgraph fence:\n\
+                                ```bgraph-section\n\
+                                {\"id\":\"...\",\"node_type\":\"Section\"}\n\
+                                ```\n\
+                                End of example.";
+        let original = build_synthetic_graph(
+            vec![("Paragraph", prose_with_fence, 1, 0)],
+            Some("Self-Referential"),
+            None,
+        );
+        // NodeContent::new should have escaped the reserved-prefix
+        // line — assert that before continuing.
+        let para = original
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Paragraph")
+            .expect("paragraph present");
+        assert!(
+            para.content.text.contains("\\```bgraph-section"),
+            "NodeContent::new must escape ```bgraph-section to \\```bgraph-section; \
+             got: {:?}",
+            para.content.text
+        );
+
+        // Round-trip: the escaped body lets the scanner see only the
+        // real bgraph-paragraph fence as a fence open.
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default())
+            .expect("self-referential paragraph round-trips cleanly");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        assert_eq!(canonical(&result.graph), canonical(&original));
     }
 
     #[test]
