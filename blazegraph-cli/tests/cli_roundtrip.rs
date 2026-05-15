@@ -374,8 +374,8 @@ fn cli_strip_body_only_removes_all_bgraph_fences() {
         "Paragraph bodies should survive body-only strip; got:\n{out}"
     );
     assert!(
-        !out.contains("Running header"),
-        "Header body (inside fence) must NOT survive body-only strip; got:\n{out}"
+        out.contains("Running header"),
+        "v2.0.0: Header body lives outside the fence and survives body-only strip; got:\n{out}"
     );
 }
 
@@ -427,50 +427,6 @@ fn cli_strip_keep_metadata_preserves_doc_level_block() {
     assert!(
         out.contains("Introduction"),
         "Section heading body must survive keep-metadata; got:\n{out}"
-    );
-}
-
-#[test]
-fn cli_strip_noise_only_keeps_structural_fences() {
-    let dir = unique_temp_dir("strip-noise-only");
-    let fixture_md = dir.join("fixture.bgraph.md");
-    let stripped = dir.join("stripped.md");
-
-    let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
-    std::fs::write(&fixture_md, &md).expect("write fixture md");
-
-    let output = Command::new(BIN)
-        .args([
-            "strip",
-            "-i",
-            fixture_md.to_str().unwrap(),
-            "-o",
-            stripped.to_str().unwrap(),
-            "--mode",
-            "noise-only",
-        ])
-        .output()
-        .expect("CLI binary spawns");
-    assert!(
-        output.status.success(),
-        "strip failed: stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let out = std::fs::read_to_string(&stripped).expect("read stripped file");
-    // Doc-level + bookmarks + structural fences all survive.
-    assert!(out.contains("```bgraph\n"));
-    assert!(out.contains("```bgraph-section"));
-    assert!(out.contains("```bgraph-paragraph"));
-    // Header/Footer fences and their inside-fence bodies are gone.
-    assert!(
-        !out.contains("```bgraph-header"),
-        "Header fence must be stripped under noise-only; got:\n{out}"
-    );
-    assert!(
-        !out.contains("Running header"),
-        "Header body must be stripped under noise-only; got:\n{out}"
     );
 }
 

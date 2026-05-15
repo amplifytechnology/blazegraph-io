@@ -1,47 +1,28 @@
 //! bgraph.md forward emitter — `DocumentGraph` → markdown string.
 //!
-//! Conforms to v1.1.0 of the bgraph.md format spec
-//! (`docs/P2/core/architecture/08-bgraph-md-format.md`; post-Amendment-F,
-//! amended in place by CR-47 / Amendment G without a major bump
-//! per the no-fictional-users policy). The emitted `schema` field is
-//! sourced from
-//! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`] so a future
-//! Amendment bumping the format version only needs to touch the const.
+//! Wire-format spec is the source of truth:
+//! `docs/P2/core/architecture/08-bgraph-md-format.md`. The emitted
+//! `schema` field is sourced from
+//! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`].
 //!
-//! Output shape:
-//!
-//! - Top of file: a single `bgraph` fence with the document-level
-//!   metadata block (flat JSON, all 7 spec fields populated from
-//!   `graph.document_info.parse_provenance` + `graph_sha256` derived
-//!   from [`super::canonical::graph_sha256`]).
-//! - Body: per-element fences (`bgraph-section`, `bgraph-paragraph`,
-//!   `bgraph-header`, `bgraph-footer`, `bgraph-margin`) emitted in
-//!   `text_order` ascending order. Section/Paragraph bodies live
-//!   *outside* the fence; Header/Footer/Margin bodies live *inside*
-//!   the fence above the JSON metadata line. The synthetic Document
-//!   root node (`text_order = None`) is skipped.
-//! - Elements separated by a single blank line.
-//!
-//! This module exposes a single public function
-//! [`emit_markdown`]; everything else is private.
+//! Public surface: [`emit_markdown`]. Everything else is private.
 
 use super::canonical;
 use crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION;
 use crate::types::*;
 use serde::Serialize;
 
-/// Emit a `DocumentGraph` to bgraph.md format (v1.0.0).
+/// Emit a `DocumentGraph` to bgraph.md format. Targets the current
+/// [`BGRAPH_MD_FORMAT_VERSION`].
 ///
 /// # Panics
 ///
-/// Panics if `graph.document_info.parse_provenance` is `None`. The
-/// emitter requires the (version, source, config) triple to populate
-/// the document-level block; the legacy `GraphBuilder::build_graph`
-/// path (random UUIDv4 IDs, no provenance) is incompatible with
-/// round-trip identity by design and should never reach this emitter.
-/// Build the graph via
+/// Panics if `graph.document_info.parse_provenance` is `None`. Build
+/// the graph via
 /// `GraphBuilder::build_graph_deterministic(elements, &id_gen, provenance)`
-/// instead.
+/// — the legacy `build_graph` path (random UUIDv4 IDs, no provenance)
+/// is incompatible with round-trip identity and must not reach this
+/// emitter.
 pub fn emit_markdown(graph: &DocumentGraph) -> String {
     let provenance = graph.document_info.parse_provenance.as_ref().expect(
         "emit_markdown requires graph.document_info.parse_provenance; \
@@ -141,57 +122,31 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 
 /// Emit one node. Returns `None` for nodes we skip (Document root).
 ///
-/// - `Section`: heading prefix + body on the line *preceding* the
-///   `bgraph-section` fence; metadata-only inside fence.
-/// - `Paragraph`: body on the line *preceding* the `bgraph-paragraph`
-///   fence; metadata-only inside fence.
-/// - `CodeBlock` / `List` / `Blockquote` / `Table` (Amendment F):
-///   body on the line(s) *preceding* the `bgraph-{tag}` fence;
-///   metadata-only inside fence. Body markdown is preserved verbatim
-///   so a plain markdown renderer shows the rendered form.
-/// - `Header` / `Footer` / `Margin`: body *inside* the fence followed
-///   by the JSON metadata line. (See "Strip ergonomics" in the spec —
-///   the body-inside-fence shape lets the second `sed` variant strip
-///   noise + metadata in a single pass.)
+/// Body placement follows spec convention C-3: content fences carry
+/// body on the line(s) preceding the fence; metadata fences (doc-level,
+/// bookmarks) have no body outside. Section gains an `#`-prefix heading
+/// line; all other content variants emit body verbatim.
 fn emit_node(node: &DocumentNode) -> Option<String> {
     let meta = node_metadata_json(node);
+    let text = &node.content.text;
     match node.node_type.as_str() {
         "Document" => None, // synthetic root; not a content node
         "Section" => {
-            let depth = node.location.semantic.depth as usize;
-            let prefix = heading_prefix(depth);
-            Some(format!(
-                "{prefix} {text}\n```bgraph-section\n{meta}\n```",
-                text = node.content.text,
-            ))
+            let prefix = heading_prefix(node.location.semantic.depth as usize);
+            Some(format!("{prefix} {text}\n```bgraph-section\n{meta}\n```"))
         }
-        "Paragraph" => Some(format!(
-            "{text}\n```bgraph-paragraph\n{meta}\n```",
-            text = node.content.text,
-        )),
-        // Amendment F (B6, schema 0.7.0+): markdown-channel variants.
-        // Body-outside pattern, same shape as Paragraph. The body
-        // markdown is the verbatim source (fences, bullets, pipes,
-        // `>` markers, all preserved).
-        "CodeBlock" | "List" | "Blockquote" | "Table" => {
+        // All content variants share the body-outside shape under v2.0.0
+        // (spec convention C-3). Tag derives from node_type lowercased
+        // per C-2.
+        "Paragraph" | "Header" | "Footer" | "Margin" | "CodeBlock" | "List" | "Blockquote"
+        | "Table" => {
             let tag = node.node_type.to_ascii_lowercase();
-            Some(format!(
-                "{text}\n```bgraph-{tag}\n{meta}\n```",
-                text = node.content.text,
-            ))
-        }
-        "Header" | "Footer" | "Margin" => {
-            let tag = node.node_type.to_ascii_lowercase();
-            Some(format!(
-                "```bgraph-{tag}\n{text}\n{meta}\n```",
-                text = node.content.text,
-            ))
+            Some(format!("{text}\n```bgraph-{tag}\n{meta}\n```"))
         }
         // Defense-in-depth: every variant in `SemanticElementType`
         // should have an explicit arm above. Reaching here means a
         // schema addition snuck through without a corresponding spec
-        // amendment and emitter update. Panic loudly so the next CI
-        // run catches it.
+        // amendment and emitter update.
         other => panic!(
             "emit_markdown (bgraph.md): variant '{other}' has no fence-tag mapping; \
              schema added a variant without a corresponding spec amendment + emitter \
@@ -368,9 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn header_footer_margin_body_is_inside_fence() {
-        // For Header/Footer/Margin: opening fence, then body line, then
-        // metadata line, then closing fence.
+    fn header_footer_margin_body_is_outside_fence() {
+        // v2.0.0 (CR-48): H/F/M unified with Section/Paragraph —
+        // body precedes the fence on the immediately adjacent line.
         let graph = build_graph(vec![
             ("Header", "Running header text", 1, 0),
             ("Footer", "Running footer text", 1, 1),
@@ -378,16 +333,16 @@ mod tests {
         ]);
         let md = emit_markdown(&graph);
         assert!(
-            md.contains("```bgraph-header\nRunning header text\n"),
-            "header body should be inside fence (immediately after fence open); got:\n{md}",
+            md.contains("Running header text\n```bgraph-header\n"),
+            "header body should precede the fence; got:\n{md}",
         );
         assert!(
-            md.contains("```bgraph-footer\nRunning footer text\n"),
-            "footer body should be inside fence; got:\n{md}",
+            md.contains("Running footer text\n```bgraph-footer\n"),
+            "footer body should precede the fence; got:\n{md}",
         );
         assert!(
-            md.contains("```bgraph-margin\nMargin note text\n"),
-            "margin body should be inside fence; got:\n{md}",
+            md.contains("Margin note text\n```bgraph-margin\n"),
+            "margin body should precede the fence; got:\n{md}",
         );
     }
 
@@ -673,5 +628,222 @@ mod tests {
         // load-bearing.
         let graph = build_graph(vec![("UnknownVariant", "x", 1, 0)]);
         let _ = emit_markdown(&graph);
+    }
+
+    // ========================================================================
+    // v2.0.0 Convention enforcement tests + emitter whitespace contract
+    // ========================================================================
+    //
+    // These tests enforce the conventions documented in
+    // `docs/P2/core/architecture/08-bgraph-md-format.md` § Conventions
+    // and § Emitter whitespace contract. They are the executable form
+    // of the spec — a canonical-emit output that violates any
+    // convention fails one of these tests.
+    //
+    // H/F/M body-outside coverage (the full v2.0.0 C-3 assertion) lands
+    // with CR-48. The non-H/F/M conventions below hold against current
+    // code and serve as the regression guard for the parts of v2.0.0
+    // that are already true.
+    //
+    // See `docs/P2/core/change-requests/CR-48-header-footer-margin-body-outside-unification.md`.
+
+    #[test]
+    fn convention_c1_doc_level_fence_is_bare_bgraph() {
+        // C-1: The first fence in every bgraph.md file is the literal
+        // ```bgraph (no -<suffix>).
+        let graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
+        let md = emit_markdown(&graph);
+        let first_line = md.lines().next().expect("canonical emit cannot be empty");
+        assert_eq!(
+            first_line, "```bgraph",
+            "C-1: first fence must be bare ```bgraph (no dash suffix); got: {first_line:?}"
+        );
+    }
+
+    #[test]
+    fn convention_c2_per_element_fences_use_lowercase_tag() {
+        // C-2: Every non-doc-level fence opens with ```bgraph-<tag>
+        // where <tag> is the lowercase node_type.
+        let variants = [
+            "Section",
+            "Paragraph",
+            "Header",
+            "Footer",
+            "Margin",
+            "CodeBlock",
+            "List",
+            "Blockquote",
+            "Table",
+        ];
+        for variant in &variants {
+            let graph = build_graph(vec![(variant, "text", 1, 0)]);
+            let md = emit_markdown(&graph);
+            let expected_tag = format!("```bgraph-{}", variant.to_ascii_lowercase());
+            assert!(
+                md.contains(&expected_tag),
+                "C-2: variant {variant} must emit fence {expected_tag}; got:\n{md}"
+            );
+        }
+    }
+
+    #[test]
+    fn convention_c3_body_outside_for_all_content_variants() {
+        // C-3 (v2.0.0): every content fence has body text on the
+        // line(s) immediately preceding the fence open. Covers all 9
+        // content variants (CR-48 unified H/F/M with the rest).
+        let cases = [
+            ("Section", "intro-marker"),
+            ("Paragraph", "para-marker"),
+            ("Header", "header-marker"),
+            ("Footer", "footer-marker"),
+            ("Margin", "margin-marker"),
+            ("CodeBlock", "code-marker"),
+            ("List", "list-marker"),
+            ("Blockquote", "quote-marker"),
+            ("Table", "table-marker"),
+        ];
+        for (variant, text_marker) in &cases {
+            let graph = build_graph(vec![(variant, text_marker, 1, 0)]);
+            let md = emit_markdown(&graph);
+            let tag_line = format!("```bgraph-{}", variant.to_ascii_lowercase());
+            let lines: Vec<&str> = md.lines().collect();
+            let fence_idx = lines
+                .iter()
+                .position(|l| *l == tag_line)
+                .unwrap_or_else(|| panic!("expected to find {tag_line} in:\n{md}"));
+            assert!(fence_idx > 0, "C-3: {variant} fence cannot be first line");
+            let preceding = lines[fence_idx - 1];
+            assert!(
+                preceding.contains(text_marker),
+                "C-3: {variant} body must precede the fence; got preceding line {preceding:?} in:\n{md}"
+            );
+        }
+    }
+
+    #[test]
+    fn convention_c3_bookmarks_metadata_fence_has_no_body_outside() {
+        // C-3 (metadata side): bgraph-bookmarks is a metadata fence;
+        // no body content precedes it. The line immediately before the
+        // fence-open is the blank-line separator from the doc-level
+        // block.
+        let mut graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
+        graph.document_info.bookmark_data = Some(BookmarkData {
+            sections: vec![BookmarkSection {
+                title: "Intro".to_string(),
+                order: 0,
+                level: 1,
+            }],
+        });
+        let md = emit_markdown(&graph);
+        let lines: Vec<&str> = md.lines().collect();
+        let bookmarks_idx = lines
+            .iter()
+            .position(|l| *l == "```bgraph-bookmarks")
+            .expect("bookmarks fence must be emitted when bookmark_data is Some");
+        assert!(
+            bookmarks_idx > 0,
+            "bookmarks fence cannot be the first line"
+        );
+        assert_eq!(
+            lines[bookmarks_idx - 1],
+            "",
+            "C-3: metadata fence (bookmarks) must be preceded by a blank line, not body content; \
+             got preceding line {:?}",
+            lines[bookmarks_idx - 1]
+        );
+    }
+
+    #[test]
+    fn convention_c4_per_element_fences_in_text_order_ascending() {
+        // C-4: per-element content fences appear in text_order
+        // ascending. Construct with text_order out of insertion order;
+        // assert output respects ascending order.
+        let graph = build_graph(vec![
+            ("Paragraph", "third-body", 1, 2),
+            ("Paragraph", "first-body", 1, 0),
+            ("Paragraph", "second-body", 1, 1),
+        ]);
+        let md = emit_markdown(&graph);
+        let first_pos = md.find("first-body").expect("first-body must appear");
+        let second_pos = md.find("second-body").expect("second-body must appear");
+        let third_pos = md.find("third-body").expect("third-body must appear");
+        assert!(
+            first_pos < second_pos && second_pos < third_pos,
+            "C-4: per-element fences must appear in text_order ascending; got positions {first_pos}, {second_pos}, {third_pos}"
+        );
+    }
+
+    #[test]
+    fn convention_c5_body_text_is_trimmed_on_construction() {
+        // C-5 (trim side): NodeContent::new strips leading/trailing
+        // whitespace.
+        let nc = NodeContent::new("  trimmed body  \n".to_string());
+        assert_eq!(
+            nc.text, "trimmed body",
+            "C-5: NodeContent::new must trim leading/trailing whitespace"
+        );
+    }
+
+    #[test]
+    fn convention_c5_exactly_one_blank_line_between_top_level_fences() {
+        // C-5 (separator side): after every ```close, the next line is
+        // either empty (blank-line separator) or EOF. The line after
+        // that (if present) must NOT be empty — no double blank lines
+        // between top-level fences.
+        let graph = build_graph(vec![
+            ("Section", "Intro", 1, 0),
+            ("Paragraph", "First para.", 1, 1),
+            ("Paragraph", "Second para.", 1, 2),
+        ]);
+        let md = emit_markdown(&graph);
+        let lines: Vec<&str> = md.lines().collect();
+        for i in 0..lines.len() {
+            if lines[i] == "```" {
+                if i + 1 < lines.len() {
+                    assert_eq!(
+                        lines[i + 1], "",
+                        "C-5: line after ```close (line {i}) must be blank-line separator; got: {:?}\nFull output:\n{md}",
+                        lines[i + 1]
+                    );
+                }
+                if i + 2 < lines.len() {
+                    assert_ne!(
+                        lines[i + 2], "",
+                        "C-5: no double blank lines between fences; got blank at line {}\nFull output:\n{md}",
+                        i + 2
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whitespace_contract_no_trailing_whitespace_on_lines() {
+        let graph = build_graph(vec![
+            ("Section", "Intro", 1, 0),
+            ("Paragraph", "Body text.", 1, 1),
+        ]);
+        let md = emit_markdown(&graph);
+        for (i, line) in md.lines().enumerate() {
+            assert_eq!(
+                line,
+                line.trim_end(),
+                "whitespace contract: line {i} has trailing whitespace: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_contract_ends_with_single_newline() {
+        let graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
+        let md = emit_markdown(&graph);
+        assert!(
+            md.ends_with('\n'),
+            "whitespace contract: canonical emit must end with newline"
+        );
+        assert!(
+            !md.ends_with("\n\n"),
+            "whitespace contract: canonical emit must end with exactly one newline (not two)"
+        );
     }
 }

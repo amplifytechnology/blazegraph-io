@@ -1,33 +1,16 @@
 //! bgraph fence stripping — bgraph.md → plain markdown / partial bgraph.md.
 //!
-//! Removes bgraph fence regions from a bgraph.md string per a
-//! [`StripMode`]. The three modes mirror the three sed patterns called
-//! out in the wire format spec's "Strip ergonomics" table; the
-//! dash discriminator (`bgraph-[a-z-]*` vs. `bgraph[a-z-]*`) is
-//! load-bearing.
+//! Removes bgraph fence regions per a [`StripMode`]. Two modes (BodyOnly,
+//! KeepMetadata) corresponding to the two sed patterns in spec
+//! § Strip ergonomics. Under v2.0.0 body-outside conventions, both
+//! modes preserve all body content.
 //!
-//! Wire-format definition:
-//! `docs/P2/core/architecture/08-bgraph-md-format.md` (v2.0.0; CR-47
-//! Amendment G bumped from v1.x).
+//! Wire-format spec is the source of truth:
+//! `docs/P2/core/architecture/08-bgraph-md-format.md` (v2.0.0).
 //!
-//! ## Why a line scanner (not regex, not pulldown-cmark)
-//!
-//! The sed patterns in the spec are correct *as patterns* but a real
-//! line-by-line scan handles cases sed cannot:
-//!
-//! - Non-bgraph code blocks in Section/Paragraph body text (e.g., a
-//!   `` ```rust `` block inside a Paragraph) need to pass through
-//!   unmodified. A naive regex on multi-line content would risk
-//!   gobbling these.
-//! - The reserved-prefix invariant (any line starting with
-//!   `` ```bgraph `` is reserved by the spec) means we can recognize
-//!   fence boundaries by line-prefix alone — no CommonMark parsing
-//!   needed.
-//!
-//! The implementation reuses [`super::bgraph_md::bgraph_fence_open_tag`]
-//! and [`super::bgraph_md::is_bare_fence_close`] (both `pub(super)`) so
-//! the strip operation and the round-trip parser share the same
-//! recognition rules for free.
+//! Reuses [`super::bgraph_md::bgraph_fence_open_tag`] and
+//! [`super::bgraph_md::is_bare_fence_close`] (both `pub(super)`) so
+//! the strip and round-trip parser share fence-recognition rules.
 
 use super::bgraph_md::{bgraph_fence_open_tag, is_bare_fence_close, strip_trailing_newline};
 use super::types::{ParseError, StripMode};
@@ -68,11 +51,7 @@ pub fn strip(input: &str, mode: StripMode) -> Result<String, ParseError> {
         let trimmed = strip_trailing_newline(line);
         if let Some(tag) = bgraph_fence_open_tag(trimmed) {
             if should_strip(&tag, mode) {
-                // Consume body lines through the fence close. We
-                // accept that the inner body is whatever's between
-                // the fence-open and fence-close lines; for noise-only
-                // mode the Header/Footer/Margin running text is
-                // intentionally removed along with the metadata line.
+                // Consume body lines through the fence close.
                 let mut closed = false;
                 for body_line in iter.by_ref() {
                     let body_trimmed = strip_trailing_newline(body_line);
@@ -148,34 +127,15 @@ pub fn strip(input: &str, mode: StripMode) -> Result<String, ParseError> {
 }
 
 /// Whether a fence with the given `tag` should be stripped under `mode`.
-///
-/// Tags here are the un-decorated names from
-/// [`super::bgraph_md::bgraph_fence_open_tag`]: `bgraph`,
-/// `bgraph-bookmarks`, `bgraph-section`, `bgraph-paragraph`,
-/// `bgraph-header`, `bgraph-footer`, `bgraph-margin`, plus the
-/// Amendment F additions (`bgraph-codeblock`, `bgraph-list`,
-/// `bgraph-blockquote`, `bgraph-table`). Any other `bgraph*` tag is a
-/// reserved-prefix violation; the round-trip parser flags it but
-/// `strip` is tolerant — we treat the tag as matching the broader
-/// `bgraph*` pattern (it will be stripped in BodyOnly mode and
-/// ignored otherwise).
-///
-/// **Classification (Amendment F):** the four markdown-channel
-/// variants behave like Section/Paragraph for strip — they're
-/// structural content, not noise. `NoiseOnly` leaves them intact;
-/// `KeepMetadata` strips the per-element fence but leaves the
-/// body-outside markdown source untouched.
+/// Tag is the un-decorated form from
+/// [`super::bgraph_md::bgraph_fence_open_tag`].
 fn should_strip(tag: &str, mode: StripMode) -> bool {
     match mode {
-        // `bgraph[a-z-]*` — every bgraph fence (with or without dash).
+        // `bgraph[a-z-]*` — every bgraph fence.
         StripMode::BodyOnly => true,
         // `bgraph-[a-z-]*` — every dashed fence; doc-level `bgraph`
         // (no dash) survives.
         StripMode::KeepMetadata => tag != "bgraph",
-        // `bgraph-(header|footer|margin)` — only the three noise tags.
-        // The four Amendment-F variants (codeblock/list/blockquote/
-        // table) are structural content, so they're NOT noise.
-        StripMode::NoiseOnly => matches!(tag, "bgraph-header" | "bgraph-footer" | "bgraph-margin"),
     }
 }
 
@@ -183,10 +143,8 @@ fn should_strip(tag: &str, mode: StripMode) -> bool {
 mod tests {
     use super::*;
 
-    /// A minimal but realistic emitter-style bgraph.md sample. The
-    /// blank-line separators between elements mirror what
-    /// [`crate::graphs::serialization::markdown::emit_markdown`]
-    /// produces in practice.
+    /// A minimal v2.0.0 emitter-style bgraph.md sample.
+    /// Header/Footer body live *outside* the fence per convention C-3.
     fn sample_bgraph_md() -> String {
         [
             "```bgraph",
@@ -207,13 +165,13 @@ mod tests {
             "{\"id\":\"22222222-2222-5222-8222-222222222222\",\"node_type\":\"Paragraph\",\"location\":{\"semantic\":{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[\"Sample\"]},\"physical\":null},\"text_order\":1,\"token_count\":3}",
             "```",
             "",
-            "```bgraph-header",
             "Running header",
+            "```bgraph-header",
             "{\"id\":\"33333333-3333-5333-8333-333333333333\",\"node_type\":\"Header\",\"location\":{\"semantic\":{\"path\":\"3\",\"depth\":1,\"breadcrumbs\":[\"Sample\"]},\"physical\":null},\"text_order\":2,\"token_count\":2}",
             "```",
             "",
-            "```bgraph-footer",
             "Confidential",
+            "```bgraph-footer",
             "{\"id\":\"44444444-4444-5444-8444-444444444444\",\"node_type\":\"Footer\",\"location\":{\"semantic\":{\"path\":\"4\",\"depth\":1,\"breadcrumbs\":[\"Sample\"]},\"physical\":null},\"text_order\":3,\"token_count\":1}",
             "```",
             "",
@@ -230,86 +188,55 @@ mod tests {
             !out.contains("```bgraph"),
             "body-only output must not contain any bgraph fence; got:\n{out}"
         );
-        // Body content survives.
-        assert!(
-            out.contains("# Introduction"),
-            "Section body (heading) should survive body-only strip; got:\n{out}"
-        );
-        assert!(
-            out.contains("First paragraph body."),
-            "Paragraph body should survive body-only strip; got:\n{out}"
-        );
-        // Header/Footer running text (which lives inside the fence) is
-        // removed.
-        assert!(
-            !out.contains("Running header"),
-            "Header body lives inside fence and must NOT survive body-only strip"
-        );
-        assert!(
-            !out.contains("Confidential"),
-            "Footer body lives inside fence and must NOT survive body-only strip"
-        );
+        // All body content (including v2.0.0 body-outside H/F) survives.
+        for body in &[
+            "# Introduction",
+            "First paragraph body.",
+            "Running header",
+            "Confidential",
+        ] {
+            assert!(
+                out.contains(body),
+                "body content {body:?} must survive body-only strip under v2.0.0; got:\n{out}"
+            );
+        }
     }
 
     #[test]
     fn keep_metadata_preserves_doc_level_block_and_bodies() {
         let md = sample_bgraph_md();
         let out = strip(&md, StripMode::KeepMetadata).expect("strip OK");
-        // Doc-level survives — `bgraph` (no dash) is the
-        // unstripped tag.
+        // Doc-level (no dash) survives.
         assert!(
             out.contains("```bgraph\n"),
             "doc-level bgraph fence must survive keep-metadata; got:\n{out}"
         );
-        assert!(
-            out.contains("\"graph_sha256\""),
-            "doc-level JSON line must survive keep-metadata"
-        );
-        // Bookmarks (dashed fence) is stripped.
-        assert!(
-            !out.contains("```bgraph-bookmarks"),
-            "bookmarks fence must be stripped under keep-metadata"
-        );
-        // Per-element fences are stripped.
-        assert!(
-            !out.contains("```bgraph-section"),
-            "section fence must be stripped under keep-metadata"
-        );
-        assert!(
-            !out.contains("```bgraph-paragraph"),
-            "paragraph fence must be stripped under keep-metadata"
-        );
-        // Body content survives.
-        assert!(out.contains("# Introduction"));
-        assert!(out.contains("First paragraph body."));
-        // Header/Footer/Margin bodies (inside-fence) are stripped.
-        assert!(!out.contains("Running header"));
-        assert!(!out.contains("Confidential"));
-    }
-
-    #[test]
-    fn noise_only_strips_header_footer_margin_only() {
-        let md = sample_bgraph_md();
-        let out = strip(&md, StripMode::NoiseOnly).expect("strip OK");
-        // Doc-level + bookmarks + section/paragraph all survive.
-        assert!(out.contains("```bgraph\n"));
-        assert!(out.contains("```bgraph-bookmarks"));
-        assert!(out.contains("```bgraph-section"));
-        assert!(out.contains("```bgraph-paragraph"));
-        // Header/Footer fences and their inside-fence bodies are gone.
-        assert!(
-            !out.contains("```bgraph-header"),
-            "header fence must be stripped under noise-only"
-        );
-        assert!(
-            !out.contains("```bgraph-footer"),
-            "footer fence must be stripped under noise-only"
-        );
-        assert!(!out.contains("Running header"));
-        assert!(!out.contains("Confidential"));
-        // Body text remains.
-        assert!(out.contains("# Introduction"));
-        assert!(out.contains("First paragraph body."));
+        assert!(out.contains("\"graph_sha256\""));
+        // Every dashed fence stripped.
+        for fence in &[
+            "```bgraph-bookmarks",
+            "```bgraph-section",
+            "```bgraph-paragraph",
+            "```bgraph-header",
+            "```bgraph-footer",
+        ] {
+            assert!(
+                !out.contains(fence),
+                "{fence} must be stripped under keep-metadata; got:\n{out}"
+            );
+        }
+        // All body content survives uniformly (v2.0.0 body-outside).
+        for body in &[
+            "# Introduction",
+            "First paragraph body.",
+            "Running header",
+            "Confidential",
+        ] {
+            assert!(
+                out.contains(body),
+                "body content {body:?} must survive keep-metadata under v2.0.0; got:\n{out}"
+            );
+        }
     }
 
     #[test]
@@ -372,10 +299,8 @@ End of body.
 
     #[test]
     fn strip_recognizes_codeblock_list_blockquote_table_fences() {
-        // Amendment F (B6): the four new fence tags get the same
-        // classification as Section/Paragraph — body content, not
-        // noise. body-only and keep-metadata strip them; noise-only
-        // leaves them.
+        // Amendment F (B6) variants — body-outside content like the
+        // rest. Both strip modes preserve the body, strip the fence.
         let md = "\
 ```bgraph
 {\"schema\":\"2.0.0\",\"graph_sha256\":\"x\"}
@@ -443,20 +368,6 @@ fn main() {}
             assert!(
                 !keep.contains(tag),
                 "keep-metadata should strip `{tag}`; got:\n{keep}"
-            );
-        }
-
-        // noise-only: structural fences are kept (not noise).
-        let noise = strip(md, StripMode::NoiseOnly).expect("noise-only OK");
-        for tag in [
-            "```bgraph-list",
-            "```bgraph-blockquote",
-            "```bgraph-table",
-            "```bgraph-codeblock",
-        ] {
-            assert!(
-                noise.contains(tag),
-                "noise-only should preserve `{tag}` (structural, not noise); got:\n{noise}"
             );
         }
     }

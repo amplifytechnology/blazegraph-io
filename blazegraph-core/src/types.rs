@@ -288,12 +288,50 @@ pub struct NodeContent {
     // pub table_data: Option<TableData>, // for tables
 }
 
+/// Reserved line-prefixes that must never appear unescaped in
+/// `NodeContent.text`. Lines starting (at column zero) with any of these
+/// get a leading `\` prepended at construction. The escape uses
+/// CommonMark's `\\`` backslash-escape semantics — invisible in
+/// rendered markdown but breaks our line scanner's fence detection.
+///
+/// Initial member: `"```bgraph"` — the reserved fence prefix per the
+/// bgraph.md spec § Reserved fence prefix. The bare-prefix match
+/// captures every suffix variant in one rule (`bgraph`, `bgraph-section`,
+/// `bgraph-anything-future`). See § Reserved-prefix escape contract
+/// in `docs/P2/core/architecture/08-bgraph-md-format.md` for the
+/// authoritative definition.
+const RESERVED_LINE_PREFIXES: &[&str] = &["```bgraph"];
+
 impl NodeContent {
     pub fn new(text: String) -> Self {
         Self {
-            text: text.trim().to_string(),
+            text: escape_reserved_prefixes(text).trim().to_string(),
         }
     }
+}
+
+/// Idempotently escape lines matching any [`RESERVED_LINE_PREFIXES`]
+/// entry at column zero by prepending `\`. See `NodeContent::new`.
+fn escape_reserved_prefixes(text: String) -> String {
+    if !RESERVED_LINE_PREFIXES.iter().any(|seq| text.contains(seq)) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut first = true;
+    for line in text.split('\n') {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        if RESERVED_LINE_PREFIXES
+            .iter()
+            .any(|seq| line.starts_with(seq))
+        {
+            out.push('\\');
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -953,5 +991,82 @@ mod parsed_element_type_tests {
             ParsedElementType::from_region_label(Some("Hello")),
             ParsedElementType::Paragraph
         );
+    }
+}
+
+// =========================================================================
+// v2.0.0 reserved-prefix escape contract tests (CR-48 / Amendment H).
+// =========================================================================
+
+#[cfg(test)]
+mod node_content_escape_tests {
+    use super::NodeContent;
+
+    #[test]
+    fn escapes_bare_reserved_prefix_at_column_zero() {
+        let nc = NodeContent::new("```bgraph".to_string());
+        assert_eq!(nc.text, "\\```bgraph");
+    }
+
+    #[test]
+    fn escapes_suffixed_reserved_prefix_at_column_zero() {
+        for suffix in &["-section", "-paragraph", "-bookmarks", "-anything-future"] {
+            let raw = format!("```bgraph{suffix}");
+            let nc = NodeContent::new(raw.clone());
+            assert_eq!(
+                nc.text,
+                format!("\\{raw}"),
+                "bare-prefix match should capture suffix {suffix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_escape_reserved_prefix_mid_line() {
+        // The line scanner only matches at column zero, so mid-line
+        // mentions of the reserved prefix don't need escaping.
+        let prose = "The reserved prefix is ```bgraph at column zero.".to_string();
+        let nc = NodeContent::new(prose.clone());
+        assert_eq!(nc.text, prose);
+    }
+
+    #[test]
+    fn does_not_escape_other_code_fence_languages() {
+        for line in &["```rust", "```python", "```", "```bash"] {
+            let nc = NodeContent::new((*line).to_string());
+            assert_eq!(
+                nc.text, *line,
+                "non-bgraph code fence {line:?} must pass through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_is_idempotent() {
+        // Applying NodeContent::new twice must equal applying it once.
+        // This is the round-trip-stability property: parse reads
+        // already-escaped text and constructing a NodeContent on it
+        // does not double-escape.
+        let raw = "```bgraph-section\nmore text".to_string();
+        let once = NodeContent::new(raw);
+        let twice = NodeContent::new(once.text.clone());
+        assert_eq!(once.text, twice.text);
+    }
+
+    #[test]
+    fn escapes_only_lines_starting_with_reserved_prefix() {
+        // Multi-line body with a mix: only the reserved-prefix line
+        // should be escaped, others pass through.
+        let raw = "First line.\n```bgraph-paragraph\nThird line.".to_string();
+        let nc = NodeContent::new(raw);
+        assert_eq!(nc.text, "First line.\n\\```bgraph-paragraph\nThird line.");
+    }
+
+    #[test]
+    fn trim_still_applies_after_escape() {
+        // C-5 trim semantics survive — leading/trailing whitespace of
+        // the whole text is stripped, but internal newlines preserve.
+        let nc = NodeContent::new("  \n```bgraph\nbody\n  ".to_string());
+        assert_eq!(nc.text, "\\```bgraph\nbody");
     }
 }

@@ -34,28 +34,17 @@ pub mod types;
 pub use strip::strip;
 pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode};
 
-/// Current bgraph.md wire-format version. Bumps when the format spec
-/// at `docs/P2/core/architecture/08-bgraph-md-format.md` gains an
-/// Amendment that changes the on-disk shape or semantics.
+/// Current bgraph.md wire-format version targeted by the emitter.
+/// Follows X.Y.Z semantics formalized in spec § Versioning policy.
 ///
-/// Distinct from [`crate::types::SCHEMA_VERSION`], which versions the
-/// in-memory `DocumentGraph` schema and moves more often. The two
-/// axes are decoupled by design: the wire format can be stable while
-/// the in-memory schema iterates (adding optional fields, refining
-/// analytics shapes, etc.), and vice versa.
+/// Distinct from [`crate::types::SCHEMA_VERSION`] (in-memory graph
+/// schema), which moves at a different cadence. Downstream consumers
+/// pinning to the wire-format axis (URD's compile-time adapter assert,
+/// future tooling) target this constant.
 ///
-/// Downstream consumers that need to pin to the wire format axis —
-/// URD's compile-time bgraph-adapter assertion, future tooling that
-/// emits or parses bgraph.md — should target this constant rather
-/// than `SCHEMA_VERSION`.
-///
-/// Value follows semver. Currently v1.1.0 (post-Amendment F, B6).
-/// CR-47 (Amendment G) changed the *derivation* of `source.sha256`
-/// and node IDs but **did not** bump the major — there are no
-/// production consumers to signal a break to (no-fictional-users
-/// principle). When real consumers appear, this version policy will
-/// tighten.
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "1.1.0";
+/// The parser at [`bgraph_md::parse`] accepts every previous major's
+/// shape as well, per the dual-support contract (spec § Amendment H).
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.0.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
