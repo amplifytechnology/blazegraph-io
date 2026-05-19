@@ -31,6 +31,21 @@ pub mod generic_md;
 pub mod strip;
 pub mod types;
 
+/// **v2.0.0 reference implementation of the bgraph.md strip surface.**
+///
+/// This function is the executable form of the format's structural
+/// rule for content boundaries (see
+/// `docs/P2/core/architecture/08-bgraph-md-format.md` § Structural
+/// rule for content boundaries). Downstream consumers that depend on
+/// v2.0.0 strip semantics should import this function; when the format
+/// moves to v3, a sibling `strip_v3` will ship alongside per the
+/// dual-support contract (CR-48).
+///
+/// Re-exports the function and its mode enum from
+/// [`crate::preprocessors::md::strip`] and
+/// [`crate::preprocessors::md::types`] at module-root for downstream
+/// pinning. The re-export pattern follows the
+/// [`BGRAPH_MD_FORMAT_VERSION`] precedent.
 pub use strip::strip;
 pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode};
 

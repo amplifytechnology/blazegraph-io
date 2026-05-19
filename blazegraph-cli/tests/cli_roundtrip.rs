@@ -333,9 +333,9 @@ fn cli_accept_drift_returns_derivative_with_warning() {
 
 #[test]
 fn cli_strip_body_only_removes_all_bgraph_fences() {
-    // Default strip mode: every bgraph fence is removed. The Section
-    // heading + Paragraph body survive; Header/Footer/Margin bodies
-    // (which live inside the fence) do not.
+    // Explicit `--mode body-only`: every bgraph fence is removed. The
+    // Section heading + Paragraph body + (v2.0.0) Header body all
+    // survive.
     let dir = unique_temp_dir("strip-body-only");
     let fixture_md = dir.join("fixture.bgraph.md");
     let stripped = dir.join("stripped.md");
@@ -351,6 +351,8 @@ fn cli_strip_body_only_removes_all_bgraph_fences() {
             fixture_md.to_str().unwrap(),
             "-o",
             stripped.to_str().unwrap(),
+            "--mode",
+            "body-only",
         ])
         .output()
         .expect("CLI binary spawns");
@@ -377,11 +379,19 @@ fn cli_strip_body_only_removes_all_bgraph_fences() {
         out.contains("Running header"),
         "v2.0.0: Header body lives outside the fence and survives body-only strip; got:\n{out}"
     );
+    // body-only: no YAML frontmatter at the top.
+    assert!(
+        !out.starts_with("---\n"),
+        "body-only must NOT emit YAML frontmatter; got start:\n{}",
+        &out.chars().take(40).collect::<String>()
+    );
 }
 
 #[test]
-fn cli_strip_keep_metadata_preserves_doc_level_block() {
-    let dir = unique_temp_dir("strip-keep-meta");
+fn cli_strip_default_mode_emits_frontmatter() {
+    // CR-55 default: `--mode body-with-frontmatter`. Strip every fence
+    // and lift the doc-level block to YAML frontmatter at the top.
+    let dir = unique_temp_dir("strip-default-frontmatter");
     let fixture_md = dir.join("fixture.bgraph.md");
     let stripped = dir.join("stripped.md");
 
@@ -396,8 +406,6 @@ fn cli_strip_keep_metadata_preserves_doc_level_block() {
             fixture_md.to_str().unwrap(),
             "-o",
             stripped.to_str().unwrap(),
-            "--mode",
-            "keep-metadata",
         ])
         .output()
         .expect("CLI binary spawns");
@@ -406,27 +414,133 @@ fn cli_strip_keep_metadata_preserves_doc_level_block() {
         "strip failed: stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-
     let out = std::fs::read_to_string(&stripped).expect("read stripped file");
     assert!(
-        out.contains("```bgraph\n"),
-        "doc-level bgraph block must survive keep-metadata; got:\n{out}"
+        out.starts_with("---\n"),
+        "default mode must emit YAML frontmatter; got start:\n{}",
+        &out.chars().take(80).collect::<String>()
+    );
+    // Frontmatter must round-trip through serde_yaml.
+    let frontmatter = out
+        .strip_prefix("---\n")
+        .and_then(|s| s.split_once("\n---\n"))
+        .map(|(yaml, _)| yaml)
+        .expect("frontmatter delimited");
+    let yaml_str = format!("{frontmatter}\n");
+    let parsed: serde_json::Value = serde_yaml::from_str(&yaml_str)
+        .expect("frontmatter must round-trip through serde_yaml");
+    assert!(parsed.get("graph_sha256").is_some());
+    // Body survives.
+    assert!(out.contains("First paragraph body."));
+    // Source file untouched (content sanity).
+    let src_after =
+        std::fs::read_to_string(&fixture_md).expect("read source after strip");
+    assert_eq!(md, src_after, "source file must not be modified by strip");
+}
+
+#[test]
+fn cli_strip_node_types_filters_headers() {
+    // CR-55: `--node-types header` removes Header elements entirely
+    // (body + fence) via the structural rule; the default-mode
+    // frontmatter still emits at the top.
+    let dir = unique_temp_dir("strip-node-types-header");
+    let fixture_md = dir.join("fixture.bgraph.md");
+    let stripped = dir.join("stripped.md");
+
+    let graph = build_synthetic_graph();
+    let md = emit_markdown(&graph);
+    std::fs::write(&fixture_md, &md).expect("write fixture md");
+
+    let output = Command::new(BIN)
+        .args([
+            "strip",
+            "-i",
+            fixture_md.to_str().unwrap(),
+            "-o",
+            stripped.to_str().unwrap(),
+            "--node-types",
+            "header",
+        ])
+        .output()
+        .expect("CLI binary spawns");
+    assert!(
+        output.status.success(),
+        "strip failed: stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = std::fs::read_to_string(&stripped).expect("read stripped file");
+    assert!(out.starts_with("---\n"), "frontmatter still emitted");
+    assert!(
+        !out.contains("Running header"),
+        "Header body must be removed; got:\n{out}"
     );
     assert!(
-        out.contains("graph_sha256"),
-        "doc-level JSON content must survive keep-metadata; got:\n{out}"
+        !out.contains("```bgraph-header"),
+        "Header fence must be removed; got:\n{out}"
     );
+}
+
+#[test]
+fn cli_strip_rejects_unknown_node_type() {
+    // CR-55 Test 11: unknown --node-types value is rejected at the
+    // clap layer with a list of valid values.
+    let dir = unique_temp_dir("strip-bad-type");
+    let fixture_md = dir.join("fixture.bgraph.md");
+    let graph = build_synthetic_graph();
+    let md = emit_markdown(&graph);
+    std::fs::write(&fixture_md, &md).expect("write fixture md");
+
+    let output = Command::new(BIN)
+        .args([
+            "strip",
+            "-i",
+            fixture_md.to_str().unwrap(),
+            "--node-types",
+            "bogus",
+        ])
+        .output()
+        .expect("CLI binary spawns");
     assert!(
-        !out.contains("```bgraph-section"),
-        "Section fence must be stripped under keep-metadata; got:\n{out}"
+        !output.status.success(),
+        "unknown --node-types must fail; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !out.contains("```bgraph-paragraph"),
-        "Paragraph fence must be stripped under keep-metadata; got:\n{out}"
+        stderr.contains("unknown node type") || stderr.contains("bogus"),
+        "stderr should name the unknown tag; got:\n{stderr}"
     );
+}
+
+#[test]
+fn cli_strip_rejects_bgraph_as_node_type() {
+    // CR-55 Test 12: `bgraph` (doc-level fence) cannot be a
+    // --node-types target; clap rejects with a hint to use
+    // `--mode body-only`.
+    let dir = unique_temp_dir("strip-bgraph-type");
+    let fixture_md = dir.join("fixture.bgraph.md");
+    let graph = build_synthetic_graph();
+    let md = emit_markdown(&graph);
+    std::fs::write(&fixture_md, &md).expect("write fixture md");
+
+    let output = Command::new(BIN)
+        .args([
+            "strip",
+            "-i",
+            fixture_md.to_str().unwrap(),
+            "--node-types",
+            "bgraph",
+        ])
+        .output()
+        .expect("CLI binary spawns");
     assert!(
-        out.contains("Introduction"),
-        "Section heading body must survive keep-metadata; got:\n{out}"
+        !output.status.success(),
+        "`--node-types bgraph` must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("body-only"),
+        "stderr should hint at --mode body-only; got:\n{stderr}"
     );
 }
 
