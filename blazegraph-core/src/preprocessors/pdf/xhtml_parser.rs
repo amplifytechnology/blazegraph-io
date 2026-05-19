@@ -375,17 +375,32 @@ fn extract_text_elements(
 }
 
 /// Sort page elements by Tika's structural reading-order anchor and assign
-/// global reading_order. CR-51: the previous Y-then-X spatial sort mis-clustered
-/// same-line spans with different font baselines (e.g. Shannon's small-caps
-/// section header, attention paper's superscript citations, math subscripts).
+/// global reading_order.
 ///
-/// The lex hierarchy is `(page, region_rank, paragraph, line, segment)` with
-/// Y/X retained as a final tiebreaker for degenerate inputs (same anchor
-/// tuple — shouldn't happen from Tika output but kept defensive). `region_rank`
-/// is a no-op at this point in the pipeline because `region_label` is `None`
-/// until `analytics::reading_order::tag_and_resort` runs; it is included here
-/// so this sort remains the right "Tika-document-order" anchor if the parser
-/// is ever consumed without the analytics resort.
+/// CR-51 (initial): replaced the previous Y-then-X spatial sort that
+/// mis-clustered same-line spans with different font baselines (Shannon's
+/// small-caps section header, attention's superscript citations).
+///
+/// CR-51 (revision after rfc-quic regression): the within-line key is
+/// `bounding_box.x` — NOT `segment_number`. Tika walks PDF content streams in
+/// source order, which is monotonic-in-X for Shannon/attention but not for
+/// rfc-quic (where inline-emphasized words like `MAY`/`SHOULD` and URL
+/// hyperlinks are emitted as a later `data-segment` than their visual
+/// neighbors). Sorting by `bounding_box.x` within a `(paragraph, line)` group
+/// is the lossless reading-order reconstruction: Tika's `data-line` grouping
+/// is reliable, and geometric X within line gives the correct order for
+/// inline-styled spans regardless of stream-emission order.
+///
+/// `segment_number` is retained as a tiebreaker for the (rare) case where two
+/// spans share an X coordinate within epsilon. `bounding_box.y` is the final
+/// fallback for fully-degenerate inputs.
+///
+/// The full lex hierarchy is `(page, region_rank, paragraph, line,
+/// bounding_box.x, segment_number, bounding_box.y)`. `region_rank` is a no-op
+/// at this point in the pipeline because `region_label` is `None` until
+/// `analytics::reading_order::tag_and_resort` runs; it is included here so
+/// this sort remains the right "Tika-document-order" anchor if the parser is
+/// ever consumed without the analytics resort.
 fn finalize_page_elements(
     page_elements: &mut Vec<PdfTextElement>,
     all_elements: &mut Vec<PdfTextElement>,
@@ -402,12 +417,15 @@ fn finalize_page_elements(
             })
             .then(pa.paragraph_number.cmp(&pb.paragraph_number))
             .then(pa.line_number.cmp(&pb.line_number))
-            .then(pa.segment_number.cmp(&pb.segment_number))
-            // Tiebreakers — only fire when the anchor tuple is degenerate
-            // (e.g. across two regions Tika labeled identically). Y first,
-            // then X — matches the previous default for that case.
-            .then(pa.bounding_box.y.total_cmp(&pb.bounding_box.y))
+            // Within line: X drives reading order. This is the load-bearing
+            // bit of CR-51 — see the docstring above for the rfc-quic
+            // motivation.
             .then(pa.bounding_box.x.total_cmp(&pb.bounding_box.x))
+            // Tiebreakers — only fire when X is degenerate (two glyphs at
+            // identical X within a line, which is unusual visually but can
+            // happen for stacked annotations).
+            .then(pa.segment_number.cmp(&pb.segment_number))
+            .then(pa.bounding_box.y.total_cmp(&pb.bounding_box.y))
     });
     for el in page_elements.iter_mut() {
         el.reading_order = *global_reading_order;
@@ -859,9 +877,11 @@ mod tests {
     /// CR-51: Shannon-shape — alternating f1/f4 spans on the same `data-line`
     /// have different Y baselines (small-caps font drops a pixel). Pre-fix,
     /// the Y-first spatial sort flattened them into `T D N C HE ISCRETE …`.
-    /// Post-fix, segment order (0..7) drives reading_order.
+    /// Post-fix, within-line X drives reading_order (which here happens to
+    /// equal segment order 0..7, since Tika emitted Shannon's section header
+    /// in left-to-right source order).
     #[test]
-    fn cr51_segment_order_overrides_y_baseline_for_shannon_header() {
+    fn cr51_within_line_x_overrides_y_baseline_for_shannon_header() {
         let xhtml = xhtml_with(
             r#"<div class="page"><div class="page-meta" data-page="0" data-width="612.0" data-height="792.0" />
 <p>
@@ -879,16 +899,17 @@ mod tests {
         let output = parse_xhtml(&xhtml).expect("parse should succeed");
         assert_eq!(output.text_elements.len(), 8);
 
-        // After the fix, reading_order matches segment order (0..7), so the
-        // text stream reads `1. T`, `HE`, `D`, `ISCRETE`, `N`, `OISELESS`,
-        // `C`, `HANNEL` — concatenation gives the correct section header.
+        // After the fix, reading_order matches the within-line X order
+        // (which here equals segment order 0..7 because Tika emitted these
+        // spans in left-to-right source order). The text stream reads
+        // `1. T`, `HE`, `D`, `ISCRETE`, `N`, `OISELESS`, `C`, `HANNEL`.
         let mut by_order: Vec<&PdfTextElement> = output.text_elements.iter().collect();
         by_order.sort_by_key(|e| e.reading_order);
         let texts: Vec<&str> = by_order.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(
             texts,
             vec!["1. T", "HE", "D", "ISCRETE", "N", "OISELESS", "C", "HANNEL"],
-            "spans must read in data-segment order, not Y/X order"
+            "spans must read in within-line X order (Y baseline must not split)"
         );
 
         // And the segment_number field on each element matches its position.
@@ -933,15 +954,13 @@ mod tests {
         );
     }
 
-    /// CR-51: Degenerate-anchor tiebreaker — two elements at identical
-    /// `(page, paragraph, line, segment)` but different bounding-box X must
-    /// fall back to Y, then X, deterministically. This is a defensive case
-    /// (Tika shouldn't emit two spans with the same segment within a line)
-    /// but the sort must still be stable and total.
+    /// CR-51: Within-line X is the primary key — when two elements share
+    /// `(page, paragraph, line)`, the one with the smaller X wins regardless
+    /// of which arrived first in document order.
     #[test]
-    fn cr51_xy_tiebreaker_fires_on_degenerate_anchor() {
-        // Same (paragraph, line, segment); different X. The X tiebreaker
-        // (after equal Y) must produce left-before-right order.
+    fn cr51_within_line_x_drives_order() {
+        // Same (paragraph, line); different X. Left (110) must come before
+        // right (400) in reading order.
         let mut elements: Vec<PdfTextElement> = vec![
             mk_test_element(1, "right", 400.0, 100.0, 0, 0, 0, None),
             mk_test_element(1, "left", 110.0, 100.0, 0, 0, 0, None),
@@ -955,12 +974,46 @@ mod tests {
         assert_eq!(
             texts,
             vec!["left", "right"],
-            "X tiebreaker fires when (page, paragraph, line, segment) collide"
+            "within-line X drives reading order"
         );
 
         // Reading-order also assigned monotonically.
         assert_eq!(all_elements[0].reading_order, 0);
         assert_eq!(all_elements[1].reading_order, 1);
+    }
+
+    /// CR-51 (revision): rfc-quic-shape — Tika emits an inline-emphasized
+    /// span (`MAY` in f9-class) with a LATER `data-segment` than its visual
+    /// neighbors. The X coordinate puts it between segments 0 and 1, but the
+    /// PDF content-stream order is 0, 1, 2. The fix asserts X-within-line
+    /// drives reading order, so the styled span lands at its visual position
+    /// regardless of segment number.
+    #[test]
+    fn cr51_within_line_x_overrides_segment_for_rfc_quic_emphasis() {
+        // X positions reproduce the rfc-quic RESET_STREAM line: body 0 ends
+        // at ~x=207, MAY starts at x=207.1, body 1 starts at x=228.0.
+        // Segments are 0, 1, 2 in Tika emission order, but visual order is
+        // body0 → MAY → body1.
+        let mut elements: Vec<PdfTextElement> = vec![
+            mk_test_element(1, "received. An implementation ", 65.9, 457.0, 0, 2, 0, None),
+            mk_test_element(1, " interrupt delivery of stream data", 228.0, 457.0, 0, 2, 1, None),
+            mk_test_element(1, "MAY", 207.1, 457.0, 0, 2, 2, None),
+        ];
+
+        let mut all_elements: Vec<PdfTextElement> = Vec::new();
+        let mut global_reading_order: u32 = 0;
+        finalize_page_elements(&mut elements, &mut all_elements, &mut global_reading_order);
+
+        let texts: Vec<&str> = all_elements.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "received. An implementation ",
+                "MAY",
+                " interrupt delivery of stream data",
+            ],
+            "within-line X order must beat data-segment order — the rfc-quic regression"
+        );
     }
 
     // Helper for CR-51 sort tests — builds a minimal PdfTextElement with the
