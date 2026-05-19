@@ -512,6 +512,12 @@ struct DocLevelSource {
 /// content/parent/children fields the spec excludes.
 #[derive(Debug, Clone, Deserialize)]
 struct NodeMetadata {
+    /// Used at parse time inside a `#[cfg(debug_assertions)]` block to
+    /// verify parsed metadata IDs match builder-derived IDs (a tamper /
+    /// version-mismatch fail-loud). Release builds compile that check
+    /// out, so suppress the dead-code warning conditionally rather than
+    /// dropping the field.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     id: NodeId,
     node_type: String,
     location: NodeLocation,
