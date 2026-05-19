@@ -374,29 +374,61 @@ fn extract_text_elements(
     Ok(all_elements)
 }
 
-/// Sort page elements spatially (Y then X) and assign global reading_order.
+/// Sort page elements by Tika's structural reading-order anchor and assign
+/// global reading_order. CR-51: the previous Y-then-X spatial sort mis-clustered
+/// same-line spans with different font baselines (e.g. Shannon's small-caps
+/// section header, attention paper's superscript citations, math subscripts).
+///
+/// The lex hierarchy is `(page, region_rank, paragraph, line, segment)` with
+/// Y/X retained as a final tiebreaker for degenerate inputs (same anchor
+/// tuple — shouldn't happen from Tika output but kept defensive). `region_rank`
+/// is a no-op at this point in the pipeline because `region_label` is `None`
+/// until `analytics::reading_order::tag_and_resort` runs; it is included here
+/// so this sort remains the right "Tika-document-order" anchor if the parser
+/// is ever consumed without the analytics resort.
 fn finalize_page_elements(
     page_elements: &mut Vec<PdfTextElement>,
     all_elements: &mut Vec<PdfTextElement>,
     global_reading_order: &mut u32,
 ) {
-    page_elements.sort_unstable_by(|a, b| {
-        a.placement
-            .bounding_box
-            .y
-            .total_cmp(&b.placement.bounding_box.y)
+    page_elements.sort_by(|a, b| {
+        let pa = &a.placement;
+        let pb = &b.placement;
+        pa.page_number
+            .cmp(&pb.page_number)
             .then_with(|| {
-                a.placement
-                    .bounding_box
-                    .x
-                    .total_cmp(&b.placement.bounding_box.x)
+                region_rank(pa.region_label.as_deref())
+                    .cmp(&region_rank(pb.region_label.as_deref()))
             })
+            .then(pa.paragraph_number.cmp(&pb.paragraph_number))
+            .then(pa.line_number.cmp(&pb.line_number))
+            .then(pa.segment_number.cmp(&pb.segment_number))
+            // Tiebreakers — only fire when the anchor tuple is degenerate
+            // (e.g. across two regions Tika labeled identically). Y first,
+            // then X — matches the previous default for that case.
+            .then(pa.bounding_box.y.total_cmp(&pb.bounding_box.y))
+            .then(pa.bounding_box.x.total_cmp(&pb.bounding_box.x))
     });
     for el in page_elements.iter_mut() {
         el.reading_order = *global_reading_order;
         *global_reading_order += 1;
     }
     all_elements.append(page_elements);
+}
+
+/// Stable rank for a region label so the sort hierarchy can disambiguate
+/// columns when Tika's `paragraph_number` collides across regions.
+///
+/// Lexicographic on the `Option<String>` — `None` sorts FIRST (treated as
+/// "no region claim yet"), then string labels in `.cmp` order. At parser
+/// time every element has `region_label == None`, so this is a no-op; it
+/// becomes load-bearing only if a future consumer re-sorts elements after
+/// `analytics::reading_order::tag_and_resort` has tagged them.
+fn region_rank(label: Option<&str>) -> (u8, Option<&str>) {
+    match label {
+        None => (0, None),
+        Some(s) => (1, Some(s)),
+    }
 }
 
 /// NFKC + whitespace fold for cross-source string equivalence. Used to align
@@ -820,5 +852,160 @@ mod tests {
             normal.placement.rotation, 0,
             "span outside aside should have rotation=0"
         );
+    }
+
+    // ── CR-51: data-segment as reading-order anchor ──────────────────────────
+
+    /// CR-51: Shannon-shape — alternating f1/f4 spans on the same `data-line`
+    /// have different Y baselines (small-caps font drops a pixel). Pre-fix,
+    /// the Y-first spatial sort flattened them into `T D N C HE ISCRETE …`.
+    /// Post-fix, segment order (0..7) drives reading_order.
+    #[test]
+    fn cr51_segment_order_overrides_y_baseline_for_shannon_header() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="612.0" data-height="792.0" />
+<p>
+<span class="f4" data-bbox="219.2,249.8,19.5,9.7" data-line="0" data-segment="0">1. T</span>
+<span class="f1" data-bbox="239.3,251.3,11.1,7.7" data-line="0" data-segment="1">HE</span>
+<span class="f4" data-bbox="253.3,249.8,7.2,9.7" data-line="0" data-segment="2">D</span>
+<span class="f1" data-bbox="261.0,251.3,35.2,7.7" data-line="0" data-segment="3">ISCRETE</span>
+<span class="f4" data-bbox="299.3,249.8,7.2,9.7" data-line="0" data-segment="4">N</span>
+<span class="f1" data-bbox="307.0,251.3,39.8,7.7" data-line="0" data-segment="5">OISELESS</span>
+<span class="f4" data-bbox="349.7,249.8,6.7,9.7" data-line="0" data-segment="6">C</span>
+<span class="f1" data-bbox="356.8,251.3,35.3,7.7" data-line="0" data-segment="7">HANNEL</span>
+</p>
+</div>"#,
+        );
+        let output = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(output.text_elements.len(), 8);
+
+        // After the fix, reading_order matches segment order (0..7), so the
+        // text stream reads `1. T`, `HE`, `D`, `ISCRETE`, `N`, `OISELESS`,
+        // `C`, `HANNEL` — concatenation gives the correct section header.
+        let mut by_order: Vec<&PdfTextElement> = output.text_elements.iter().collect();
+        by_order.sort_by_key(|e| e.reading_order);
+        let texts: Vec<&str> = by_order.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["1. T", "HE", "D", "ISCRETE", "N", "OISELESS", "C", "HANNEL"],
+            "spans must read in data-segment order, not Y/X order"
+        );
+
+        // And the segment_number field on each element matches its position.
+        for (i, el) in by_order.iter().enumerate() {
+            assert_eq!(
+                el.placement.segment_number, i as u32,
+                "element {} should have segment_number={}, got {}",
+                i, i, el.placement.segment_number
+            );
+        }
+    }
+
+    /// CR-51: Multi-column synth — two elements with identical
+    /// `(paragraph, line, segment)` but different `region_label` must be
+    /// disambiguated by `region_rank`. All "1" before all "2", regardless of
+    /// the order the parser saw them (Tika in a two-column doc may
+    /// interleave). We test the sort directly here since `region_label` is
+    /// always `None` after `parse_xhtml` — it's set later by
+    /// `analytics::reading_order::tag_and_resort`. The sort itself, though,
+    /// must respect the field when present.
+    #[test]
+    fn cr51_region_rank_disambiguates_multi_column() {
+        // Build four elements: two columns, two lines each. Tika emitted
+        // interleaved (L1, R1, L2, R2). After the sort, region "1" (left)
+        // must come before region "2" (right).
+        let mut elements: Vec<PdfTextElement> = vec![
+            mk_test_element(1, "L1", 110.0, 100.0, 0, 0, 0, Some("1")),
+            mk_test_element(1, "R1", 400.0, 100.0, 0, 0, 0, Some("2")),
+            mk_test_element(1, "L2", 110.0, 120.0, 0, 1, 0, Some("1")),
+            mk_test_element(1, "R2", 400.0, 120.0, 0, 1, 0, Some("2")),
+        ];
+
+        let mut all_elements: Vec<PdfTextElement> = Vec::new();
+        let mut global_reading_order: u32 = 0;
+        finalize_page_elements(&mut elements, &mut all_elements, &mut global_reading_order);
+
+        let texts: Vec<&str> = all_elements.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["L1", "L2", "R1", "R2"],
+            "region_rank must drive all of column 1 before all of column 2"
+        );
+    }
+
+    /// CR-51: Degenerate-anchor tiebreaker — two elements at identical
+    /// `(page, paragraph, line, segment)` but different bounding-box X must
+    /// fall back to Y, then X, deterministically. This is a defensive case
+    /// (Tika shouldn't emit two spans with the same segment within a line)
+    /// but the sort must still be stable and total.
+    #[test]
+    fn cr51_xy_tiebreaker_fires_on_degenerate_anchor() {
+        // Same (paragraph, line, segment); different X. The X tiebreaker
+        // (after equal Y) must produce left-before-right order.
+        let mut elements: Vec<PdfTextElement> = vec![
+            mk_test_element(1, "right", 400.0, 100.0, 0, 0, 0, None),
+            mk_test_element(1, "left", 110.0, 100.0, 0, 0, 0, None),
+        ];
+
+        let mut all_elements: Vec<PdfTextElement> = Vec::new();
+        let mut global_reading_order: u32 = 0;
+        finalize_page_elements(&mut elements, &mut all_elements, &mut global_reading_order);
+
+        let texts: Vec<&str> = all_elements.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["left", "right"],
+            "X tiebreaker fires when (page, paragraph, line, segment) collide"
+        );
+
+        // Reading-order also assigned monotonically.
+        assert_eq!(all_elements[0].reading_order, 0);
+        assert_eq!(all_elements[1].reading_order, 1);
+    }
+
+    // Helper for CR-51 sort tests — builds a minimal PdfTextElement with the
+    // sort-relevant fields set; everything else gets defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn mk_test_element(
+        page: u32,
+        text: &str,
+        x: f32,
+        y: f32,
+        paragraph: u32,
+        line: u32,
+        segment: u32,
+        region: Option<&str>,
+    ) -> PdfTextElement {
+        PdfTextElement {
+            text: text.to_string(),
+            style_info: FontClass {
+                class_name: "f1".to_string(),
+                font_family: "Times".to_string(),
+                font_size: 10.0,
+                font_style: "normal".to_string(),
+                font_weight: "normal".to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Placement {
+                page_number: page,
+                bounding_box: BoundingBox {
+                    x,
+                    y,
+                    width: 50.0,
+                    height: 10.0,
+                },
+                line_number: line,
+                segment_number: segment,
+                rotation: 0,
+                paragraph_number: paragraph,
+                region_label: region.map(|s| s.to_string()),
+                page_width: 612.0,
+                page_height: 792.0,
+            },
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            raw_tags: vec![],
+        }
     }
 }
