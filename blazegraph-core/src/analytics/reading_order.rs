@@ -221,6 +221,23 @@ pub fn tag_and_resort(
                 .expect("permutation must visit each index exactly once"),
         );
     }
+
+    // Reassign `reading_order` to match the new physical position.
+    //
+    // Without this, downstream rules (spatial_clustering, node_type_clustering)
+    // re-sort merged elements by the *stale* reading_order from
+    // `xhtml_parser::finalize_page_elements`, which was computed before the
+    // region tree existed. On multi-column docs where Tika interleaves
+    // columns into a single `<p>` (e.g. gpt2 page 1 — Transformer-XL paper),
+    // the stale order is column-interleaved, so the rules engine emits a
+    // column-inverted reading order. Reassigning here aligns reading_order
+    // with the region-tree depth-first walk that this function actually
+    // produces, so all downstream `sort_by_key(reading_order)` calls observe
+    // the correct cross-region order.
+    for (i, el) in resorted.iter_mut().enumerate() {
+        el.reading_order = i as u32;
+    }
+
     resorted
 }
 
