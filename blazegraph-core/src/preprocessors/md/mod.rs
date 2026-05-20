@@ -60,7 +60,7 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 ///
 /// The parser at [`bgraph_md::parse`] accepts every previous major's
 /// shape as well, per the dual-support contract (spec § Amendment H).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.0.0";
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.1.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -116,8 +116,10 @@ mod tests {
     /// accept (the parser may reject for other reasons; this is a
     /// detection test, not a reconstruction test).
     fn sample_bgraph_md_header() -> &'static str {
+        // v2.1.0+: doc-level block carries no `title` (moved to
+        // bgraph-metadata fence — CR-56 § I.4).
         "```bgraph\n\
-         {\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"title\":null,\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
+         {\"schema\":\"2.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
          ```\n"
     }
 

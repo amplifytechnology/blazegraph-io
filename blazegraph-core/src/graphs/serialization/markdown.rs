@@ -29,13 +29,22 @@ pub fn emit_markdown(graph: &DocumentGraph) -> String {
          build the graph via GraphBuilder::build_graph_deterministic with provenance",
     );
 
-    let mut parts: Vec<String> = Vec::with_capacity(graph.nodes.len() + 4);
+    let mut parts: Vec<String> = Vec::with_capacity(graph.nodes.len() + 6);
     parts.push(emit_document_level_block(graph, provenance));
     parts.push(String::new()); // blank line after doc-level block
 
+    // v2.1.0+ (CR-56 § I.3): the `bgraph-metadata` fence is REQUIRED on
+    // every emitted bgraph.md, even when all fields are null. Placed
+    // immediately after the doc-level `bgraph` block, before any
+    // `bgraph-bookmarks` fence.
+    parts.push(emit_metadata_block(
+        &graph.document_info.document_metadata,
+    ));
+    parts.push(String::new());
+
     // Optional `bgraph-bookmarks` fence — emitted only when the source
-    // graph carries an outline. Placed immediately after the doc-level
-    // block so the doc-level block stays a single readable JSON line
+    // graph carries an outline. Placed immediately after `bgraph-metadata`
+    // so the doc-level identity block stays a single readable JSON line
     // even when the bookmark payload is large (rfc-quic ~14 KB).
     if let Some(bookmarks_block) = emit_bookmarks_block(graph) {
         parts.push(bookmarks_block);
@@ -71,17 +80,26 @@ fn emit_bookmarks_block(graph: &DocumentGraph) -> Option<String> {
     Some(format!("```bgraph-bookmarks\n{json}\n```"))
 }
 
-/// Document-level metadata block. Tag: `bgraph` (no suffix). Flat JSON
-/// — this is file metadata, not a node, so the schema-mirroring rule
-/// for per-element blocks doesn't apply.
+/// Document-extracted metadata block. Tag: `bgraph-metadata`. Carries
+/// canonical fields (title, author, description, language, created) plus
+/// channel-specific namespaced sub-objects (pdf / md / docx).
 ///
-/// Field order matches the prototype emitter and the bgraph.md spec
-/// inline example (`schema, blazegraph_version, source, flow_type,
-/// title, config_hash, graph_sha256`). Order is preserved by emitting
-/// from a struct with serde-derived `Serialize` rather than a
-/// `serde_json::Map` — the latter sorts keys when the
-/// `preserve_order` feature is off, which is not what the spec
-/// example shows for the file representation.
+/// Always emitted by v2.1.0+ even when every field is null — the fence's
+/// presence is part of the wire-format contract (CR-56 § I.3).
+fn emit_metadata_block(metadata: &DocumentMetadata) -> String {
+    let json = serde_json::to_string(metadata)
+        .expect("DocumentMetadata is always serializable");
+    format!("```bgraph-metadata\n{json}\n```")
+}
+
+/// Document-level metadata block. Tag: `bgraph` (no suffix). Flat JSON
+/// — this is graph-identity metadata, not a node, so the schema-mirroring
+/// rule for per-element blocks doesn't apply.
+///
+/// CR-57 (v2.1.0+ / Amendment I.4): `title` moves out to the
+/// `bgraph-metadata` block. The doc-level `bgraph` block carries only
+/// graph identity (schema, version, source, flow_type, config_hash,
+/// graph_sha256).
 fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance) -> String {
     #[derive(Serialize)]
     struct DocLevelSource<'a> {
@@ -96,7 +114,7 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
         blazegraph_version: &'a str,
         source: DocLevelSource<'a>,
         flow_type: &'a FlowType,
-        title: &'a Option<String>,
+        // title removed — moved to bgraph-metadata (CR-56 § I.4)
         config_hash: &'a str,
         graph_sha256: String,
     }
@@ -110,7 +128,6 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
             sha256: &provenance.source_sha256,
         },
         flow_type: &graph.structural_profile.flow_type,
-        title: &graph.document_info.document_metadata.title,
         config_hash: &provenance.config_hash,
         graph_sha256: canonical::graph_sha256(graph),
     };
@@ -124,29 +141,47 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 ///
 /// Body placement follows spec convention C-3: content fences carry
 /// body on the line(s) preceding the fence; metadata fences (doc-level,
-/// bookmarks) have no body outside. Section gains an `#`-prefix heading
-/// line; all other content variants emit body verbatim.
+/// `bgraph-metadata`, `bgraph-bookmarks`) have no body outside. Section
+/// gains an `#`-prefix heading line; all other content variants emit
+/// body verbatim.
+///
+/// Fence-tag derivation goes through [`node_type_to_fence_tag`] so
+/// multi-word variants get kebab-case per CR-56 § I.5 / F-11
+/// (`CodeBlock` → `bgraph-code-block`, `Blockquote` → `bgraph-block-quote`).
 fn emit_node(node: &DocumentNode) -> Option<String> {
     let meta = node_metadata_json(node);
     let text = &node.content.text;
-    match node.node_type.as_str() {
-        "Document" => None, // synthetic root; not a content node
-        "Section" => {
-            let prefix = heading_prefix(node.location.semantic.depth as usize);
-            Some(format!("{prefix} {text}\n```bgraph-section\n{meta}\n```"))
-        }
-        // All content variants share the body-outside shape under v2.0.0
-        // (spec convention C-3). Tag derives from node_type lowercased
-        // per C-2.
-        "Paragraph" | "Header" | "Footer" | "Margin" | "CodeBlock" | "List" | "Blockquote"
-        | "Table" => {
-            let tag = node.node_type.to_ascii_lowercase();
-            Some(format!("{text}\n```bgraph-{tag}\n{meta}\n```"))
-        }
-        // Defense-in-depth: every variant in `SemanticElementType`
-        // should have an explicit arm above. Reaching here means a
-        // schema addition snuck through without a corresponding spec
-        // amendment and emitter update.
+    if node.node_type == "Document" {
+        return None; // synthetic root; not a content node
+    }
+    if node.node_type == "Section" {
+        let prefix = heading_prefix(node.location.semantic.depth as usize);
+        let tag = node_type_to_fence_tag(&node.node_type);
+        return Some(format!("{prefix} {text}\n```bgraph-{tag}\n{meta}\n```"));
+    }
+    let tag = node_type_to_fence_tag(&node.node_type);
+    Some(format!("{text}\n```bgraph-{tag}\n{meta}\n```"))
+}
+
+/// Map a graph `node_type` (PascalCase) to its bgraph.md fence-tag
+/// (lowercase, kebab-case for multi-word variants per CR-56 § I.5 / F-11).
+///
+/// Single source of truth for the variant→tag mapping; the parser's
+/// dispatch arm in `bgraph_md.rs` accepts exactly these tags. Panics on
+/// any variant without an explicit mapping — defense-in-depth so a
+/// schema addition cannot reach the emitter without a corresponding spec
+/// amendment + arm here.
+fn node_type_to_fence_tag(node_type: &str) -> &'static str {
+    match node_type {
+        "Section" => "section",
+        "Paragraph" => "paragraph",
+        "Header" => "header",
+        "Footer" => "footer",
+        "Margin" => "margin",
+        "CodeBlock" => "code-block", // F-11 (v2.1.0+; was: codeblock)
+        "List" => "list",
+        "Blockquote" => "block-quote", // F-11 (v2.1.0+; was: blockquote)
+        "Table" => "table",
         other => panic!(
             "emit_markdown (bgraph.md): variant '{other}' has no fence-tag mapping; \
              schema added a variant without a corresponding spec amendment + emitter \
@@ -367,7 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn doc_level_block_has_all_seven_fields() {
+    fn doc_level_block_has_all_six_identity_fields_no_title() {
+        // v2.1.0 (CR-56 § I.4): `title` moved out of the doc-level
+        // `bgraph` block into the `bgraph-metadata` block. The `bgraph`
+        // block now carries identity-only fields.
         let graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
         let md = emit_markdown(&graph);
 
@@ -379,12 +417,10 @@ mod tests {
             "first line must be the document-level fence open",
         );
 
-        // Pull out the JSON line (between first and second '\n').
         let after_first = &md[first_line_end + 1..];
         let json_line_end = after_first.find('\n').expect("JSON line + closing fence");
         let json_line = &after_first[..json_line_end];
 
-        // Parse and verify all seven keys are present.
         let parsed: serde_json::Value =
             serde_json::from_str(json_line).expect("doc-level JSON parses");
         for key in [
@@ -392,7 +428,6 @@ mod tests {
             "blazegraph_version",
             "source",
             "flow_type",
-            "title",
             "config_hash",
             "graph_sha256",
         ] {
@@ -401,7 +436,11 @@ mod tests {
                 "doc-level block missing required key {key:?}; got {json_line}",
             );
         }
-        // source.{format, filename, sha256}
+        // v2.1.0 contract: `title` MUST NOT appear in the bgraph block.
+        assert!(
+            parsed.get("title").is_none(),
+            "doc-level block must not carry `title` under v2.1.0; got {json_line}"
+        );
         let source = parsed.get("source").unwrap();
         for key in ["format", "filename", "sha256"] {
             assert!(
@@ -409,7 +448,6 @@ mod tests {
                 "doc-level source block missing required key {key:?}; got {json_line}",
             );
         }
-        // graph_sha256 is a 64-char lowercase hex
         let h = parsed["graph_sha256"]
             .as_str()
             .expect("graph_sha256 is a string");
@@ -417,29 +455,66 @@ mod tests {
     }
 
     #[test]
+    fn metadata_block_is_emitted_after_doc_level() {
+        // v2.1.0 (CR-56 § I.3): the bgraph-metadata fence is REQUIRED on
+        // every emitted bgraph.md, immediately after the doc-level block,
+        // separated by exactly one blank line.
+        let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
+        graph.document_info.document_metadata.title = Some("My Doc".to_string());
+        graph.document_info.document_metadata.author = Some("Alice".to_string());
+        let md = emit_markdown(&graph);
+
+        // Doc-level close → blank line → bgraph-metadata open.
+        assert!(
+            md.contains("```\n\n```bgraph-metadata\n"),
+            "bgraph-metadata fence must follow the doc-level block with one blank-line separator; \
+             got:\n{md}"
+        );
+
+        // Payload mirrors DocumentMetadata JSON shape (canonical fields at
+        // the top, channel namespaces under named keys).
+        let start = md.find("```bgraph-metadata\n").unwrap() + "```bgraph-metadata\n".len();
+        let end = md[start..].find("\n```").expect("metadata fence close") + start;
+        let json_line = &md[start..end];
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_line).expect("bgraph-metadata JSON parses");
+        assert_eq!(parsed["title"].as_str(), Some("My Doc"));
+        assert_eq!(parsed["author"].as_str(), Some("Alice"));
+    }
+
+    #[test]
+    fn metadata_block_emitted_even_when_metadata_empty() {
+        let graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
+        // build_graph defaults `title: Some("Synthetic Test Doc")` — strip
+        // it so we test the truly-empty case too.
+        let mut graph = graph;
+        graph.document_info.document_metadata = DocumentMetadata::default();
+        let md = emit_markdown(&graph);
+        assert!(
+            md.contains("```bgraph-metadata\n"),
+            "bgraph-metadata fence MUST be present under v2.1.0 even when all fields are null; \
+             got:\n{md}"
+        );
+    }
+
+    #[test]
     fn synthetic_one_section_one_paragraph_matches_template() {
         // Whole-output literal check: for a synthetic graph with one
-        // Section + one Paragraph, the body shape (after the
-        // doc-level block) must be byte-identical to the template
-        // below. The doc-level block changes whenever provenance or
-        // graph_sha256 changes, so we anchor on the body slice.
+        // Section + one Paragraph, the body shape (after the doc-level
+        // + bgraph-metadata blocks) must be byte-identical to the
+        // template below. The doc-level + metadata blocks change with
+        // provenance / graph_sha256 / metadata fields, so we anchor on
+        // the section heading line.
         let graph = build_graph(vec![
             ("Section", "Intro", 1, 0),
             ("Paragraph", "Hello.", 1, 1),
         ]);
         let md = emit_markdown(&graph);
-        // The body shape after the doc-level block is anchored by the
-        // first occurrence of the section heading line. Pull from there
-        // to end-of-file.
         let body_start = md
             .find("# Intro\n```bgraph-section\n")
             .expect("section heading should be present");
         let after_doc = &md[body_start..];
 
-        // The section/paragraph fences embed deterministic UUIDs from
-        // build_graph's seeding ("test:0", "test:1"). Compute them here
-        // so the assertion stays stable as long as the seeding scheme
-        // doesn't drift.
         let section_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"test:0");
         let paragraph_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"test:1");
 
@@ -526,14 +601,16 @@ mod tests {
         assert_eq!(parsed.sections.len(), 2);
         assert_eq!(parsed.sections[0].title, "Introduction");
 
-        // Placement: bookmarks fence sits between the doc-level block
-        // and the first per-element fence.
-        let doc_level_close = md.find("```\n\n```bgraph-bookmarks").expect(
-            "bookmarks fence should follow the doc-level block, separated by exactly one blank line",
-        );
+        // Placement (v2.1.0+): bookmarks fence sits between the
+        // bgraph-metadata block and the first per-element fence.
+        let metadata_close = md
+            .find("```\n\n```bgraph-bookmarks")
+            .expect(
+                "bookmarks fence should follow the metadata block, separated by exactly one blank line",
+            );
         let first_section = md.find("```bgraph-section").expect("section fence");
         assert!(
-            doc_level_close < first_section,
+            metadata_close < first_section,
             "bookmarks fence must precede the first per-element fence",
         );
     }
@@ -574,10 +651,10 @@ mod tests {
         let raw = "```rust\nfn main() {}\n```";
         let graph = build_graph(vec![("CodeBlock", raw, 2, 0)]);
         let md = emit_markdown(&graph);
-        // Body precedes the bgraph fence on the immediately adjacent
-        // line, same shape as Section/Paragraph.
+        // F-11 (v2.1.0+): the CodeBlock variant uses kebab-case
+        // `bgraph-code-block`.
         assert!(
-            md.contains("```\n```bgraph-codeblock\n"),
+            md.contains("```\n```bgraph-code-block\n"),
             "CodeBlock body should be outside the bgraph fence; got:\n{md}"
         );
         // Body itself survives verbatim (fence + language tag + body).
@@ -603,8 +680,10 @@ mod tests {
         let raw = "> quoted\n> still";
         let graph = build_graph(vec![("Blockquote", raw, 2, 0)]);
         let md = emit_markdown(&graph);
+        // F-11 (v2.1.0+): the Blockquote variant uses kebab-case
+        // `bgraph-block-quote`.
         assert!(
-            md.contains("> quoted\n> still\n```bgraph-blockquote\n"),
+            md.contains("> quoted\n> still\n```bgraph-block-quote\n"),
             "Blockquote body should be outside the fence; got:\n{md}"
         );
     }
@@ -661,24 +740,26 @@ mod tests {
     }
 
     #[test]
-    fn convention_c2_per_element_fences_use_lowercase_tag() {
-        // C-2: Every non-doc-level fence opens with ```bgraph-<tag>
-        // where <tag> is the lowercase node_type.
+    fn convention_c2_per_element_fences_use_kebab_case_tag() {
+        // C-2 (v2.1.0+ / F-11): Every non-doc-level fence opens with
+        // ```bgraph-<tag> where <tag> is the kebab-case lowercased
+        // node_type. CodeBlock → bgraph-code-block; Blockquote →
+        // bgraph-block-quote; the rest are single-word and unchanged.
         let variants = [
-            "Section",
-            "Paragraph",
-            "Header",
-            "Footer",
-            "Margin",
-            "CodeBlock",
-            "List",
-            "Blockquote",
-            "Table",
+            ("Section", "section"),
+            ("Paragraph", "paragraph"),
+            ("Header", "header"),
+            ("Footer", "footer"),
+            ("Margin", "margin"),
+            ("CodeBlock", "code-block"),
+            ("List", "list"),
+            ("Blockquote", "block-quote"),
+            ("Table", "table"),
         ];
-        for variant in &variants {
+        for (variant, tag) in &variants {
             let graph = build_graph(vec![(variant, "text", 1, 0)]);
             let md = emit_markdown(&graph);
-            let expected_tag = format!("```bgraph-{}", variant.to_ascii_lowercase());
+            let expected_tag = format!("```bgraph-{tag}");
             assert!(
                 md.contains(&expected_tag),
                 "C-2: variant {variant} must emit fence {expected_tag}; got:\n{md}"
@@ -688,24 +769,24 @@ mod tests {
 
     #[test]
     fn convention_c3_body_outside_for_all_content_variants() {
-        // C-3 (v2.0.0): every content fence has body text on the
-        // line(s) immediately preceding the fence open. Covers all 9
-        // content variants (CR-48 unified H/F/M with the rest).
+        // C-3 (v2.0.0+ / kebab-case from v2.1.0): every content fence
+        // has body text on the line(s) immediately preceding the fence
+        // open. Covers all 9 content variants.
         let cases = [
-            ("Section", "intro-marker"),
-            ("Paragraph", "para-marker"),
-            ("Header", "header-marker"),
-            ("Footer", "footer-marker"),
-            ("Margin", "margin-marker"),
-            ("CodeBlock", "code-marker"),
-            ("List", "list-marker"),
-            ("Blockquote", "quote-marker"),
-            ("Table", "table-marker"),
+            ("Section", "intro-marker", "section"),
+            ("Paragraph", "para-marker", "paragraph"),
+            ("Header", "header-marker", "header"),
+            ("Footer", "footer-marker", "footer"),
+            ("Margin", "margin-marker", "margin"),
+            ("CodeBlock", "code-marker", "code-block"),
+            ("List", "list-marker", "list"),
+            ("Blockquote", "quote-marker", "block-quote"),
+            ("Table", "table-marker", "table"),
         ];
-        for (variant, text_marker) in &cases {
+        for (variant, text_marker, tag) in &cases {
             let graph = build_graph(vec![(variant, text_marker, 1, 0)]);
             let md = emit_markdown(&graph);
-            let tag_line = format!("```bgraph-{}", variant.to_ascii_lowercase());
+            let tag_line = format!("```bgraph-{tag}");
             let lines: Vec<&str> = md.lines().collect();
             let fence_idx = lines
                 .iter()

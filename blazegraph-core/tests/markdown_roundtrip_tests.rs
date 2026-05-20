@@ -398,7 +398,7 @@ fn reserved_prefix_in_body_is_handled_on_parse() {
     // should fail loud — either ReservedPrefixInBody or
     // MalformedFence is acceptable per the handoff.
     let bogus = "```bgraph\n\
-                 {\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"title\":null,\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
+                 {\"schema\":\"2.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
                  ```\n\
                  \n\
                  ```bgraph-mystery\n\
