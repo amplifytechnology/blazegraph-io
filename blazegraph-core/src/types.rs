@@ -73,6 +73,90 @@ pub struct DocumentInfo {
     /// Schema 0.6.0 (B2 of MD+DOCX flow).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parse_provenance: Option<ParseProvenance>,
+
+    /// Parsing-semantics signal. Bgraph.md v2.1.0+ (CR-49):
+    ///
+    /// - `"tree"` — spacelike content (documents, notes, derived corpus.md
+    ///   files). Default semantically; absence means tree.
+    /// - `"stream"` — timelike content (conversations, message logs).
+    ///
+    /// Lives on the doc-level `bgraph` block. The bgraph.md emitter writes
+    /// this field when populated and skips it when `None`. URD's
+    /// topology-aware storage uses this signal to choose dedup strategy
+    /// (cross-pack global vs pack-scoped) at write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<String>,
+
+    /// Logical-identity namespace for lineage tracking. Bgraph.md v2.1.0+
+    /// (CR-49). Distinct from `source.sha256` (byte-identity): this carries
+    /// stable identifiers (filesystem path, application-assigned stable ID)
+    /// that survive content edits.
+    ///
+    /// - Tree, curated artifacts (PDFs): typically absent (`None`).
+    /// - Tree, mutable files (notes): `path` SHOULD be populated;
+    ///   `stable_id` SHOULD be populated when the source format supports it
+    ///   (e.g., markdown frontmatter `id:` field).
+    /// - Stream (conversations): `stable_id` MUST carry the conversation_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<SourceIdentity>,
+
+    /// URD address of the prior revision of this logical artifact.
+    /// Bgraph.md v2.1.0+ (CR-49). 1:1 chain pointer — leave absent to model
+    /// DAG-style forks (lineage links in URD's link drawer enumerate
+    /// siblings via `source.sha256` when `supersedes` is absent).
+    ///
+    /// Use cases: note re-emit, re-emit under newer blazegraph, replacing
+    /// config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+}
+
+/// Lineage-identity namespace carried on `DocumentInfo`. Bgraph.md v2.1.0+
+/// (CR-49). All sub-fields optional; emit any subset.
+///
+/// `content_hash` is **not** stored here — it would be a redundant copy of
+/// `source.sha256`. Consumers reading content-hash lineage read it from
+/// `source.sha256` directly.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SourceIdentity {
+    /// Absolute filesystem path of the source artifact. Stable until
+    /// rename. Populate for mutable files (notes, drafts); usually `None`
+    /// for curated artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
+    /// Application- or user-assigned stable ID. For notes: markdown
+    /// frontmatter `id:` field. For conversations: the conversation_id.
+    /// Forever-stable when assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+}
+
+/// Variant-specific metadata for `Message` content nodes. Bgraph.md
+/// v2.1.0+ (CR-49). The first instance of V-2 (variant-specific metadata
+/// extensions) in practice — see
+/// `docs/P2/core/architecture/10-variant-content-metadata-contract.md`
+/// § Future: Message.
+///
+/// Carrier choice: an optional sibling field on `DocumentNode` (parallel
+/// to `style_info`). `None` for non-Message nodes; populated for Message
+/// nodes. Emitter and parser pair the field with `skip_serializing_if =
+/// Option::is_none` so it appears in the per-element JSON only on Message
+/// nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MessageMetadata {
+    /// Speaker role + optional identifier. `role` is one of `"human"`,
+    /// `"assistant"`, `"system"`, `"tool"` by convention; not enforced at
+    /// the schema layer (the schema permits any string so future channels
+    /// can extend without a bump).
+    pub speaker: Option<String>,
+
+    /// ISO-8601 UTC timestamp the message was produced / captured.
+    pub timestamp: Option<String>,
+
+    /// 0-based position in the conversation sequence. By convention
+    /// `text_order == turn_number` for stream-topology packs.
+    pub turn_number: Option<u32>,
 }
 
 /// Provenance record for a specific parse run. Persisted on
@@ -207,6 +291,12 @@ pub struct DocumentNode {
     pub content: NodeContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style_info: Option<StyleMetadata>,
+    /// Variant-specific metadata for `Message` nodes (speaker, timestamp,
+    /// turn_number). `None` for every other variant — the field is
+    /// emitted only on Message nodes via the `skip_serializing_if` rule
+    /// on the bgraph.md per-element JSON. Bgraph.md v2.1.0+ (CR-49).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_metadata: Option<MessageMetadata>,
     pub token_count: usize,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
@@ -229,6 +319,7 @@ impl DocumentNode {
             text_order: Some(0),
             content: NodeContent::new(text),
             style_info: None,
+            message_metadata: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
@@ -251,6 +342,7 @@ impl DocumentNode {
             text_order: Some(0),
             content: NodeContent::new(text),
             style_info: None,
+            message_metadata: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
@@ -858,6 +950,13 @@ pub struct SemanticTreeElement {
     /// may not be final — channels populate as best-effort or `None`.
     pub style: Option<StyleInfo>,
 
+    /// Variant-specific metadata for `Message` elements
+    /// (bgraph.md v2.1.0+ / CR-49). `None` on every other variant —
+    /// the channel projection sets this only for stream-topology
+    /// Message nodes. Threaded through `GraphBuilder` onto
+    /// `DocumentNode.message_metadata` to survive round-trip.
+    pub message_metadata: Option<MessageMetadata>,
+
     /// Pre-computed token count.
     pub token_count: usize,
 }
@@ -891,6 +990,11 @@ pub enum SemanticElementType {
     List,
     Blockquote,
     Table,
+    // Bgraph.md v2.1.0+ (CR-49): stream-topology content node. Produced
+    // by conversation-ingestion preprocessors; carries variant-specific
+    // metadata (speaker, timestamp, turn_number) via
+    // `DocumentNode.message_metadata`.
+    Message,
 }
 /// Complete output from document preprocessing
 ///

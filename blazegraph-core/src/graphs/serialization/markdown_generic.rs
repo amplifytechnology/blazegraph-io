@@ -318,6 +318,7 @@ mod tests {
                         text: text.to_string(),
                     },
                     style_info: None,
+                    message_metadata: None,
                     token_count: 1,
                     parent: Some(root_id),
                     children: Vec::new(),
@@ -343,6 +344,7 @@ mod tests {
                     text: String::new(),
                 },
                 style_info: None,
+                message_metadata: None,
                 token_count: 0,
                 parent: None,
                 children: child_ids,
@@ -356,6 +358,9 @@ mod tests {
                 document_metadata: DocumentMetadata::default(),
                 bookmark_data: None,
                 parse_provenance: None, // generic emitter doesn't need provenance
+                topology: None,
+                source_identity: None,
+                supersedes: None,
             },
             structural_profile: StructuralProfile::default(),
         }

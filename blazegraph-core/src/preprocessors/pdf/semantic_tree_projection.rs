@@ -41,6 +41,11 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
                 text_order: index as u32,
                 physical_location,
                 style,
+                // PDF channel never produces Message variants — CR-49's
+                // Message variant is stream-topology only (conversation
+                // ingestion). PDF channel is tree-topology; this stays
+                // `None` for every PDF-projected element.
+                message_metadata: None,
                 token_count: parsed.token_count,
             }
         })

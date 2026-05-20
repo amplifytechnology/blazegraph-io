@@ -62,6 +62,7 @@ fn build_synthetic_graph() -> DocumentGraph {
             text_order: 0,
             physical_location: None,
             style: None,
+            message_metadata: None,
             token_count: 1,
         },
         SemanticTreeElement {
@@ -71,6 +72,7 @@ fn build_synthetic_graph() -> DocumentGraph {
             text_order: 1,
             physical_location: None,
             style: None,
+            message_metadata: None,
             token_count: 3,
         },
         SemanticTreeElement {
@@ -80,6 +82,7 @@ fn build_synthetic_graph() -> DocumentGraph {
             text_order: 2,
             physical_location: None,
             style: None,
+            message_metadata: None,
             token_count: 1,
         },
         SemanticTreeElement {
@@ -89,6 +92,7 @@ fn build_synthetic_graph() -> DocumentGraph {
             text_order: 3,
             physical_location: None,
             style: None,
+            message_metadata: None,
             token_count: 3,
         },
         SemanticTreeElement {
@@ -98,6 +102,7 @@ fn build_synthetic_graph() -> DocumentGraph {
             text_order: 4,
             physical_location: None,
             style: None,
+            message_metadata: None,
             token_count: 2,
         },
         SemanticTreeElement {
@@ -107,6 +112,7 @@ fn build_synthetic_graph() -> DocumentGraph {
             text_order: 5,
             physical_location: None,
             style: None,
+            message_metadata: None,
             token_count: 1,
         },
     ];

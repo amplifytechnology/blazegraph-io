@@ -60,6 +60,7 @@ fn build_synthetic_graph(
                 text_order: *text_order,
                 physical_location: None,
                 style: None,
+                message_metadata: None,
                 token_count: text.split_whitespace().count(),
             }
         })
@@ -132,6 +133,7 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
                 physical_location: n.location.physical.clone(),
                 // v1.0.0 spec does not carry per-element style.
                 style: None,
+                message_metadata: None,
                 token_count: n.token_count,
             }
         })

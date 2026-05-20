@@ -135,6 +135,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                         text_order,
                         physical_location: None,
                         style: None,
+                        message_metadata: None,
                         token_count: estimate_token_count(&heading_text),
                     });
                     current_section_depth = depth;
@@ -166,6 +167,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                             text_order,
                             physical_location: None,
                             style: None,
+                            message_metadata: None,
                             token_count: estimate_token_count(&source),
                         });
                     }
@@ -212,6 +214,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                         text_order,
                         physical_location: None,
                         style: None,
+                        message_metadata: None,
                         token_count: estimate_token_count(&source),
                     });
                 }
@@ -228,6 +231,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                         text_order,
                         physical_location: None,
                         style: None,
+                        message_metadata: None,
                         token_count: estimate_token_count(&source),
                     });
                 }

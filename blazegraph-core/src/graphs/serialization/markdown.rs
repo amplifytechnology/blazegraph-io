@@ -115,6 +115,16 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
         source: DocLevelSource<'a>,
         flow_type: &'a FlowType,
         // title removed — moved to bgraph-metadata (CR-56 § I.4)
+        // CR-49 (v2.1.0+): three optional lineage / topology fields.
+        // Position: after flow_type, before config_hash. Each skipped from
+        // the emitted JSON when None so v2.1.0 graphs without the fields
+        // serialize byte-identical to the pre-CR-49 shape.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        topology: &'a Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_identity: &'a Option<SourceIdentity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        supersedes: &'a Option<String>,
         config_hash: &'a str,
         graph_sha256: String,
     }
@@ -128,6 +138,9 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
             sha256: &provenance.source_sha256,
         },
         flow_type: &graph.structural_profile.flow_type,
+        topology: &graph.document_info.topology,
+        source_identity: &graph.document_info.source_identity,
+        supersedes: &graph.document_info.supersedes,
         config_hash: &provenance.config_hash,
         graph_sha256: canonical::graph_sha256(graph),
     };
@@ -182,6 +195,9 @@ fn node_type_to_fence_tag(node_type: &str) -> &'static str {
         "List" => "list",
         "Blockquote" => "block-quote", // F-11 (v2.1.0+; was: blockquote)
         "Table" => "table",
+        // CR-49 (v2.1.0+): stream-topology content variant.
+        // Single-word — F-11 kebab-case rule doesn't apply.
+        "Message" => "message",
         other => panic!(
             "emit_markdown (bgraph.md): variant '{other}' has no fence-tag mapping; \
              schema added a variant without a corresponding spec amendment + emitter \
@@ -213,7 +229,24 @@ fn node_metadata_json(node: &DocumentNode) -> String {
         /// the right shape now.
         #[serde(skip_serializing_if = "Option::is_none")]
         style: &'a Option<StyleMetadata>,
+        /// CR-49 (v2.1.0+): Message-variant-specific metadata fields,
+        /// flat at the top level of the per-element JSON. Each field is
+        /// populated only for Message nodes (sourced from
+        /// `node.message_metadata`); `skip_serializing_if` keeps them
+        /// absent on every other variant. This is the first instance of
+        /// V-2 (variant-specific metadata extension) in practice —
+        /// see 10-variant-content-metadata-contract.md § Future: Message.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speaker: Option<&'a String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<&'a String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_number: Option<u32>,
     }
+    let (speaker, timestamp, turn_number) = match &node.message_metadata {
+        Some(mm) => (mm.speaker.as_ref(), mm.timestamp.as_ref(), mm.turn_number),
+        None => (None, None, None),
+    };
     let meta = NodeMetadata {
         id: &node.id,
         node_type: &node.node_type,
@@ -221,6 +254,9 @@ fn node_metadata_json(node: &DocumentNode) -> String {
         text_order: &node.text_order,
         token_count: node.token_count,
         style: &node.style_info,
+        speaker,
+        timestamp,
+        turn_number,
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
 }
@@ -279,6 +315,7 @@ mod tests {
                         text: text.to_string(),
                     },
                     style_info: None,
+                    message_metadata: None,
                     token_count: 1,
                     parent: Some(root_id),
                     children: Vec::new(),
@@ -304,6 +341,7 @@ mod tests {
                     text: "Document".to_string(),
                 },
                 style_info: None,
+                message_metadata: None,
                 token_count: 0,
                 parent: None,
                 children: child_ids,
@@ -326,6 +364,9 @@ mod tests {
                     source_sha256: "deadbeef".to_string(),
                     config_hash: "cafef00d".to_string(),
                 }),
+                topology: None,
+                source_identity: None,
+                supersedes: None,
             },
             structural_profile: StructuralProfile::default(),
         }
@@ -922,6 +963,134 @@ mod tests {
                 "whitespace contract: line {i} has trailing whitespace: {line:?}"
             );
         }
+    }
+
+    // ===================================================================
+    // CR-49 (v2.1.0+) emit tests: topology / source_identity / supersedes
+    // doc-level fields + Message variant.
+    // ===================================================================
+
+    #[test]
+    fn doc_level_block_omits_cr49_fields_when_unset() {
+        // Default-built graph: no topology / source_identity / supersedes.
+        // The skip_serializing_if rule must keep them out of the JSON.
+        let graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
+        let md = emit_markdown(&graph);
+        assert!(
+            !md.contains("\"topology\""),
+            "topology must be skipped when None; got:\n{md}"
+        );
+        assert!(
+            !md.contains("\"source_identity\""),
+            "source_identity must be skipped when None; got:\n{md}"
+        );
+        assert!(
+            !md.contains("\"supersedes\""),
+            "supersedes must be skipped when None; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn doc_level_block_emits_cr49_fields_when_set() {
+        let mut graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
+        graph.document_info.topology = Some("stream".to_string());
+        graph.document_info.source_identity = Some(SourceIdentity {
+            path: Some("/notes/foo.md".to_string()),
+            stable_id: Some("conv-123".to_string()),
+        });
+        graph.document_info.supersedes = Some("urd:addr:prior".to_string());
+        let md = emit_markdown(&graph);
+        // Extract the first JSON line (doc-level block).
+        let first_line_end = md.find('\n').expect("multi-line output");
+        let after_first = &md[first_line_end + 1..];
+        let json_line_end = after_first.find('\n').expect("JSON line + closing fence");
+        let json_line = &after_first[..json_line_end];
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_line).expect("doc-level JSON parses");
+        assert_eq!(parsed["topology"].as_str(), Some("stream"));
+        assert_eq!(
+            parsed["source_identity"]["path"].as_str(),
+            Some("/notes/foo.md")
+        );
+        assert_eq!(
+            parsed["source_identity"]["stable_id"].as_str(),
+            Some("conv-123")
+        );
+        assert_eq!(parsed["supersedes"].as_str(), Some("urd:addr:prior"));
+        // CR-49 position contract: after flow_type, before config_hash.
+        let topology_pos = json_line.find("\"topology\"").expect("topology present");
+        let flow_pos = json_line.find("\"flow_type\"").expect("flow_type present");
+        let config_pos = json_line
+            .find("\"config_hash\"")
+            .expect("config_hash present");
+        assert!(
+            flow_pos < topology_pos && topology_pos < config_pos,
+            "topology should sit between flow_type and config_hash; got positions {flow_pos}, {topology_pos}, {config_pos}"
+        );
+    }
+
+    #[test]
+    fn emit_message_node_body_outside_with_variant_metadata() {
+        // Message variant: body precedes the fence (same as Paragraph);
+        // fence tag is `bgraph-message`; per-element JSON carries the
+        // variant-specific speaker / timestamp / turn_number fields.
+        let mut graph = build_graph(vec![("Message", "Hello, world.", 1, 0)]);
+        graph.document_info.topology = Some("stream".to_string());
+        // Find the Message node and attach Message-variant-specific
+        // metadata.
+        let msg_id = graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Message")
+            .map(|n| n.id)
+            .expect("Message node present");
+        graph.nodes.get_mut(&msg_id).unwrap().message_metadata = Some(MessageMetadata {
+            speaker: Some("human".to_string()),
+            timestamp: Some("2026-05-20T14:30:00Z".to_string()),
+            turn_number: Some(0),
+        });
+        let md = emit_markdown(&graph);
+        assert!(
+            md.contains("Hello, world.\n```bgraph-message\n"),
+            "Message body should precede the bgraph-message fence; got:\n{md}"
+        );
+        // Per-element JSON carries the variant fields.
+        let start = md.find("```bgraph-message\n").unwrap() + "```bgraph-message\n".len();
+        let end = md[start..].find("\n```").expect("fence close") + start;
+        let json_line = &md[start..end];
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_line).expect("Message JSON parses");
+        assert_eq!(parsed["node_type"].as_str(), Some("Message"));
+        assert_eq!(parsed["speaker"].as_str(), Some("human"));
+        assert_eq!(parsed["timestamp"].as_str(), Some("2026-05-20T14:30:00Z"));
+        assert_eq!(parsed["turn_number"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn non_message_variant_does_not_carry_message_fields() {
+        // Variant isolation: a Paragraph (or any non-Message variant)
+        // must NOT carry speaker / timestamp / turn_number even if its
+        // message_metadata slot is somehow populated. The
+        // skip_serializing_if rule keeps the JSON clean on every
+        // variant; this test guards the property explicitly.
+        let graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
+        let md = emit_markdown(&graph);
+        let start = md.find("```bgraph-paragraph\n").unwrap()
+            + "```bgraph-paragraph\n".len();
+        let end = md[start..].find("\n```").expect("fence close") + start;
+        let json_line = &md[start..end];
+        assert!(
+            !json_line.contains("\"speaker\""),
+            "non-Message variant must not carry speaker field; got: {json_line}"
+        );
+        assert!(
+            !json_line.contains("\"timestamp\""),
+            "non-Message variant must not carry timestamp field; got: {json_line}"
+        );
+        assert!(
+            !json_line.contains("\"turn_number\""),
+            "non-Message variant must not carry turn_number field; got: {json_line}"
+        );
     }
 
     #[test]

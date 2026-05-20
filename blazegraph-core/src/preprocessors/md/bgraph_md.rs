@@ -156,7 +156,8 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                     | "bgraph-code-block"
                     | "bgraph-list"
                     | "bgraph-block-quote"
-                    | "bgraph-table" => {
+                    | "bgraph-table"
+                    | "bgraph-message" => {
                         // v2.1.0+ single convention: body-outside for
                         // every content variant (including H/F/M; CR-48
                         // / Amendment H) and kebab-case for multi-word
@@ -217,6 +218,24 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
             SemanticElementType::Section => p.metadata.location.semantic.depth,
             _ => p.metadata.location.semantic.depth,
         };
+        // CR-49 (v2.1.0+): reassemble Message-variant-specific fields
+        // from the flat per-element JSON into a `MessageMetadata` struct.
+        // Only Message nodes carry these fields in practice; for every
+        // other variant the three parser-side slots stay `None` and this
+        // collapses to `message_metadata = None` via the all-None check
+        // below.
+        let message_metadata = match (
+            &p.metadata.speaker,
+            &p.metadata.timestamp,
+            p.metadata.turn_number,
+        ) {
+            (None, None, None) => None,
+            (speaker, timestamp, turn_number) => Some(MessageMetadata {
+                speaker: speaker.clone(),
+                timestamp: timestamp.clone(),
+                turn_number,
+            }),
+        };
         semantic_elements.push(SemanticTreeElement {
             text: p.body.clone(),
             element_type,
@@ -228,6 +247,7 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
             // `element.style` onto `DocumentNode.style_info`, restoring
             // round-trip identity for PDF-source graphs that carry style.
             style: p.metadata.style.clone(),
+            message_metadata,
             token_count: p.metadata.token_count,
         });
     }
@@ -261,6 +281,11 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     // which is the honest "no extracted metadata" answer.
     graph.document_info.document_metadata = document_metadata;
     graph.document_info.bookmark_data = bookmarks;
+    // CR-49 (v2.1.0+): three optional doc-level lineage / topology fields.
+    // Absent in the source bgraph.md → `None` on the reconstructed graph.
+    graph.document_info.topology = doc_level.topology.clone();
+    graph.document_info.source_identity = doc_level.source_identity.clone();
+    graph.document_info.supersedes = doc_level.supersedes.clone();
     graph.structural_profile.flow_type = doc_level.flow_type.clone();
 
     // Canonical post-build sequence (mirrors processor.rs:501-502).
@@ -411,6 +436,7 @@ pub(super) fn bgraph_fence_open_tag(line: &str) -> Option<String> {
         || info == "bgraph-list"
         || info == "bgraph-block-quote"
         || info == "bgraph-table"
+        || info == "bgraph-message"
     {
         Some(info.to_string())
     } else if let Some(rest) = info.strip_prefix("bgraph") {
@@ -469,12 +495,23 @@ fn collapse_free_buffer(lines: &[&str]) -> String {
 /// serde behavior with `deny_unknown_fields` *not* set), so a v2.0.0
 /// fixture's stray `title` field doesn't break parsing — it's just
 /// ignored. The metadata fence is the canonical title source under v2.1.0.
+///
+/// CR-49 (v2.1.0+): three optional lineage / topology fields
+/// (`topology`, `source_identity`, `supersedes`). `#[serde(default)]` so
+/// absence parses to `None` — v2.1.0 graphs without these fields stay
+/// fully accepted.
 #[derive(Debug, Clone, Deserialize)]
 struct DocLevelBlock {
     schema: String,
     blazegraph_version: String,
     source: DocLevelSource,
     flow_type: FlowType,
+    #[serde(default)]
+    topology: Option<String>,
+    #[serde(default)]
+    source_identity: Option<SourceIdentity>,
+    #[serde(default)]
+    supersedes: Option<String>,
     config_hash: String,
     graph_sha256: String,
 }
@@ -514,6 +551,19 @@ struct NodeMetadata {
     /// graph builder repopulates `DocumentNode.style_info`.
     #[serde(default)]
     style: Option<StyleMetadata>,
+    /// CR-49 (v2.1.0+): Message-variant-specific metadata, flat at the
+    /// top level of the per-element JSON. Each field defaults to `None`
+    /// — non-Message nodes never carry them, and Message nodes that
+    /// happen to omit one tolerate the absence. The trio is reassembled
+    /// into `MessageMetadata` after parse and routed onto
+    /// `SemanticTreeElement.message_metadata` → `DocumentNode.message_metadata`
+    /// via the GraphBuilder.
+    #[serde(default)]
+    speaker: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    turn_number: Option<u32>,
 }
 
 /// A single parsed bgraph element — the body text plus its decoded
@@ -584,6 +634,8 @@ fn map_node_type_to_semantic(s: &str) -> Result<SemanticElementType, ParseError>
         "List" => Ok(SemanticElementType::List),
         "Blockquote" => Ok(SemanticElementType::Blockquote),
         "Table" => Ok(SemanticElementType::Table),
+        // CR-49 (v2.1.0+): stream-topology content variant.
+        "Message" => Ok(SemanticElementType::Message),
         other => Err(ParseError::UnknownNodeType(other.to_string())),
     }
 }
@@ -631,6 +683,8 @@ mod tests {
                     "List" => SemanticElementType::List,
                     "Blockquote" => SemanticElementType::Blockquote,
                     "Table" => SemanticElementType::Table,
+                    // CR-49 (v2.1.0+).
+                    "Message" => SemanticElementType::Message,
                     other => panic!("unsupported test node type {other:?}"),
                 };
                 SemanticTreeElement {
@@ -640,6 +694,7 @@ mod tests {
                     text_order: *text_order,
                     physical_location: None,
                     style: None,
+                    message_metadata: None,
                     token_count: text.split_whitespace().count(),
                 }
             })
@@ -1109,6 +1164,111 @@ mod tests {
             .expect("self-referential paragraph round-trips cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         assert_eq!(canonical(&result.graph), canonical(&original));
+    }
+
+    // ----- CR-49 (v2.1.0+) parse tests --------------------------------
+
+    #[test]
+    fn parse_doc_level_topology_source_identity_supersedes_round_trip() {
+        // Round-trip a doc-level block carrying all three CR-49 fields.
+        // The fields survive emit → parse → re-emit byte-for-byte.
+        let mut original = build_synthetic_graph(
+            vec![("Paragraph", "Body.", 1, 0)],
+            Some("Lineage Test"),
+            None,
+        );
+        original.document_info.topology = Some("stream".to_string());
+        original.document_info.source_identity = Some(SourceIdentity {
+            path: Some("/notes/abc.md".to_string()),
+            stable_id: Some("conv-xyz".to_string()),
+        });
+        original.document_info.supersedes = Some("urd:bgraph:prior".to_string());
+        let md1 = emit_markdown(&original);
+        let result = parse(&md1, ParseOptions::default()).expect("round-trips");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        let info = &result.graph.document_info;
+        assert_eq!(info.topology.as_deref(), Some("stream"));
+        let si = info.source_identity.as_ref().expect("source_identity");
+        assert_eq!(si.path.as_deref(), Some("/notes/abc.md"));
+        assert_eq!(si.stable_id.as_deref(), Some("conv-xyz"));
+        assert_eq!(info.supersedes.as_deref(), Some("urd:bgraph:prior"));
+        // Second emit must be byte-identical to the first.
+        let md2 = emit_markdown(&result.graph);
+        assert_eq!(md1, md2, "second emit must be byte-identical to the first");
+    }
+
+    #[test]
+    fn parse_message_variant_round_trip_byte_identity() {
+        // Round-trip a Message variant carrying speaker / timestamp /
+        // turn_number. emit → parse → re-emit is byte-identical and
+        // canonical-equal.
+        let mut original = build_synthetic_graph(
+            vec![("Message", "Hi there!", 1, 0)],
+            Some("Conversation"),
+            None,
+        );
+        original.document_info.topology = Some("stream".to_string());
+        // Attach Message-variant metadata directly on the reconstructed
+        // node — the synthetic-builder helper doesn't carry it through.
+        let msg_id = original
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Message")
+            .map(|n| n.id)
+            .expect("Message node present");
+        original.nodes.get_mut(&msg_id).unwrap().message_metadata = Some(MessageMetadata {
+            speaker: Some("human".to_string()),
+            timestamp: Some("2026-05-20T14:30:00Z".to_string()),
+            turn_number: Some(0),
+        });
+        let md1 = emit_markdown(&original);
+        let result = parse(&md1, ParseOptions::default()).expect("Message round-trips");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        let msg = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Message")
+            .expect("parsed Message present");
+        assert_eq!(msg.content.text, "Hi there!");
+        let mm = msg.message_metadata.as_ref().expect("message_metadata");
+        assert_eq!(mm.speaker.as_deref(), Some("human"));
+        assert_eq!(mm.timestamp.as_deref(), Some("2026-05-20T14:30:00Z"));
+        assert_eq!(mm.turn_number, Some(0));
+        let md2 = emit_markdown(&result.graph);
+        assert_eq!(md1, md2, "Message round-trip must be byte-identical");
+        assert_eq!(canonical(&result.graph), canonical(&original));
+    }
+
+    #[test]
+    fn parse_bgraph_message_variant_tag() {
+        // Variant-tag dispatch: `bgraph-message` parses to
+        // SemanticElementType::Message. The fence open recognizer must
+        // accept the tag, the dispatch arm must route it, and the
+        // node_type → semantic-type map must produce Message.
+        assert_eq!(
+            bgraph_fence_open_tag("```bgraph-message").as_deref(),
+            Some("bgraph-message"),
+            "bgraph-message must be recognized as a v2.1.0+ fence tag"
+        );
+        assert_eq!(
+            map_node_type_to_semantic("Message")
+                .expect("Message resolves to a semantic type"),
+            SemanticElementType::Message
+        );
+    }
+
+    #[test]
+    fn parse_doc_level_cr49_fields_absent_yields_none() {
+        // A bgraph.md without the CR-49 fields parses cleanly; the
+        // reconstructed graph carries `None` for each.
+        let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
+        let md = emit_markdown(&graph);
+        let result = parse(&md, ParseOptions::default()).expect("parses");
+        let info = &result.graph.document_info;
+        assert!(info.topology.is_none());
+        assert!(info.source_identity.is_none());
+        assert!(info.supersedes.is_none());
     }
 
     #[test]
