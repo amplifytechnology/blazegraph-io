@@ -347,6 +347,7 @@ pub enum NodeType {
     Footer,
 }
 
+/// Verbatim Tika style projection — see DT-03 for why this is the right shape now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleMetadata {
     pub font_class: String,
