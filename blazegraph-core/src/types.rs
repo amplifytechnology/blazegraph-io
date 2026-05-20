@@ -586,93 +586,119 @@ pub struct BoundingBox {
     // page moved to DocumentNode level
 }
 
+/// Document-extracted metadata. Universal canonical fields at the top
+/// (cross-channel consistency contract); channel-specific format-native
+/// fields under named namespaces.
+///
+/// Wire-format home: the `bgraph-metadata` doc-level fence
+/// (`docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment I.3).
+/// One per document; emitted whether or not any field is populated.
+///
+/// Canonical fields read **source-native only** — no body-side fallback
+/// (per `09-metadata-first-class.md` § F-02 deferred to composition layer).
+/// Title / author / language / description / created return `None` when the
+/// source's metadata does not carry them; cleanup is a composition-layer
+/// concern (URD or above), not extraction.
+///
+/// Schema 0.7.0 (B6): canonical fields + opaque `extras` were flat.
+/// Schema 0.7.1+ (CR-57 / v2.1.0): namespaced channel-specific sub-objects
+/// (`pdf` / `md` / `docx`) replace the flat per-channel fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DocumentMetadata {
-    // Current fields
+    // Universal extracted (canonical)
     pub title: Option<String>,
     pub author: Option<String>,
+    pub description: Option<String>,
     pub language: Option<String>,
-    pub page_count: u32,
+    pub created: Option<String>,
 
-    // Enhanced flat fields from <meta> tags
-    pub publisher: Option<String>,        // xmp:dc:publisher
-    pub creator_tool: Option<String>,     // xmp:CreatorTool
-    pub producer: Option<String>,         // pdf:producer
-    pub pdf_version: Option<String>,      // pdf:PDFVersion
-    pub created: Option<String>,          // dcterms:created
-    pub modified: Option<String>,         // dcterms:modified
-    pub description: Option<String>,      // dc:description
-    pub encrypted: Option<bool>,          // pdf:encrypted
-    pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
+    // Channel-specific namespaces (typically only one populated per document).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<PdfMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md: Option<MdMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docx: Option<DocxMetadata>,
+}
 
-    // Schema 0.7.0+ (B6): canonical frontmatter fields from the
-    // markdown channel. Free-form strings (rather than typed Date /
-    // tag-vocabulary types) because frontmatter is user-authored and
-    // lenient — we capture what's there, not normalize it.
-    #[serde(default)]
-    pub date: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub draft: Option<bool>,
-
-    // Schema 0.7.0+ (B6): opaque pass-through for non-canonical
-    // frontmatter keys. YAML values from the markdown channel are
-    // converted to `serde_json::Value` at the frontmatter-parse
-    // boundary (in `preprocessors::md::frontmatter`) so the schema
-    // type does not depend on the YAML library.
-    //
-    // `BTreeMap` (not `HashMap`) so canonical JSON serialization is
-    // deterministic — same input must produce the same `graph_sha256`.
+/// PDF-channel metadata: strong-convention typed fields + `extras`
+/// passthrough for any non-canonical XMP / `<meta>` tag the source carries.
+///
+/// `extras` closes the asymmetry from pre-CR-57 where unrecognized XMP tags
+/// were silently dropped at the `_ => {}` arm in the flat extractor —
+/// per `09-metadata-first-class.md` § Channel-specific (pdf).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PdfMetadata {
+    pub version: Option<String>,           // pdf:PDFVersion
+    pub producer: Option<String>,          // pdf:producer
+    pub creator_tool: Option<String>,      // xmp:CreatorTool
+    pub publisher: Option<String>,         // xmp:dc:publisher | dc:publisher
+    pub page_count: Option<u32>,           // xmpTPg:NPages
+    pub encrypted: Option<bool>,           // pdf:encrypted
+    pub has_marked_content: Option<bool>,  // pdf:hasMarkedContent
+    pub modified: Option<String>,          // dcterms:modified
     #[serde(default)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
-impl DocumentMetadata {
-    /// Merge extracted metadata on top of current values.
-    /// Non-None fields from `extracted` overwrite; None fields preserve existing.
-    /// page_count overwrites if > 0.
-    pub fn merge_extracted(&mut self, extracted: DocumentMetadata) {
-        if extracted.title.is_some() {
-            self.title = extracted.title;
-        }
-        if extracted.author.is_some() {
-            self.author = extracted.author;
-        }
-        if extracted.language.is_some() {
-            self.language = extracted.language;
-        }
-        if extracted.page_count > 0 {
-            self.page_count = extracted.page_count;
-        }
-        if extracted.publisher.is_some() {
-            self.publisher = extracted.publisher;
-        }
-        if extracted.creator_tool.is_some() {
-            self.creator_tool = extracted.creator_tool;
-        }
-        if extracted.producer.is_some() {
-            self.producer = extracted.producer;
-        }
-        if extracted.pdf_version.is_some() {
-            self.pdf_version = extracted.pdf_version;
-        }
-        if extracted.created.is_some() {
-            self.created = extracted.created;
-        }
-        if extracted.modified.is_some() {
-            self.modified = extracted.modified;
-        }
-        if extracted.description.is_some() {
-            self.description = extracted.description;
-        }
-        if extracted.encrypted.is_some() {
-            self.encrypted = extracted.encrypted;
-        }
-        if extracted.has_marked_content.is_some() {
-            self.has_marked_content = extracted.has_marked_content;
-        }
-    }
+/// MD-channel metadata: strong-convention frontmatter slots (`draft`,
+/// `tags`, `categories`) plus `extras` for everything else (Hugo `slug` /
+/// `layout`, Astro `pubDate`, Obsidian aliases, …).
+///
+/// `BTreeMap` (not `HashMap`) so canonical JSON serialization is
+/// deterministic — same input must produce the same `graph_sha256`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MdMetadata {
+    pub draft: Option<bool>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+/// DOCX-channel metadata: strong-convention typed fields drawn from
+/// `docProps/core.xml` + `docProps/app.xml`; `extras` passthrough for
+/// `docProps/custom.xml` and any non-canonical OOXML properties.
+///
+/// Stub-ready (CR-57): the type lands in v2.1.0 so the schema is
+/// complete and Track C (S10) does not need a follow-on schema bump.
+/// The DOCX channel extractor is a stub returning `Default` until S10
+/// wires the real OOXML probe.
+/// Tagged union for channel-specific metadata, produced by a channel's
+/// [`crate::preprocessors::metadata::MetadataExtractor`] impl and routed
+/// into the corresponding namespace slot on [`DocumentMetadata`].
+///
+/// Adding a new channel adds a variant here; the type system carries the
+/// dispatch — every match site updates under the compiler's eye.
+#[derive(Debug, Clone)]
+pub enum ChannelMetadata {
+    Pdf(PdfMetadata),
+    Md(MdMetadata),
+    Docx(DocxMetadata),
+    // Future: Html(HtmlMetadata), Epub(EpubMetadata), …
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DocxMetadata {
+    pub application: Option<String>,
+    pub app_version: Option<String>,
+    pub pages: Option<u32>,
+    pub words: Option<u32>,
+    pub characters: Option<u32>,
+    pub lines: Option<u32>,
+    pub paragraphs: Option<u32>,
+    pub company: Option<String>,
+    pub manager: Option<String>,
+    pub template: Option<String>,
+    pub total_time: Option<u32>,
+    pub doc_security: Option<u32>,
+    pub last_modified_by: Option<String>,
+    pub revision: Option<String>,
+    pub modified: Option<String>,
+    #[serde(default)]
+    pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

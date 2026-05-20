@@ -49,9 +49,11 @@ use unicode_normalization::UnicodeNormalization;
 static RAW_TAG_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)(?:<[^>]+/>|<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>)").unwrap());
 
-static META_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<meta\s+name="([^"]*)"[^>]*content="([^"]*)"[^>]*/?>"#).unwrap()
-});
+// CR-57 Phase B: the META regex + flat tag dispatch moved to
+// `crate::preprocessors::pdf::metadata::PdfMetadataExtractor`. The
+// metadata-extraction entry point in `parse_xhtml` now drives the trait,
+// so unrecognized XMP tags surface in `pdf.extras` rather than being
+// silently dropped.
 
 static STYLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)<style[^>]*>(.*?)</style>").unwrap());
@@ -70,8 +72,11 @@ static FONT_CLASS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Main entry point. Extracts text elements (with full structural context),
 /// document metadata, style data, and bookmark data.
 pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
+    use crate::preprocessors::metadata::extract_document_metadata;
+    use crate::preprocessors::pdf::metadata::PdfMetadataExtractor;
+
     let t0 = Instant::now();
-    let metadata = extract_enhanced_metadata(xhtml)?;
+    let metadata = extract_document_metadata(&PdfMetadataExtractor::new(xhtml), &());
     let t1 = Instant::now();
     let style_data = extract_style_data(xhtml)?;
     let t2 = Instant::now();
@@ -589,43 +594,13 @@ fn fallback_font(font_class_name: &str) -> FontClass {
 }
 
 // ============================================================================
-// Metadata extraction (regex, stable)
+// Metadata extraction
 // ============================================================================
-
-/// Extract enhanced metadata from <meta> tags.
-fn extract_enhanced_metadata(xhtml: &str) -> Result<DocumentMetadata> {
-    let mut metadata = DocumentMetadata::default();
-
-    for cap in META_REGEX.captures_iter(xhtml) {
-        if let (Some(name), Some(content)) = (cap.get(1), cap.get(2)) {
-            let name_str = name.as_str();
-            let content_str = content.as_str().to_string();
-
-            match name_str {
-                "dc:title" => metadata.title = Some(content_str),
-                "dc:creator" => metadata.author = Some(content_str),
-                "dc:language" => metadata.language = Some(content_str),
-                "xmp:dc:publisher" | "dc:publisher" => metadata.publisher = Some(content_str),
-                "xmp:CreatorTool" => metadata.creator_tool = Some(content_str),
-                "pdf:producer" => metadata.producer = Some(content_str),
-                "pdf:PDFVersion" => metadata.pdf_version = Some(content_str),
-                "dcterms:created" => metadata.created = Some(content_str),
-                "dcterms:modified" => metadata.modified = Some(content_str),
-                "dc:description" => metadata.description = Some(content_str),
-                "pdf:encrypted" => metadata.encrypted = Some(content_str == "true"),
-                "pdf:hasMarkedContent" => metadata.has_marked_content = Some(content_str == "true"),
-                "xmpTPg:NPages" => {
-                    if let Ok(pages) = content_str.parse::<u32>() {
-                        metadata.page_count = pages;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(metadata)
-}
+//
+// The flat `extract_enhanced_metadata` from pre-CR-57 was replaced by
+// `crate::preprocessors::pdf::metadata::PdfMetadataExtractor` — the
+// trait-driven extractor that lives next to the trait it implements.
+// `parse_xhtml` (above) drives that extractor directly.
 
 // ============================================================================
 // Style data extraction (regex, stable)

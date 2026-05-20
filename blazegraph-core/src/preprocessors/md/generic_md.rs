@@ -482,8 +482,10 @@ mod tests {
         let metadata = &graph.document_info.document_metadata;
         assert_eq!(metadata.title.as_deref(), Some("From Frontmatter"));
         assert_eq!(metadata.author.as_deref(), Some("Marcus"));
-        assert_eq!(metadata.date.as_deref(), Some("2026-05-12"));
-        assert_eq!(metadata.tags, vec!["rust".to_string(), "b6".to_string()]);
+        // `date` migrates to canonical `created` (CR-57 / design doc § Notes on `created`).
+        assert_eq!(metadata.created.as_deref(), Some("2026-05-12"));
+        let md_ns = metadata.md.as_ref().expect("md namespace populated");
+        assert_eq!(md_ns.tags, vec!["rust".to_string(), "b6".to_string()]);
     }
 
     #[test]

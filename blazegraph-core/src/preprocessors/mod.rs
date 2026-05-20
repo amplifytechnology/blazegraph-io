@@ -23,7 +23,9 @@
 //! - (Future) `MarkdownPreprocessor` - Markdown files
 //! - (Future) `DocxPreprocessor` - Word documents
 
+pub mod docx;
 pub mod md;
+pub mod metadata;
 pub mod pdf;
 pub mod traits;
 

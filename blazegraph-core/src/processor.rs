@@ -327,14 +327,20 @@ impl DocumentProcessor {
         // Stage 4: SemanticTreeElement → DocumentGraph
         let mut graph = self.graph_builder.build_graph(semantic_elements)?;
 
-        // Wire metadata and compute post-processing
-        if let Some(title) = inferred_title {
-            graph.document_info.document_metadata.title = Some(title);
+        // Wire metadata and compute post-processing. CR-57: each channel
+        // now writes a complete DocumentMetadata in its extractor — direct
+        // assignment replaces the old merge_extracted semantic.
+        graph.document_info.document_metadata = preprocessor_output.metadata;
+        // Body-side title inference is honored only when source-native
+        // extraction returned None. F-02 (title-cleanup) is deferred to
+        // the composition layer per `09-metadata-first-class.md`; the
+        // existing PDF pipeline still relies on the inferred fallback
+        // so we preserve it explicitly until the composition layer lands.
+        if graph.document_info.document_metadata.title.is_none() {
+            if let Some(title) = inferred_title {
+                graph.document_info.document_metadata.title = Some(title);
+            }
         }
-        graph
-            .document_info
-            .document_metadata
-            .merge_extracted(preprocessor_output.metadata);
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
@@ -488,14 +494,18 @@ impl DocumentProcessor {
             )
         })?;
 
-        // Post-processing: metadata, analysis, breadcrumbs
-        if let Some(title) = inferred_title {
-            graph.document_info.document_metadata.title = Some(title);
+        // Post-processing: metadata, analysis, breadcrumbs. CR-57: direct
+        // assignment replaces the old merge_extracted call (each channel
+        // now writes a complete DocumentMetadata in its extractor).
+        graph.document_info.document_metadata = preprocessor_output.metadata.clone();
+        // Body-side title inference is honored only when source-native
+        // extraction returned None — see the entry-point analog above
+        // for the F-02 deferral rationale.
+        if graph.document_info.document_metadata.title.is_none() {
+            if let Some(title) = inferred_title {
+                graph.document_info.document_metadata.title = Some(title);
+            }
         }
-        graph
-            .document_info
-            .document_metadata
-            .merge_extracted(preprocessor_output.metadata.clone());
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data.clone();
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();

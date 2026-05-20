@@ -83,13 +83,18 @@ pub fn emit_markdown(graph: &DocumentGraph) -> String {
 }
 
 /// Emit YAML frontmatter from `DocumentMetadata` when there's content
-/// to carry. Returns `None` when all canonical fields are unset and
-/// `extras` is empty (so we don't write an empty `---\n---\n` block).
+/// to carry. Returns `None` when all canonical fields are unset and the
+/// `md` namespace's flat fields + `extras` are empty (so we don't write
+/// an empty `---\n---\n` block).
 ///
 /// Field order: `title`, `author`, `date`, `description`, `draft`,
-/// `tags`, then `extras` in sorted-key order. Order is stable so the
-/// emitter is byte-deterministic and round-trips cleanly through the
-/// frontmatter pre-pass.
+/// `tags`, `categories`, then `md.extras` in sorted-key order. Order is
+/// stable so the emitter is byte-deterministic and round-trips cleanly
+/// through the frontmatter pre-pass.
+///
+/// CR-57: `date` is sourced from canonical `metadata.created`;
+/// `draft` / `tags` / `categories` / extras are sourced from
+/// `metadata.md`.
 fn emit_frontmatter(metadata: &DocumentMetadata) -> Option<String> {
     if !has_frontmatter_content(metadata) {
         return None;
@@ -98,49 +103,71 @@ fn emit_frontmatter(metadata: &DocumentMetadata) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     lines.push("---".to_string());
 
-    // Order convention: title, author, date, description, tags,
-    // draft, then extras. Matches what humans typically write at the
-    // top of a markdown file (identifying fields first; the boolean
-    // flag last). Stable order makes round-trip byte-identical on
-    // common inputs.
     if let Some(ref title) = metadata.title {
         lines.push(emit_scalar_field("title", title));
     }
     if let Some(ref author) = metadata.author {
         lines.push(emit_scalar_field("author", author));
     }
-    if let Some(ref date) = metadata.date {
-        lines.push(emit_scalar_field("date", date));
+    // `date` in MD frontmatter is the canonical `created` slot
+    // (per `09-metadata-first-class.md` § Notes on `created`). Round-trip
+    // semantics: parse → canonical `created` → emit `date`.
+    if let Some(ref created) = metadata.created {
+        lines.push(emit_scalar_field("date", created));
     }
     if let Some(ref description) = metadata.description {
         lines.push(emit_scalar_field("description", description));
     }
-    if !metadata.tags.is_empty() {
-        lines.push(emit_tags(&metadata.tags));
+    if let Some(md_ns) = metadata.md.as_ref() {
+        if !md_ns.tags.is_empty() {
+            lines.push(emit_tags(&md_ns.tags));
+        }
+        if let Some(draft) = md_ns.draft {
+            lines.push(format!("draft: {draft}"));
+        }
+        if !md_ns.categories.is_empty() {
+            lines.push(emit_categories(&md_ns.categories));
+        }
+        emit_extras(&md_ns.extras, &mut lines);
     }
-    if let Some(draft) = metadata.draft {
-        lines.push(format!("draft: {draft}"));
-    }
-
-    // Extras in sorted-key order (BTreeMap iteration is already
-    // sorted). YAML scalar / array / object emission via
-    // serde_yaml-compatible JSON — `serde_json::Value` is a strict
-    // superset of YAML scalars, so a one-line JSON-style emission is
-    // a valid YAML flow representation.
-    emit_extras(&metadata.extras, &mut lines);
 
     lines.push("---".to_string());
     Some(lines.join("\n"))
 }
 
 fn has_frontmatter_content(metadata: &DocumentMetadata) -> bool {
-    metadata.title.is_some()
+    if metadata.title.is_some()
         || metadata.author.is_some()
-        || metadata.date.is_some()
+        || metadata.created.is_some()
         || metadata.description.is_some()
-        || metadata.draft.is_some()
-        || !metadata.tags.is_empty()
-        || !metadata.extras.is_empty()
+    {
+        return true;
+    }
+    if let Some(md_ns) = metadata.md.as_ref() {
+        if md_ns.draft.is_some()
+            || !md_ns.tags.is_empty()
+            || !md_ns.categories.is_empty()
+            || !md_ns.extras.is_empty()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn emit_categories(categories: &[String]) -> String {
+    let items: Vec<String> = categories
+        .iter()
+        .map(|c| {
+            if needs_yaml_quoting(c) {
+                let escaped = c.replace('\\', r"\\").replace('"', r#"\""#);
+                format!("\"{escaped}\"")
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    format!("categories: [{}]", items.join(", "))
 }
 
 /// Emit one YAML scalar field. If the value needs quoting (contains
@@ -363,7 +390,11 @@ mod tests {
         let mut graph = build_graph(vec![("Section", "Hi", 1, 0)]);
         graph.document_info.document_metadata.title = Some("Test Doc".to_string());
         graph.document_info.document_metadata.author = Some("Marcus".to_string());
-        graph.document_info.document_metadata.tags = vec!["rust".to_string(), "b6".to_string()];
+        // Strong-convention `tags` lives under the `md` namespace post-CR-57.
+        graph.document_info.document_metadata.md = Some(MdMetadata {
+            tags: vec!["rust".to_string(), "b6".to_string()],
+            ..Default::default()
+        });
         let md = emit_markdown(&graph);
         assert!(
             md.starts_with("---\n"),
@@ -424,16 +455,15 @@ mod tests {
     #[test]
     fn emit_extras_pass_through_in_sorted_order() {
         let mut graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
-        graph
-            .document_info
-            .document_metadata
+        // `extras` lives under the md namespace post-CR-57.
+        let mut md_ns = MdMetadata::default();
+        md_ns
             .extras
             .insert("zeta".to_string(), serde_json::Value::String("z".into()));
-        graph
-            .document_info
-            .document_metadata
+        md_ns
             .extras
             .insert("alpha".to_string(), serde_json::Value::Number(7.into()));
+        graph.document_info.document_metadata.md = Some(md_ns);
         let md = emit_markdown(&graph);
         // BTreeMap iteration → alphabetical: alpha before zeta.
         let alpha_pos = md.find("alpha: 7").expect("alpha emitted");

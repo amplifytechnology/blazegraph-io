@@ -4,6 +4,7 @@
 //! PDF content to Blazegraph XHTML, then parses into PreprocessorOutput.
 
 pub mod backends;
+pub mod metadata;
 pub mod semantic_tree_projection;
 pub mod xhtml_parser;
 
