@@ -70,14 +70,22 @@ fn project_element_type(input: &ParsedElementType) -> SemanticElementType {
 /// channel-agnostic `StyleInfo` (alias for `StyleMetadata`). Lossless on
 /// the fields the downstream consumer (`DocumentNode.style_info`)
 /// historically populates: font_family, font_size, is_bold, is_italic,
-/// color, font_class.
+/// foreground_color, font_class.
+///
+/// CR-45: `foreground_color` is sourced from Tika's CSS `color:` (which
+/// is the foreground per CSS spec). `background_color` stays `None` here
+/// — Tika's current `FontClass` regex captures `color:` only and we
+/// don't see `background-color:` on the CSS spans across the corpus. The
+/// `None` is the honest answer; DT-03 covers why we project verbatim
+/// rather than synthesize.
 fn project_style(parsed: &ParsedPdfElement) -> StyleInfo {
     let font = &parsed.style_info;
     StyleInfo {
         font_class: font.class_name.clone(),
         font_size: Some(font.font_size),
         font_family: Some(font.font_family.clone()),
-        color: Some(font.color.clone()),
+        foreground_color: Some(font.color.clone()),
+        background_color: None,
         is_bold: font.font_weight.to_lowercase().contains("bold"),
         is_italic: font.font_style.to_lowercase().contains("italic"),
     }
@@ -164,7 +172,11 @@ mod tests {
         assert_eq!(style.font_class, "f1");
         assert_eq!(style.font_size, Some(12.0));
         assert_eq!(style.font_family.as_deref(), Some("LiberationSerif"));
-        assert_eq!(style.color.as_deref(), Some("#112233"));
+        assert_eq!(style.foreground_color.as_deref(), Some("#112233"));
+        assert_eq!(
+            style.background_color, None,
+            "background_color stays None — Tika CSS regex captures color only (CR-45)",
+        );
         assert!(style.is_bold);
         assert!(style.is_italic);
     }

@@ -111,10 +111,12 @@ struct ParseArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Include style_info on each node (font_class, font_size, font_family, bold, italic, color).
-    /// Stripped by default to reduce output size (~20%). PDF channel only.
+    /// Strip style_info from each node's output (~20% smaller files). By
+    /// default, style is emitted as first-class metadata (CR-45:
+    /// foreground_color, background_color, font_family, font_size, is_bold,
+    /// is_italic, font_class). PDF channel only.
     #[arg(long)]
-    include_style_info: bool,
+    strip_style_info: bool,
 
     /// Dump all intermediate pipeline stage outputs to a directory.
     /// Captures: XHTML, TextElements, ParsedElements, and final Graph as separate files.
@@ -425,8 +427,10 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
             println!("✅ Successfully processed document");
             println!("📊 Graph: {} nodes", graph.nodes.len());
 
-            // Strip style_info from output unless explicitly requested
-            if !args.include_style_info {
+            // Style is emitted as first-class metadata by default
+            // (CR-45). Opt out via --strip-style-info for the ~20%
+            // smaller output.
+            if args.strip_style_info {
                 for node in graph.nodes.values_mut() {
                     node.style_info = None;
                 }
@@ -510,9 +514,12 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
     let mut graph = result.graph;
     println!("📊 Graph: {} nodes", graph.nodes.len());
 
-    if !args.include_style_info {
-        // bgraph.md v1.0.0 doesn't carry style_info, but the toggle
-        // is symmetric with the PDF path — keep behavior consistent.
+    if args.strip_style_info {
+        // CR-45: v2.1.0+ bgraph.md carries `style` first-class on PDF-
+        // source per-element fences; markdown-source inputs leave it as
+        // None. The toggle stays symmetric with the PDF path so the
+        // bgraph.md -> graph.json conversion respects the strip flag
+        // when round-tripping a PDF-source bgraph.md.
         for node in graph.nodes.values_mut() {
             node.style_info = None;
         }

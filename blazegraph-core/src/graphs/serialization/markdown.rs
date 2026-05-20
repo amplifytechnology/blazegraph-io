@@ -204,6 +204,15 @@ fn node_metadata_json(node: &DocumentNode) -> String {
         location: &'a NodeLocation,
         text_order: &'a Option<u32>,
         token_count: usize,
+        /// CR-45: verbatim Tika style projection (foreground / background
+        /// color, font_family, font_size, is_bold, is_italic, font_class).
+        /// `skip_serializing_if = Option::is_none` keeps the JSON tight
+        /// for nodes that carry no style (MD-source nodes; header /
+        /// footer / margin nodes where Tika often loses font info).
+        /// Shape is verbatim Tika projection — see DT-03 for why this is
+        /// the right shape now.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        style: &'a Option<StyleMetadata>,
     }
     let meta = NodeMetadata {
         id: &node.id,
@@ -211,6 +220,7 @@ fn node_metadata_json(node: &DocumentNode) -> String {
         location: &node.location,
         text_order: &node.text_order,
         token_count: node.token_count,
+        style: &node.style_info,
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
 }

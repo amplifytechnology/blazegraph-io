@@ -355,7 +355,17 @@ pub struct StyleMetadata {
     pub is_bold: bool,
     pub is_italic: bool,
     pub font_family: Option<String>,
-    pub color: Option<String>, // CSS color value (e.g., "#FF0000" or "rgb(255,0,0)")
+    /// CSS foreground color value (e.g., "#FF0000" or "rgb(255,0,0)").
+    /// Renamed from `color` in CR-45 — this field has always been the
+    /// foreground color; the rename clarifies that against the new
+    /// `background_color` slot.
+    pub foreground_color: Option<String>,
+    /// CSS background color value (e.g., "#FFFFFF" or "rgb(255,255,255)").
+    /// PDF channel: populated only when Tika surfaces `background-color` on
+    /// the wrapping element. Most body-text spans have no explicit
+    /// background, so `None` is the dominant case — see DT-03 for why we
+    /// project verbatim rather than synthesize.
+    pub background_color: Option<String>,
 }
 
 /// Channel-agnostic style information attached to `SemanticTreeElement`.

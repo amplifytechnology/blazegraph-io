@@ -223,9 +223,11 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
             hierarchy_level,
             text_order: p.metadata.text_order,
             physical_location: p.metadata.location.physical.clone(),
-            // v1.0.0 spec does not carry per-element style — CR-45 will
-            // amend in v1.1 once style projection is restored.
-            style: None,
+            // CR-45 (v2.1.0+): per-element `style` is a first-class field
+            // in the bgraph fence's JSON. The graph builder copies
+            // `element.style` onto `DocumentNode.style_info`, restoring
+            // round-trip identity for PDF-source graphs that carry style.
+            style: p.metadata.style.clone(),
             token_count: p.metadata.token_count,
         });
     }
@@ -487,6 +489,11 @@ struct DocLevelSource {
 /// Per-element JSON metadata as serialized by the B2 emitter.
 /// Mirrors the inner shape of `DocumentNode` minus the
 /// content/parent/children fields the spec excludes.
+///
+/// **Symmetry invariant (CR-57 AAR).** The field set here MUST stay in
+/// lockstep with the emitter-side `NodeMetadata` struct in
+/// `crate::graphs::serialization::markdown::node_metadata_json`. Round-trip
+/// tests catch divergence; the two structs are the load-bearing pair.
 #[derive(Debug, Clone, Deserialize)]
 struct NodeMetadata {
     /// Used at parse time inside a `#[cfg(debug_assertions)]` block to
@@ -500,6 +507,13 @@ struct NodeMetadata {
     location: NodeLocation,
     text_order: u32,
     token_count: usize,
+    /// CR-45: per-element verbatim Tika style projection. `#[serde(default)]`
+    /// makes the field tolerant of fixtures / hand-edited inputs that
+    /// omit it (forward-compat with the spec's "tolerate absent optional
+    /// fields" rule). Threaded into `SemanticTreeElement.style` so the
+    /// graph builder repopulates `DocumentNode.style_info`.
+    #[serde(default)]
+    style: Option<StyleMetadata>,
 }
 
 /// A single parsed bgraph element — the body text plus its decoded
