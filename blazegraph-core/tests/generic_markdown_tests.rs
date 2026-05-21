@@ -77,7 +77,6 @@ fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph
                 text_order: *text_order,
                 physical_location: None,
                 style: None,
-                message_metadata: None,
                 token_count: text.split_whitespace().count(),
             }
         })

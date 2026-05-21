@@ -132,30 +132,25 @@ pub struct SourceIdentity {
     pub stable_id: Option<String>,
 }
 
-/// Variant-specific metadata for `Message` content nodes. Bgraph.md
-/// v2.1.0+ (CR-49). The first instance of V-2 (variant-specific metadata
-/// extensions) in practice — see
-/// `docs/P2/core/architecture/10-variant-content-metadata-contract.md`
-/// § Future: Message.
+/// Orphan struct reserved for the future stream-topology design slice.
 ///
-/// Carrier choice: an optional sibling field on `DocumentNode` (parallel
-/// to `style_info`). `None` for non-Message nodes; populated for Message
-/// nodes. Emitter and parser pair the field with `skip_serializing_if =
-/// Option::is_none` so it appears in the per-element JSON only on Message
-/// nodes.
+/// CR-49 introduced this as the variant-specific metadata carrier for
+/// `SemanticElementType::Message` on the shared `DocumentNode` /
+/// `SemanticTreeElement` shapes. CR-59 retracted the wire format and
+/// removed the field — the struct survives only as a placeholder for
+/// the future stream-topology pipeline.
+///
+/// The shape (`speaker: Option<String>`, `timestamp: Option<String>`,
+/// `turn_number: Option<u32>`) is provisional — the real stream-topology
+/// design will likely promote `speaker` to a richer `{role, identifier?}`
+/// object, and may add fields not anticipated here. Treat this as a
+/// placeholder, not a contract.
+///
+/// Not constructed anywhere in v2.1.0.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageMetadata {
-    /// Speaker role + optional identifier. `role` is one of `"human"`,
-    /// `"assistant"`, `"system"`, `"tool"` by convention; not enforced at
-    /// the schema layer (the schema permits any string so future channels
-    /// can extend without a bump).
     pub speaker: Option<String>,
-
-    /// ISO-8601 UTC timestamp the message was produced / captured.
     pub timestamp: Option<String>,
-
-    /// 0-based position in the conversation sequence. By convention
-    /// `text_order == turn_number` for stream-topology packs.
     pub turn_number: Option<u32>,
 }
 
@@ -291,12 +286,6 @@ pub struct DocumentNode {
     pub content: NodeContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style_info: Option<StyleMetadata>,
-    /// Variant-specific metadata for `Message` nodes (speaker, timestamp,
-    /// turn_number). `None` for every other variant — the field is
-    /// emitted only on Message nodes via the `skip_serializing_if` rule
-    /// on the bgraph.md per-element JSON. Bgraph.md v2.1.0+ (CR-49).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_metadata: Option<MessageMetadata>,
     pub token_count: usize,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
@@ -319,7 +308,6 @@ impl DocumentNode {
             text_order: Some(0),
             content: NodeContent::new(text),
             style_info: None,
-            message_metadata: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
@@ -342,7 +330,6 @@ impl DocumentNode {
             text_order: Some(0),
             content: NodeContent::new(text),
             style_info: None,
-            message_metadata: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
@@ -950,13 +937,6 @@ pub struct SemanticTreeElement {
     /// may not be final — channels populate as best-effort or `None`.
     pub style: Option<StyleInfo>,
 
-    /// Variant-specific metadata for `Message` elements
-    /// (bgraph.md v2.1.0+ / CR-49). `None` on every other variant —
-    /// the channel projection sets this only for stream-topology
-    /// Message nodes. Threaded through `GraphBuilder` onto
-    /// `DocumentNode.message_metadata` to survive round-trip.
-    pub message_metadata: Option<MessageMetadata>,
-
     /// Pre-computed token count.
     pub token_count: usize,
 }
@@ -990,10 +970,22 @@ pub enum SemanticElementType {
     List,
     Blockquote,
     Table,
-    // Bgraph.md v2.1.0+ (CR-49): stream-topology content node. Produced
-    // by conversation-ingestion preprocessors; carries variant-specific
-    // metadata (speaker, timestamp, turn_number) via
-    // `DocumentNode.message_metadata`.
+    /// Orphan variant reserved for the future stream-topology design slice.
+    ///
+    /// CR-49 added the variant + wire-format support; CR-59 retracted the
+    /// wire format (the variant had no in-memory production path —
+    /// PDF and generic-MD are both tree-topology channels and never emit
+    /// Message nodes — and the field-on-shared-types coupling forced
+    /// tree-topology code to know about it). The variant survives as a
+    /// sentinel marking the intended future shape: a separate
+    /// stream-topology pipeline that will live alongside (not inside)
+    /// the current tree-topology code path, with its own emitter, parser,
+    /// and carrier type.
+    ///
+    /// Do not add a `Message` arm to any tree-topology code path. The
+    /// builder maps it to `"Message"` only so `match` exhaustiveness
+    /// compiles; emitter / parser have no arm for it (and reject it at
+    /// the wire-format boundary).
     Message,
 }
 /// Complete output from document preprocessing

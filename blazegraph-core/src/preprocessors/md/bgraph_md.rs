@@ -156,8 +156,7 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                     | "bgraph-code-block"
                     | "bgraph-list"
                     | "bgraph-block-quote"
-                    | "bgraph-table"
-                    | "bgraph-message" => {
+                    | "bgraph-table" => {
                         // v2.1.0+ single convention: body-outside for
                         // every content variant (including H/F/M; CR-48
                         // / Amendment H) and kebab-case for multi-word
@@ -218,24 +217,6 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
             SemanticElementType::Section => p.metadata.location.semantic.depth,
             _ => p.metadata.location.semantic.depth,
         };
-        // CR-49 (v2.1.0+): reassemble Message-variant-specific fields
-        // from the flat per-element JSON into a `MessageMetadata` struct.
-        // Only Message nodes carry these fields in practice; for every
-        // other variant the three parser-side slots stay `None` and this
-        // collapses to `message_metadata = None` via the all-None check
-        // below.
-        let message_metadata = match (
-            &p.metadata.speaker,
-            &p.metadata.timestamp,
-            p.metadata.turn_number,
-        ) {
-            (None, None, None) => None,
-            (speaker, timestamp, turn_number) => Some(MessageMetadata {
-                speaker: speaker.clone(),
-                timestamp: timestamp.clone(),
-                turn_number,
-            }),
-        };
         semantic_elements.push(SemanticTreeElement {
             text: p.body.clone(),
             element_type,
@@ -246,8 +227,10 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
             // in the bgraph fence's JSON. The graph builder copies
             // `element.style` onto `DocumentNode.style_info`, restoring
             // round-trip identity for PDF-source graphs that carry style.
+            // CR-59 (v2.1.0+): emission is gated by
+            // `EmitOptions::include_style_info`; the parser still tolerates
+            // the field on inputs that carry it.
             style: p.metadata.style.clone(),
-            message_metadata,
             token_count: p.metadata.token_count,
         });
     }
@@ -420,6 +403,11 @@ fn scan_segments(input: &str) -> Result<Vec<Segment>, ParseError> {
 /// ` ```bgraph* ` line-start is rejected by the caller as a
 /// reserved-prefix violation.
 ///
+/// CR-59 retracted `bgraph-message` (added by CR-49); the variant has
+/// no in-memory carrier in tree-topology code paths. Inputs containing
+/// `bgraph-message` now fall through to the reserved-prefix-violation
+/// path.
+///
 /// Visible at `pub(super)` so the sibling [`super::strip`] module can
 /// reuse the same fence-recognition rules without re-implementing them.
 pub(super) fn bgraph_fence_open_tag(line: &str) -> Option<String> {
@@ -436,7 +424,6 @@ pub(super) fn bgraph_fence_open_tag(line: &str) -> Option<String> {
         || info == "bgraph-list"
         || info == "bgraph-block-quote"
         || info == "bgraph-table"
-        || info == "bgraph-message"
     {
         Some(info.to_string())
     } else if let Some(rest) = info.strip_prefix("bgraph") {
@@ -548,22 +535,11 @@ struct NodeMetadata {
     /// makes the field tolerant of fixtures / hand-edited inputs that
     /// omit it (forward-compat with the spec's "tolerate absent optional
     /// fields" rule). Threaded into `SemanticTreeElement.style` so the
-    /// graph builder repopulates `DocumentNode.style_info`.
+    /// graph builder repopulates `DocumentNode.style_info`. CR-59 gated
+    /// the emitter side; the parser stays tolerant of both shapes
+    /// (with-style and without-style).
     #[serde(default)]
     style: Option<StyleMetadata>,
-    /// CR-49 (v2.1.0+): Message-variant-specific metadata, flat at the
-    /// top level of the per-element JSON. Each field defaults to `None`
-    /// — non-Message nodes never carry them, and Message nodes that
-    /// happen to omit one tolerate the absence. The trio is reassembled
-    /// into `MessageMetadata` after parse and routed onto
-    /// `SemanticTreeElement.message_metadata` → `DocumentNode.message_metadata`
-    /// via the GraphBuilder.
-    #[serde(default)]
-    speaker: Option<String>,
-    #[serde(default)]
-    timestamp: Option<String>,
-    #[serde(default)]
-    turn_number: Option<u32>,
 }
 
 /// A single parsed bgraph element — the body text plus its decoded
@@ -622,6 +598,11 @@ fn validate_schema(schema: &str) -> Result<(), ParseError> {
 }
 
 /// Map a wire-format `node_type` string to its `SemanticElementType`.
+///
+/// CR-59 removed the `"Message"` arm along with the rest of the v2.1.0
+/// Message wire-format support. The enum variant survives in `types.rs`
+/// as an orphan sentinel but has no parser path; inputs containing
+/// `"node_type": "Message"` are rejected as `UnknownNodeType`.
 fn map_node_type_to_semantic(s: &str) -> Result<SemanticElementType, ParseError> {
     match s {
         "Section" => Ok(SemanticElementType::Section),
@@ -634,8 +615,6 @@ fn map_node_type_to_semantic(s: &str) -> Result<SemanticElementType, ParseError>
         "List" => Ok(SemanticElementType::List),
         "Blockquote" => Ok(SemanticElementType::Blockquote),
         "Table" => Ok(SemanticElementType::Table),
-        // CR-49 (v2.1.0+): stream-topology content variant.
-        "Message" => Ok(SemanticElementType::Message),
         other => Err(ParseError::UnknownNodeType(other.to_string())),
     }
 }
@@ -683,8 +662,6 @@ mod tests {
                     "List" => SemanticElementType::List,
                     "Blockquote" => SemanticElementType::Blockquote,
                     "Table" => SemanticElementType::Table,
-                    // CR-49 (v2.1.0+).
-                    "Message" => SemanticElementType::Message,
                     other => panic!("unsupported test node type {other:?}"),
                 };
                 SemanticTreeElement {
@@ -694,7 +671,6 @@ mod tests {
                     text_order: *text_order,
                     physical_location: None,
                     style: None,
-                    message_metadata: None,
                     token_count: text.split_whitespace().count(),
                 }
             })
@@ -1197,64 +1173,31 @@ mod tests {
         assert_eq!(md1, md2, "second emit must be byte-identical to the first");
     }
 
-    #[test]
-    fn parse_message_variant_round_trip_byte_identity() {
-        // Round-trip a Message variant carrying speaker / timestamp /
-        // turn_number. emit → parse → re-emit is byte-identical and
-        // canonical-equal.
-        let mut original = build_synthetic_graph(
-            vec![("Message", "Hi there!", 1, 0)],
-            Some("Conversation"),
-            None,
-        );
-        original.document_info.topology = Some("stream".to_string());
-        // Attach Message-variant metadata directly on the reconstructed
-        // node — the synthetic-builder helper doesn't carry it through.
-        let msg_id = original
-            .nodes
-            .values()
-            .find(|n| n.node_type == "Message")
-            .map(|n| n.id)
-            .expect("Message node present");
-        original.nodes.get_mut(&msg_id).unwrap().message_metadata = Some(MessageMetadata {
-            speaker: Some("human".to_string()),
-            timestamp: Some("2026-05-20T14:30:00Z".to_string()),
-            turn_number: Some(0),
-        });
-        let md1 = emit_markdown(&original);
-        let result = parse(&md1, ParseOptions::default()).expect("Message round-trips");
-        assert!(matches!(result.identity, ParseIdentity::Verified));
-        let msg = result
-            .graph
-            .nodes
-            .values()
-            .find(|n| n.node_type == "Message")
-            .expect("parsed Message present");
-        assert_eq!(msg.content.text, "Hi there!");
-        let mm = msg.message_metadata.as_ref().expect("message_metadata");
-        assert_eq!(mm.speaker.as_deref(), Some("human"));
-        assert_eq!(mm.timestamp.as_deref(), Some("2026-05-20T14:30:00Z"));
-        assert_eq!(mm.turn_number, Some(0));
-        let md2 = emit_markdown(&result.graph);
-        assert_eq!(md1, md2, "Message round-trip must be byte-identical");
-        assert_eq!(canonical(&result.graph), canonical(&original));
-    }
+    // CR-59 removed `parse_message_variant_round_trip_byte_identity` and
+    // `parse_bgraph_message_variant_tag` along with the wire-format
+    // support for the Message variant. See `types.rs` for the orphan
+    // sentinel that survives.
 
     #[test]
-    fn parse_bgraph_message_variant_tag() {
-        // Variant-tag dispatch: `bgraph-message` parses to
-        // SemanticElementType::Message. The fence open recognizer must
-        // accept the tag, the dispatch arm must route it, and the
-        // node_type → semantic-type map must produce Message.
-        assert_eq!(
-            bgraph_fence_open_tag("```bgraph-message").as_deref(),
-            Some("bgraph-message"),
-            "bgraph-message must be recognized as a v2.1.0+ fence tag"
+    fn parse_rejects_bgraph_message_fence_post_cr59() {
+        // CR-59 retracted `bgraph-message`. A synthetic v2.1.0 fixture
+        // carrying the tag must be rejected at parse time. The fence-tag
+        // recognizer now classifies `bgraph-message` as a reserved-prefix
+        // violation (returns Some("bgraph-message") so the caller sees it
+        // as a fence, but the dispatch arm in `parse` no longer accepts
+        // it and falls through to MalformedFence).
+        let base = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
+        let md = emit_markdown(&base);
+        // Splice a `bgraph-message` fence into a synthetic shape. Use a
+        // hand-built fence with the minimum JSON the parser would have
+        // tried to dispatch on.
+        let injected = format!(
+            "{md}Hello.\n```bgraph-message\n{{\"id\":\"00000000-0000-0000-0000-000000000000\",\"node_type\":\"Message\",\"location\":{{\"semantic\":{{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":1,\"token_count\":1}}\n```\n"
         );
-        assert_eq!(
-            map_node_type_to_semantic("Message")
-                .expect("Message resolves to a semantic type"),
-            SemanticElementType::Message
+        let result = parse(&injected, ParseOptions::default());
+        assert!(
+            matches!(result, Err(ParseError::MalformedFence(_))),
+            "bgraph-message must be rejected post-CR-59; got {result:?}"
         );
     }
 

@@ -111,12 +111,16 @@ struct ParseArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Strip style_info from each node's output (~20% smaller files). By
-    /// default, style is emitted as first-class metadata (CR-45:
-    /// foreground_color, background_color, font_family, font_size, is_bold,
-    /// is_italic, font_class). PDF channel only.
+    /// Include `style` on every per-element fence in the emitted bgraph.md
+    /// (verbatim Tika projection — `foreground_color`, `background_color`,
+    /// `font_family`, `font_size`, `is_bold`, `is_italic`, `font_class`).
+    /// CR-59 reverted the default to opt-in: by default the wire-format
+    /// emitter omits `style` (the in-memory `node.style_info` is still
+    /// populated for library consumers). Pass this flag to round-trip a
+    /// PDF-source graph with style preserved in the emitted bgraph.md.
+    /// PDF channel only.
     #[arg(long)]
-    strip_style_info: bool,
+    include_style_info: bool,
 
     /// Dump all intermediate pipeline stage outputs to a directory.
     /// Captures: XHTML, TextElements, ParsedElements, and final Graph as separate files.
@@ -423,21 +427,16 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
         &cache_defaults,
         args.profile,
     ) {
-        Ok(mut graph) => {
+        Ok(graph) => {
             println!("✅ Successfully processed document");
             println!("📊 Graph: {} nodes", graph.nodes.len());
 
-            // Style is emitted as first-class metadata by default
-            // (CR-45). Opt out via --strip-style-info for the ~20%
-            // smaller output.
-            if args.strip_style_info {
-                for node in graph.nodes.values_mut() {
-                    node.style_info = None;
-                }
-            }
-
+            // CR-59 (v2.1.0+): style emission is opt-in. The pipeline
+            // always populates `node.style_info` for library consumers;
+            // only the bgraph.md serializer gates emission, threaded
+            // through `save_graph` → `EmitOptions::include_style_info`.
             let output_path = resolve_output_path(&args);
-            save_graph(&graph, &output_path, &args.output_format)?;
+            save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
 
             // Fast exit - skip JVM shutdown sequence
             #[cfg(feature = "jni-backend")]
@@ -511,22 +510,14 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
         }
     }
 
-    let mut graph = result.graph;
+    let graph = result.graph;
     println!("📊 Graph: {} nodes", graph.nodes.len());
 
-    if args.strip_style_info {
-        // CR-45: v2.1.0+ bgraph.md carries `style` first-class on PDF-
-        // source per-element fences; markdown-source inputs leave it as
-        // None. The toggle stays symmetric with the PDF path so the
-        // bgraph.md -> graph.json conversion respects the strip flag
-        // when round-tripping a PDF-source bgraph.md.
-        for node in graph.nodes.values_mut() {
-            node.style_info = None;
-        }
-    }
-
+    // CR-59 (v2.1.0+): style emission is opt-in. Pipeline keeps
+    // `node.style_info` populated for library consumers; the bgraph.md
+    // serializer is gated via `EmitOptions::include_style_info`.
     let output_path = resolve_output_path(&args);
-    save_graph(&graph, &output_path, &args.output_format)?;
+    save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
     Ok(())
 }
 
@@ -886,7 +877,12 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<()> {
+fn save_graph(
+    graph: &DocumentGraph,
+    output_path: &str,
+    format: &str,
+    include_style_info: bool,
+) -> Result<()> {
     match format {
         // B6: `-f markdown` is the generic-markdown emitter.
         // `-f bgraph-md` (new) is the bgraph.md round-trip artifact
@@ -917,7 +913,18 @@ fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<
             println!("💾 Markdown saved to: {}", output_path);
         }
         "bgraph-md" => {
-            let md = blazegraph_io_core::graphs::serialization::markdown::emit_markdown(graph);
+            // CR-59 (v2.1.0+): the bgraph.md emitter takes an explicit
+            // options struct; the CLI threads `--include-style-info`
+            // through. Other output formats don't carry style on the
+            // wire (graph.json carries it via `DocumentNode.style_info`
+            // directly; generic markdown has no per-element JSON).
+            let opts = blazegraph_io_core::graphs::serialization::markdown::EmitOptions {
+                include_style_info,
+            };
+            let md =
+                blazegraph_io_core::graphs::serialization::markdown::emit_markdown_with_options(
+                    graph, opts,
+                );
             std::fs::write(output_path, md)?;
             println!("💾 bgraph.md saved to: {}", output_path);
         }
@@ -1004,7 +1011,6 @@ mod tests {
                         text: nt.to_string(),
                     },
                     style_info: None,
-                    message_metadata: None,
                     token_count: 1,
                     parent: Some(root_id),
                     children: Vec::new(),
@@ -1029,7 +1035,6 @@ mod tests {
                     text: "Document".to_string(),
                 },
                 style_info: None,
-                message_metadata: None,
                 token_count: 0,
                 parent: None,
                 children: child_ids,

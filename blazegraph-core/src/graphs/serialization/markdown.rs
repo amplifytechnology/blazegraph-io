@@ -5,15 +5,43 @@
 //! `schema` field is sourced from
 //! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`].
 //!
-//! Public surface: [`emit_markdown`]. Everything else is private.
+//! Public surface: [`emit_markdown`] (default options) and
+//! [`emit_markdown_with_options`] (opt-in flags). Everything else is
+//! private.
 
 use super::canonical;
 use crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION;
 use crate::types::*;
 use serde::Serialize;
 
+/// Emitter options. Defaults are the wire-format default — anything
+/// gated behind a flag is opt-in.
+///
+/// CR-59 (v2.1.0+): `include_style_info` gates whether the per-element
+/// JSON carries the `style` field. CR-45 introduced the field but
+/// shipped with a default of "always emit"; CR-59 reverted the default
+/// to opt-in because the 178-line-per-Shannon bloat outweighed the
+/// debug-readability benefit. The in-memory pipeline still populates
+/// `DocumentNode.style_info` regardless — library consumers of the
+/// `Graph` data structure see style on every PDF-source body node. Only
+/// the bgraph.md serializer gates on the flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmitOptions {
+    /// When `true`, the per-element JSON carries the `style` field for
+    /// every node whose `style_info` is `Some(...)`. When `false`
+    /// (default), the `style` field is omitted unconditionally. Round-
+    /// trip identity holds in both modes; the parser tolerates either
+    /// shape on input.
+    pub include_style_info: bool,
+}
+
 /// Emit a `DocumentGraph` to bgraph.md format. Targets the current
-/// [`BGRAPH_MD_FORMAT_VERSION`].
+/// [`BGRAPH_MD_FORMAT_VERSION`]. Uses [`EmitOptions::default()`] — the
+/// wire-format default (no opt-in flags set).
+///
+/// For PDF-source graphs whose emitted bgraph.md should carry `style`
+/// on every per-element fence, call [`emit_markdown_with_options`] with
+/// `EmitOptions { include_style_info: true }`.
 ///
 /// # Panics
 ///
@@ -24,6 +52,16 @@ use serde::Serialize;
 /// is incompatible with round-trip identity and must not reach this
 /// emitter.
 pub fn emit_markdown(graph: &DocumentGraph) -> String {
+    emit_markdown_with_options(graph, EmitOptions::default())
+}
+
+/// Emit a `DocumentGraph` to bgraph.md format with explicit options. See
+/// [`EmitOptions`] for the available flags.
+///
+/// # Panics
+///
+/// Same panic contract as [`emit_markdown`].
+pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> String {
     let provenance = graph.document_info.parse_provenance.as_ref().expect(
         "emit_markdown requires graph.document_info.parse_provenance; \
          build the graph via GraphBuilder::build_graph_deterministic with provenance",
@@ -61,7 +99,7 @@ pub fn emit_markdown(graph: &DocumentGraph) -> String {
     nodes.sort_by_key(|n| n.text_order.expect("filtered above"));
 
     for node in nodes {
-        if let Some(chunk) = emit_node(node) {
+        if let Some(chunk) = emit_node(node, opts) {
             parts.push(chunk);
             parts.push(String::new()); // blank line between elements
         }
@@ -161,8 +199,8 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 /// Fence-tag derivation goes through [`node_type_to_fence_tag`] so
 /// multi-word variants get kebab-case per CR-56 § I.5 / F-11
 /// (`CodeBlock` → `bgraph-code-block`, `Blockquote` → `bgraph-block-quote`).
-fn emit_node(node: &DocumentNode) -> Option<String> {
-    let meta = node_metadata_json(node);
+fn emit_node(node: &DocumentNode, opts: EmitOptions) -> Option<String> {
+    let meta = node_metadata_json(node, opts);
     let text = &node.content.text;
     if node.node_type == "Document" {
         return None; // synthetic root; not a content node
@@ -195,9 +233,11 @@ fn node_type_to_fence_tag(node_type: &str) -> &'static str {
         "List" => "list",
         "Blockquote" => "block-quote", // F-11 (v2.1.0+; was: blockquote)
         "Table" => "table",
-        // CR-49 (v2.1.0+): stream-topology content variant.
-        // Single-word — F-11 kebab-case rule doesn't apply.
-        "Message" => "message",
+        // CR-59 (v2.1.0+): the `Message` variant was added by CR-49 as a
+        // wire-format precursor to the future stream-topology design slice
+        // but had no in-memory carrier path in tree-topology channels.
+        // Retracted — `SemanticElementType::Message` survives as an orphan
+        // sentinel only; no fence tag, no production path.
         other => panic!(
             "emit_markdown (bgraph.md): variant '{other}' has no fence-tag mapping; \
              schema added a variant without a corresponding spec amendment + emitter \
@@ -212,7 +252,7 @@ fn node_type_to_fence_tag(node_type: &str) -> &'static str {
 /// `content.text` (lives in markdown body or inside fence) and
 /// `parent`/`children` (derivable from heading structure on reverse
 /// parse).
-fn node_metadata_json(node: &DocumentNode) -> String {
+fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
     #[derive(Serialize)]
     struct NodeMetadata<'a> {
         id: &'a NodeId,
@@ -222,30 +262,23 @@ fn node_metadata_json(node: &DocumentNode) -> String {
         token_count: usize,
         /// CR-45: verbatim Tika style projection (foreground / background
         /// color, font_family, font_size, is_bold, is_italic, font_class).
-        /// `skip_serializing_if = Option::is_none` keeps the JSON tight
-        /// for nodes that carry no style (MD-source nodes; header /
-        /// footer / margin nodes where Tika often loses font info).
-        /// Shape is verbatim Tika projection — see DT-03 for why this is
-        /// the right shape now.
+        /// CR-59 (v2.1.0+): gated on `EmitOptions::include_style_info`. When
+        /// the flag is `false` (default), this slot is always `None` so
+        /// `skip_serializing_if` omits the field entirely — regardless of
+        /// whether `node.style_info` is populated. The in-memory carrier
+        /// (`DocumentNode.style_info`) stays populated for library
+        /// consumers; only the wire-format emission is gated. Shape is
+        /// verbatim Tika projection — see DT-03.
         #[serde(skip_serializing_if = "Option::is_none")]
-        style: &'a Option<StyleMetadata>,
-        /// CR-49 (v2.1.0+): Message-variant-specific metadata fields,
-        /// flat at the top level of the per-element JSON. Each field is
-        /// populated only for Message nodes (sourced from
-        /// `node.message_metadata`); `skip_serializing_if` keeps them
-        /// absent on every other variant. This is the first instance of
-        /// V-2 (variant-specific metadata extension) in practice —
-        /// see 10-variant-content-metadata-contract.md § Future: Message.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        speaker: Option<&'a String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        timestamp: Option<&'a String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        turn_number: Option<u32>,
+        style: Option<&'a StyleMetadata>,
     }
-    let (speaker, timestamp, turn_number) = match &node.message_metadata {
-        Some(mm) => (mm.speaker.as_ref(), mm.timestamp.as_ref(), mm.turn_number),
-        None => (None, None, None),
+    // CR-59: style emission is opt-in. When the flag is off we pass
+    // `None` regardless of `node.style_info`; `skip_serializing_if`
+    // then drops the field.
+    let style = if opts.include_style_info {
+        node.style_info.as_ref()
+    } else {
+        None
     };
     let meta = NodeMetadata {
         id: &node.id,
@@ -253,10 +286,7 @@ fn node_metadata_json(node: &DocumentNode) -> String {
         location: &node.location,
         text_order: &node.text_order,
         token_count: node.token_count,
-        style: &node.style_info,
-        speaker,
-        timestamp,
-        turn_number,
+        style,
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
 }
@@ -315,7 +345,6 @@ mod tests {
                         text: text.to_string(),
                     },
                     style_info: None,
-                    message_metadata: None,
                     token_count: 1,
                     parent: Some(root_id),
                     children: Vec::new(),
@@ -341,7 +370,6 @@ mod tests {
                     text: "Document".to_string(),
                 },
                 style_info: None,
-                message_metadata: None,
                 token_count: 0,
                 parent: None,
                 children: child_ids,
@@ -1029,67 +1057,87 @@ mod tests {
         );
     }
 
+    // CR-59 removed `emit_message_node_body_outside_with_variant_metadata`
+    // and `non_message_variant_does_not_carry_message_fields` along with
+    // the wire-format support for the Message variant. The orphan enum
+    // variant + struct remain in `types.rs` as future-design sentinels.
+
+    // ===================================================================
+    // CR-59 (v2.1.0+) emit tests: style emit-gating.
+    // ===================================================================
+
     #[test]
-    fn emit_message_node_body_outside_with_variant_metadata() {
-        // Message variant: body precedes the fence (same as Paragraph);
-        // fence tag is `bgraph-message`; per-element JSON carries the
-        // variant-specific speaker / timestamp / turn_number fields.
-        let mut graph = build_graph(vec![("Message", "Hello, world.", 1, 0)]);
-        graph.document_info.topology = Some("stream".to_string());
-        // Find the Message node and attach Message-variant-specific
-        // metadata.
-        let msg_id = graph
+    fn style_omitted_by_default_even_when_node_carries_it() {
+        // Build a graph and populate `style_info` on its single
+        // Paragraph node. With default `EmitOptions` the emitter must
+        // omit `style` from the per-element JSON regardless.
+        let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
+        let para_id = graph
             .nodes
             .values()
-            .find(|n| n.node_type == "Message")
+            .find(|n| n.node_type == "Paragraph")
             .map(|n| n.id)
-            .expect("Message node present");
-        graph.nodes.get_mut(&msg_id).unwrap().message_metadata = Some(MessageMetadata {
-            speaker: Some("human".to_string()),
-            timestamp: Some("2026-05-20T14:30:00Z".to_string()),
-            turn_number: Some(0),
+            .expect("Paragraph node present");
+        graph.nodes.get_mut(&para_id).unwrap().style_info = Some(StyleMetadata {
+            font_class: "f1".to_string(),
+            font_size: Some(10.0),
+            is_bold: false,
+            is_italic: false,
+            font_family: Some("Helvetica".to_string()),
+            foreground_color: Some("#000000".to_string()),
+            background_color: None,
         });
         let md = emit_markdown(&graph);
         assert!(
-            md.contains("Hello, world.\n```bgraph-message\n"),
-            "Message body should precede the bgraph-message fence; got:\n{md}"
+            !md.contains("\"style\""),
+            "default EmitOptions must omit `style` even when node.style_info is Some; got:\n{md}"
         );
-        // Per-element JSON carries the variant fields.
-        let start = md.find("```bgraph-message\n").unwrap() + "```bgraph-message\n".len();
-        let end = md[start..].find("\n```").expect("fence close") + start;
-        let json_line = &md[start..end];
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_line).expect("Message JSON parses");
-        assert_eq!(parsed["node_type"].as_str(), Some("Message"));
-        assert_eq!(parsed["speaker"].as_str(), Some("human"));
-        assert_eq!(parsed["timestamp"].as_str(), Some("2026-05-20T14:30:00Z"));
-        assert_eq!(parsed["turn_number"].as_u64(), Some(0));
     }
 
     #[test]
-    fn non_message_variant_does_not_carry_message_fields() {
-        // Variant isolation: a Paragraph (or any non-Message variant)
-        // must NOT carry speaker / timestamp / turn_number even if its
-        // message_metadata slot is somehow populated. The
-        // skip_serializing_if rule keeps the JSON clean on every
-        // variant; this test guards the property explicitly.
+    fn style_emitted_when_include_flag_set_and_node_carries_it() {
+        let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
+        let para_id = graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Paragraph")
+            .map(|n| n.id)
+            .expect("Paragraph node present");
+        graph.nodes.get_mut(&para_id).unwrap().style_info = Some(StyleMetadata {
+            font_class: "f1".to_string(),
+            font_size: Some(10.0),
+            is_bold: false,
+            is_italic: false,
+            font_family: Some("Helvetica".to_string()),
+            foreground_color: Some("#000000".to_string()),
+            background_color: None,
+        });
+        let md = emit_markdown_with_options(
+            &graph,
+            EmitOptions {
+                include_style_info: true,
+            },
+        );
+        assert!(
+            md.contains("\"style\":{"),
+            "include_style_info=true must emit `style` when node.style_info is Some; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn style_omitted_when_include_flag_set_but_node_lacks_it() {
+        // skip_serializing_if=Option::is_none still applies: when the
+        // node has no style, the field is absent even with the flag on.
         let graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
-        let md = emit_markdown(&graph);
-        let start = md.find("```bgraph-paragraph\n").unwrap()
-            + "```bgraph-paragraph\n".len();
-        let end = md[start..].find("\n```").expect("fence close") + start;
-        let json_line = &md[start..end];
-        assert!(
-            !json_line.contains("\"speaker\""),
-            "non-Message variant must not carry speaker field; got: {json_line}"
+        let md = emit_markdown_with_options(
+            &graph,
+            EmitOptions {
+                include_style_info: true,
+            },
         );
         assert!(
-            !json_line.contains("\"timestamp\""),
-            "non-Message variant must not carry timestamp field; got: {json_line}"
-        );
-        assert!(
-            !json_line.contains("\"turn_number\""),
-            "non-Message variant must not carry turn_number field; got: {json_line}"
+            !md.contains("\"style\""),
+            "with-flag emit must still omit `style` when node.style_info is None; got:\n{md}"
         );
     }
 

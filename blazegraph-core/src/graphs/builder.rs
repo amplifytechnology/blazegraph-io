@@ -70,7 +70,6 @@ impl GraphBuilder {
                 text: "Document".to_string(),
             },
             style_info: None,
-            message_metadata: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
@@ -171,7 +170,6 @@ impl GraphBuilder {
                 text: "Document".to_string(),
             },
             style_info: None,
-            message_metadata: None,
             token_count: 0,
             parent: None,
             children: Vec::new(),
@@ -270,7 +268,6 @@ impl GraphBuilder {
         node.text_order = Some(order);
         node.token_count = element.token_count;
         node.style_info = element.style.clone();
-        node.message_metadata = element.message_metadata.clone();
         node
     }
 
@@ -282,7 +279,6 @@ impl GraphBuilder {
         node.text_order = Some(order);
         node.token_count = element.token_count;
         node.style_info = element.style.clone();
-        node.message_metadata = element.message_metadata.clone();
         node
     }
 }
@@ -302,7 +298,16 @@ pub fn node_type_for(t: SemanticElementType) -> &'static str {
         SemanticElementType::List => "List",
         SemanticElementType::Blockquote => "Blockquote",
         SemanticElementType::Table => "Table",
-        // Bgraph.md v2.1.0+ (CR-49): stream-topology content variant.
-        SemanticElementType::Message => "Message",
+        // CR-59: `Message` is an orphan variant with no in-memory
+        // production path (see `SemanticElementType::Message` doc
+        // comment). Reaching this arm means some new code path
+        // constructed a Message element on the shared tree-topology
+        // type — that's the regression the orphan-sentinel design
+        // guards against. Panic loudly so it's caught immediately.
+        SemanticElementType::Message => panic!(
+            "SemanticElementType::Message is an orphan variant with no \
+             tree-topology production path; see types.rs for the future \
+             stream-topology design slice."
+        ),
     }
 }
