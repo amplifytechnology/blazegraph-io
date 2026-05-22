@@ -21,8 +21,6 @@ impl DocumentGraph {
             bookmark_data: None,
             parse_provenance: None,
             topology: None,
-            source_identity: None,
-            supersedes: None,
         };
 
         Self {
@@ -43,8 +41,6 @@ impl DocumentGraph {
             bookmark_data: None,
             parse_provenance: None,
             topology: None,
-            source_identity: None,
-            supersedes: None,
         };
 
         Self {

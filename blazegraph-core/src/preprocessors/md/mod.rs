@@ -195,8 +195,6 @@ mod tests {
                     config_hash: "def".to_string(),
                 }),
                 topology: None,
-                source_identity: None,
-                supersedes: None,
             },
             structural_profile: StructuralProfile::default(),
         };

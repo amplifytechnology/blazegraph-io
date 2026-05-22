@@ -153,16 +153,14 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
         source: DocLevelSource<'a>,
         flow_type: &'a FlowType,
         // title removed — moved to bgraph-metadata (CR-56 § I.4)
-        // CR-49 (v2.1.0+): three optional lineage / topology fields.
-        // Position: after flow_type, before config_hash. Each skipped from
-        // the emitted JSON when None so v2.1.0 graphs without the fields
-        // serialize byte-identical to the pre-CR-49 shape.
+        // CR-49 (v2.1.0+) added `topology` here.
+        // CR-60 (2026-05-22) retracted `source_identity` + `supersedes`
+        // per the byte-in/byte-out principle (arch doc 11 + DT-04).
+        // `topology` stays — parser-known (channel decides) + immutable.
+        // Skipped when None so v2.1.0 graphs without the field serialize
+        // byte-identical to the pre-CR-49 shape.
         #[serde(skip_serializing_if = "Option::is_none")]
         topology: &'a Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        source_identity: &'a Option<SourceIdentity>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        supersedes: &'a Option<String>,
         config_hash: &'a str,
         graph_sha256: String,
     }
@@ -177,8 +175,6 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
         },
         flow_type: &graph.structural_profile.flow_type,
         topology: &graph.document_info.topology,
-        source_identity: &graph.document_info.source_identity,
-        supersedes: &graph.document_info.supersedes,
         config_hash: &provenance.config_hash,
         graph_sha256: canonical::graph_sha256(graph),
     };
@@ -393,8 +389,6 @@ mod tests {
                     config_hash: "cafef00d".to_string(),
                 }),
                 topology: None,
-                source_identity: None,
-                supersedes: None,
             },
             structural_profile: StructuralProfile::default(),
         }
@@ -994,39 +988,27 @@ mod tests {
     }
 
     // ===================================================================
-    // CR-49 (v2.1.0+) emit tests: topology / source_identity / supersedes
-    // doc-level fields + Message variant.
+    // CR-49 (v2.1.0+) emit tests: topology doc-level field.
+    // CR-60 (2026-05-22) retracted source_identity + supersedes per
+    // arch doc 11 + DT-04 (byte-in/byte-out). Only topology remains.
     // ===================================================================
 
     #[test]
-    fn doc_level_block_omits_cr49_fields_when_unset() {
-        // Default-built graph: no topology / source_identity / supersedes.
-        // The skip_serializing_if rule must keep them out of the JSON.
+    fn doc_level_block_omits_topology_when_unset() {
+        // Default-built graph: no topology.
+        // The skip_serializing_if rule must keep it out of the JSON.
         let graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
         let md = emit_markdown(&graph);
         assert!(
             !md.contains("\"topology\""),
             "topology must be skipped when None; got:\n{md}"
         );
-        assert!(
-            !md.contains("\"source_identity\""),
-            "source_identity must be skipped when None; got:\n{md}"
-        );
-        assert!(
-            !md.contains("\"supersedes\""),
-            "supersedes must be skipped when None; got:\n{md}"
-        );
     }
 
     #[test]
-    fn doc_level_block_emits_cr49_fields_when_set() {
+    fn doc_level_block_emits_topology_when_set() {
         let mut graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
         graph.document_info.topology = Some("stream".to_string());
-        graph.document_info.source_identity = Some(SourceIdentity {
-            path: Some("/notes/foo.md".to_string()),
-            stable_id: Some("conv-123".to_string()),
-        });
-        graph.document_info.supersedes = Some("urd:addr:prior".to_string());
         let md = emit_markdown(&graph);
         // Extract the first JSON line (doc-level block).
         let first_line_end = md.find('\n').expect("multi-line output");
@@ -1036,15 +1018,6 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(json_line).expect("doc-level JSON parses");
         assert_eq!(parsed["topology"].as_str(), Some("stream"));
-        assert_eq!(
-            parsed["source_identity"]["path"].as_str(),
-            Some("/notes/foo.md")
-        );
-        assert_eq!(
-            parsed["source_identity"]["stable_id"].as_str(),
-            Some("conv-123")
-        );
-        assert_eq!(parsed["supersedes"].as_str(), Some("urd:addr:prior"));
         // CR-49 position contract: after flow_type, before config_hash.
         let topology_pos = json_line.find("\"topology\"").expect("topology present");
         let flow_pos = json_line.find("\"flow_type\"").expect("flow_type present");

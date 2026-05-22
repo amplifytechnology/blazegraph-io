@@ -87,49 +87,13 @@ pub struct DocumentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
 
-    /// Logical-identity namespace for lineage tracking. Bgraph.md v2.1.0+
-    /// (CR-49). Distinct from `source.sha256` (byte-identity): this carries
-    /// stable identifiers (filesystem path, application-assigned stable ID)
-    /// that survive content edits.
-    ///
-    /// - Tree, curated artifacts (PDFs): typically absent (`None`).
-    /// - Tree, mutable files (notes): `path` SHOULD be populated;
-    ///   `stable_id` SHOULD be populated when the source format supports it
-    ///   (e.g., markdown frontmatter `id:` field).
-    /// - Stream (conversations): `stable_id` MUST carry the conversation_id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_identity: Option<SourceIdentity>,
-
-    /// URD address of the prior revision of this logical artifact.
-    /// Bgraph.md v2.1.0+ (CR-49). 1:1 chain pointer — leave absent to model
-    /// DAG-style forks (lineage links in URD's link drawer enumerate
-    /// siblings via `source.sha256` when `supersedes` is absent).
-    ///
-    /// Use cases: note re-emit, re-emit under newer blazegraph, replacing
-    /// config.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supersedes: Option<String>,
-}
-
-/// Lineage-identity namespace carried on `DocumentInfo`. Bgraph.md v2.1.0+
-/// (CR-49). All sub-fields optional; emit any subset.
-///
-/// `content_hash` is **not** stored here — it would be a redundant copy of
-/// `source.sha256`. Consumers reading content-hash lineage read it from
-/// `source.sha256` directly.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SourceIdentity {
-    /// Absolute filesystem path of the source artifact. Stable until
-    /// rename. Populate for mutable files (notes, drafts); usually `None`
-    /// for curated artifacts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-
-    /// Application- or user-assigned stable ID. For notes: markdown
-    /// frontmatter `id:` field. For conversations: the conversation_id.
-    /// Forever-stable when assigned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stable_id: Option<String>,
+    // CR-60 (2026-05-22) retracted `source_identity` and `supersedes`
+    // here per the byte-in/byte-out schema-boundary principle
+    // (`docs/P2/core/architecture/11-byte-in-byte-out.md`,
+    //  `docs/P2/core/deliberate-tradeoffs/DT-04-byte-in-byte-out-schema-boundary.md`).
+    // Filesystem paths and URD addresses are stateful concepts owned by
+    // the storage-layer adapter (URD), not the stateless parser.
+    // `topology` stays — it's parser-known (channel decides) + immutable.
 }
 
 /// Orphan struct reserved for the future stream-topology design slice.

@@ -264,11 +264,11 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     // which is the honest "no extracted metadata" answer.
     graph.document_info.document_metadata = document_metadata;
     graph.document_info.bookmark_data = bookmarks;
-    // CR-49 (v2.1.0+): three optional doc-level lineage / topology fields.
+    // CR-49 (v2.1.0+) added `topology` here.
+    // CR-60 (2026-05-22) retracted `source_identity` + `supersedes`
+    // per the byte-in/byte-out principle (arch doc 11 + DT-04).
     // Absent in the source bgraph.md → `None` on the reconstructed graph.
     graph.document_info.topology = doc_level.topology.clone();
-    graph.document_info.source_identity = doc_level.source_identity.clone();
-    graph.document_info.supersedes = doc_level.supersedes.clone();
     graph.structural_profile.flow_type = doc_level.flow_type.clone();
 
     // Canonical post-build sequence (mirrors processor.rs:501-502).
@@ -483,10 +483,14 @@ fn collapse_free_buffer(lines: &[&str]) -> String {
 /// fixture's stray `title` field doesn't break parsing — it's just
 /// ignored. The metadata fence is the canonical title source under v2.1.0.
 ///
-/// CR-49 (v2.1.0+): three optional lineage / topology fields
-/// (`topology`, `source_identity`, `supersedes`). `#[serde(default)]` so
-/// absence parses to `None` — v2.1.0 graphs without these fields stay
-/// fully accepted.
+/// CR-49 (v2.1.0+) added `topology` here.
+/// CR-60 (2026-05-22) retracted `source_identity` + `supersedes` per the
+/// byte-in/byte-out principle (arch doc 11 + DT-04). `#[serde(default)]`
+/// on `topology` so absence parses to `None` — v2.1.0 graphs without it
+/// stay fully accepted. Pre-CR-60 v2.1.0 inputs that still carry
+/// `source_identity` or `supersedes` are silently ignored (default serde
+/// behavior; `deny_unknown_fields` not set, consistent with the wider
+/// forward-compat posture in this struct).
 #[derive(Debug, Clone, Deserialize)]
 struct DocLevelBlock {
     schema: String,
@@ -495,10 +499,6 @@ struct DocLevelBlock {
     flow_type: FlowType,
     #[serde(default)]
     topology: Option<String>,
-    #[serde(default)]
-    source_identity: Option<SourceIdentity>,
-    #[serde(default)]
-    supersedes: Option<String>,
     config_hash: String,
     graph_sha256: String,
 }
@@ -1143,31 +1143,25 @@ mod tests {
     }
 
     // ----- CR-49 (v2.1.0+) parse tests --------------------------------
+    // CR-60 (2026-05-22) retracted source_identity + supersedes per
+    // arch doc 11 + DT-04 (byte-in/byte-out). Only `topology` remains
+    // from the CR-49 doc-level additions; this test covers its round-trip.
 
     #[test]
-    fn parse_doc_level_topology_source_identity_supersedes_round_trip() {
-        // Round-trip a doc-level block carrying all three CR-49 fields.
-        // The fields survive emit → parse → re-emit byte-for-byte.
+    fn parse_doc_level_topology_round_trip() {
+        // Round-trip a doc-level block carrying `topology`.
+        // The field survives emit → parse → re-emit byte-for-byte.
         let mut original = build_synthetic_graph(
             vec![("Paragraph", "Body.", 1, 0)],
-            Some("Lineage Test"),
+            Some("Topology Test"),
             None,
         );
         original.document_info.topology = Some("stream".to_string());
-        original.document_info.source_identity = Some(SourceIdentity {
-            path: Some("/notes/abc.md".to_string()),
-            stable_id: Some("conv-xyz".to_string()),
-        });
-        original.document_info.supersedes = Some("urd:bgraph:prior".to_string());
         let md1 = emit_markdown(&original);
         let result = parse(&md1, ParseOptions::default()).expect("round-trips");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         let info = &result.graph.document_info;
         assert_eq!(info.topology.as_deref(), Some("stream"));
-        let si = info.source_identity.as_ref().expect("source_identity");
-        assert_eq!(si.path.as_deref(), Some("/notes/abc.md"));
-        assert_eq!(si.stable_id.as_deref(), Some("conv-xyz"));
-        assert_eq!(info.supersedes.as_deref(), Some("urd:bgraph:prior"));
         // Second emit must be byte-identical to the first.
         let md2 = emit_markdown(&result.graph);
         assert_eq!(md1, md2, "second emit must be byte-identical to the first");
@@ -1202,16 +1196,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_doc_level_cr49_fields_absent_yields_none() {
-        // A bgraph.md without the CR-49 fields parses cleanly; the
-        // reconstructed graph carries `None` for each.
+    fn parse_doc_level_topology_absent_yields_none() {
+        // A bgraph.md without `topology` parses cleanly; the
+        // reconstructed graph carries `None`.
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
         let md = emit_markdown(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let info = &result.graph.document_info;
         assert!(info.topology.is_none());
-        assert!(info.source_identity.is_none());
-        assert!(info.supersedes.is_none());
     }
 
     #[test]

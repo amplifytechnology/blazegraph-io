@@ -357,8 +357,6 @@ mod tests {
                 bookmark_data: None,
                 parse_provenance: None, // generic emitter doesn't need provenance
                 topology: None,
-                source_identity: None,
-                supersedes: None,
             },
             structural_profile: StructuralProfile::default(),
         }

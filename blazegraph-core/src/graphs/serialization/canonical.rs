@@ -182,8 +182,6 @@ mod tests {
                     config_hash: format!("{seed}-cfg"),
                 }),
                 topology: None,
-                source_identity: None,
-                supersedes: None,
             },
             structural_profile: StructuralProfile::default(),
         }
