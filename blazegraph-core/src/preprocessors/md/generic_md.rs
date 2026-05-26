@@ -63,6 +63,16 @@ use sha2::{Digest, Sha256};
 use super::frontmatter::extract_frontmatter;
 use super::types::{ParseError, ParseIdentity, ParseOptions, ParseResult};
 
+/// Active inline-collection context. Set when we enter a top-level
+/// Heading or Paragraph; cleared on matching End. Used to gate the
+/// inline-event-to-buffer accumulation that builds C-7b canonical-form
+/// text (v2.2.0+ / CR-61).
+#[derive(Debug)]
+enum InlineMode {
+    Heading(HeadingLevel),
+    Paragraph,
+}
+
 /// Parse a plain markdown string (no bgraph fences) into a
 /// `DocumentGraph`.
 ///
@@ -93,12 +103,22 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
 
     // We only act on **top-level** blocks. Nesting depth tracks how
     // many `Tag::*` Start events are currently open; we collect text
-    // for Section headings inside a `Heading` start/end pair, and
-    // we slice the source range for other tags' Start event when
-    // we're at the top level.
+    // for Section headings and Paragraphs inside their Start/End pair
+    // (reconstructing inline content with C-7b canonical delimiters
+    // per CR-61 / v2.2.0+), and we slice the source range for other
+    // block-cluster tags' Start event when we're at the top level
+    // (CodeBlock / List / Blockquote / Table — literal /
+    // literal-with-markers domains per C-7a, source preserved verbatim).
     let mut nesting: u32 = 0;
-    let mut heading_text_buf = String::new();
-    let mut current_heading_level: Option<HeadingLevel> = None;
+    // Active inline-collection mode: None outside a top-level Heading
+    // / Paragraph; Some(...) while collecting inline events between
+    // their Start and End. Heading carries its level so we can
+    // assign the right depth on End.
+    let mut inline_mode: Option<InlineMode> = None;
+    let mut inline_buf = String::new();
+    // Stack of link destination URLs — needed because TagEnd::Link
+    // doesn't carry the URL; we record it on Start and consume on End.
+    let mut link_url_stack: Vec<String> = Vec::new();
     // Tracks the depth of the most recent Section we've emitted, so
     // non-Section leaves (Paragraph, CodeBlock, List, Blockquote,
     // Table) can carry a hierarchy_level that makes
@@ -109,40 +129,122 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
 
     for (event, range) in parser {
         match event {
-            // ---------- Section starts ----------
+            // ---------- Section / heading boundaries ----------
             Event::Start(Tag::Heading { level, .. }) => {
                 nesting += 1;
                 if nesting == 1 {
-                    // Top-level heading — start collecting heading
-                    // text from subsequent Text / Code / etc. events.
-                    current_heading_level = Some(level);
-                    heading_text_buf.clear();
+                    // Top-level heading — enter inline-collection mode.
+                    inline_mode = Some(InlineMode::Heading(level));
+                    inline_buf.clear();
                 }
             }
             Event::End(TagEnd::Heading(_)) => {
                 if nesting == 1 {
-                    // Close out the heading.
-                    let heading_text = std::mem::take(&mut heading_text_buf).trim().to_string();
-                    let level = current_heading_level
-                        .take()
-                        .expect("heading end without start (parser invariant)");
+                    let level = match inline_mode.take() {
+                        Some(InlineMode::Heading(l)) => l,
+                        _ => panic!("heading end without matching start (parser invariant)"),
+                    };
+                    let heading_text = std::mem::take(&mut inline_buf).trim().to_string();
                     let text_order = elements.len() as u32;
                     let depth = heading_level_to_depth(level);
-                    elements.push(SemanticTreeElement {
-                        text: heading_text.clone(),
-                        element_type: SemanticElementType::Section,
-                        hierarchy_level: depth,
-                        text_order,
-                        physical_location: None,
-                        style: None,
-                        token_count: estimate_token_count(&heading_text),
-                    });
+                    elements.push(
+                        SemanticTreeElement {
+                            text: heading_text.clone(),
+                            element_type: SemanticElementType::Section,
+                            hierarchy_level: depth,
+                            text_order,
+                            physical_location: None,
+                            style: None,
+                            token_count: estimate_token_count(&heading_text),
+                        }
+                        .validate(),
+                    );
                     current_section_depth = depth;
                 }
                 nesting -= 1;
             }
 
-            // ---------- Top-level non-heading blocks ----------
+            // ---------- Paragraph boundaries (now event-reconstructed) ----------
+            Event::Start(Tag::Paragraph) => {
+                if nesting == 0 {
+                    inline_mode = Some(InlineMode::Paragraph);
+                    inline_buf.clear();
+                }
+                nesting += 1;
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if nesting == 1 && matches!(inline_mode, Some(InlineMode::Paragraph)) {
+                    inline_mode = None;
+                    let para_text = std::mem::take(&mut inline_buf).trim().to_string();
+                    let text_order = elements.len() as u32;
+                    let leaf_level = current_section_depth + 1;
+                    elements.push(
+                        SemanticTreeElement {
+                            text: para_text.clone(),
+                            element_type: SemanticElementType::Paragraph,
+                            hierarchy_level: leaf_level,
+                            text_order,
+                            physical_location: None,
+                            style: None,
+                            token_count: estimate_token_count(&para_text),
+                        }
+                        .validate(),
+                    );
+                }
+                nesting = nesting.saturating_sub(1);
+            }
+
+            // ---------- Inline emphasis / code / link events ----------
+            // C-7b canonical delimiters: `*italic*` / `**bold**` /
+            // `` `code` `` / `[label](url)`. Source-side variant
+            // (`_italic_`, `__bold__`, `[label][ref]`) gets normalized
+            // on parse per C-7c — the pulldown-cmark event stream
+            // already resolved the source-side variant; we just emit
+            // the canonical form.
+            Event::Start(Tag::Emphasis) => {
+                if inline_mode.is_some() {
+                    inline_buf.push('*');
+                }
+                nesting += 1;
+            }
+            Event::End(TagEnd::Emphasis) => {
+                if inline_mode.is_some() {
+                    inline_buf.push('*');
+                }
+                nesting = nesting.saturating_sub(1);
+            }
+            Event::Start(Tag::Strong) => {
+                if inline_mode.is_some() {
+                    inline_buf.push_str("**");
+                }
+                nesting += 1;
+            }
+            Event::End(TagEnd::Strong) => {
+                if inline_mode.is_some() {
+                    inline_buf.push_str("**");
+                }
+                nesting = nesting.saturating_sub(1);
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                // Track URL for matched End event. Always push onto
+                // stack so nesting balance is preserved even if we're
+                // not in inline_mode (defensive — pulldown shouldn't
+                // emit Link outside a block, but cheaper to be safe).
+                link_url_stack.push(dest_url.to_string());
+                if inline_mode.is_some() {
+                    inline_buf.push('[');
+                }
+                nesting += 1;
+            }
+            Event::End(TagEnd::Link) => {
+                let url = link_url_stack.pop().unwrap_or_default();
+                if inline_mode.is_some() {
+                    inline_buf.push_str(&format!("]({url})"));
+                }
+                nesting = nesting.saturating_sub(1);
+            }
+
+            // ---------- Top-level non-heading non-paragraph blocks ----------
             Event::Start(tag) => {
                 if nesting == 0 {
                     if let Some(element_type) = project_top_level_tag(&tag) {
@@ -159,15 +261,18 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                         // any Section is seen, `current_section_depth = 0`
                         // and the leaf attaches to Document at depth 1.
                         let leaf_level = current_section_depth + 1;
-                        elements.push(SemanticTreeElement {
-                            text: source.clone(),
-                            element_type,
-                            hierarchy_level: leaf_level,
-                            text_order,
-                            physical_location: None,
-                            style: None,
-                            token_count: estimate_token_count(&source),
-                        });
+                        elements.push(
+                            SemanticTreeElement {
+                                text: source.clone(),
+                                element_type,
+                                hierarchy_level: leaf_level,
+                                text_order,
+                                physical_location: None,
+                                style: None,
+                                token_count: estimate_token_count(&source),
+                            }
+                            .validate(),
+                        );
                     }
                 }
                 nesting += 1;
@@ -176,22 +281,36 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                 nesting = nesting.saturating_sub(1);
             }
 
-            // ---------- Heading-text collection ----------
-            // Inside a top-level heading, capture text / code-span /
-            // softbreak content so we can build a clean `text` field.
+            // ---------- Inline content collection (text / code / breaks) ----------
+            // When inline_mode is Some, accumulate raw text / code-span
+            // content into inline_buf. Code spans wrap in backticks for
+            // C-7b canonical form (` `code` `).
             Event::Text(s) => {
-                if nesting == 1 && current_heading_level.is_some() {
-                    heading_text_buf.push_str(&s);
+                if inline_mode.is_some() {
+                    inline_buf.push_str(&s);
                 }
             }
             Event::Code(s) => {
-                if nesting == 1 && current_heading_level.is_some() {
-                    heading_text_buf.push_str(&s);
+                if inline_mode.is_some() {
+                    inline_buf.push('`');
+                    inline_buf.push_str(&s);
+                    inline_buf.push('`');
                 }
             }
-            Event::SoftBreak | Event::HardBreak => {
-                if nesting == 1 && current_heading_level.is_some() {
-                    heading_text_buf.push(' ');
+            Event::SoftBreak => {
+                if matches!(inline_mode, Some(InlineMode::Paragraph)) {
+                    // Paragraphs preserve soft-wrap as newline. Headings
+                    // collapse to space (a heading wrapping mid-line is
+                    // typographically a continuation, not a line break).
+                    inline_buf.push('\n');
+                } else if matches!(inline_mode, Some(InlineMode::Heading(_))) {
+                    inline_buf.push(' ');
+                }
+            }
+            Event::HardBreak => {
+                if inline_mode.is_some() {
+                    // CommonMark hard break = two-space + newline.
+                    inline_buf.push_str("  \n");
                 }
             }
 
@@ -205,15 +324,18 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                     let text_order = elements.len() as u32;
                     let source = slice_verbatim(body, range);
                     let leaf_level = current_section_depth + 1;
-                    elements.push(SemanticTreeElement {
-                        text: source.clone(),
-                        element_type: SemanticElementType::Paragraph,
-                        hierarchy_level: leaf_level,
-                        text_order,
-                        physical_location: None,
-                        style: None,
-                        token_count: estimate_token_count(&source),
-                    });
+                    elements.push(
+                        SemanticTreeElement {
+                            text: source.clone(),
+                            element_type: SemanticElementType::Paragraph,
+                            hierarchy_level: leaf_level,
+                            text_order,
+                            physical_location: None,
+                            style: None,
+                            token_count: estimate_token_count(&source),
+                        }
+                        .validate(),
+                    );
                 }
             }
             Event::Html(_html) => {
@@ -221,15 +343,18 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                     let text_order = elements.len() as u32;
                     let source = slice_verbatim(body, range);
                     let leaf_level = current_section_depth + 1;
-                    elements.push(SemanticTreeElement {
-                        text: source.clone(),
-                        element_type: SemanticElementType::Paragraph,
-                        hierarchy_level: leaf_level,
-                        text_order,
-                        physical_location: None,
-                        style: None,
-                        token_count: estimate_token_count(&source),
-                    });
+                    elements.push(
+                        SemanticTreeElement {
+                            text: source.clone(),
+                            element_type: SemanticElementType::Paragraph,
+                            hierarchy_level: leaf_level,
+                            text_order,
+                            physical_location: None,
+                            style: None,
+                            token_count: estimate_token_count(&source),
+                        }
+                        .validate(),
+                    );
                 }
             }
 
@@ -527,5 +652,138 @@ mod tests {
         // sha256 of "# Hi\n" — deterministic.
         let expected = sha256_hex(input.as_bytes());
         assert_eq!(prov.source_sha256, expected);
+    }
+
+    // ---------- CR-61 / v2.2.0+: C-7c canonical-form normalization ----------
+    //
+    // Paragraph + Section heading text is reconstructed from inline events
+    // with C-7b canonical delimiters. Non-canonical source forms get
+    // normalized on parse. Block-cluster types (CodeBlock / List /
+    // Blockquote / Table) preserve raw source verbatim per the
+    // literal / literal-with-markers domains in C-7a.
+
+    #[test]
+    fn paragraph_normalizes_underscore_italic_to_asterisk() {
+        let graph = parse_ok("Hello _italic_ world.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_type, "Paragraph");
+        assert_eq!(nodes[0].content.text, "Hello *italic* world.");
+    }
+
+    #[test]
+    fn paragraph_normalizes_double_underscore_bold_to_double_asterisk() {
+        let graph = parse_ok("Hello __bold__ world.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].content.text, "Hello **bold** world.");
+    }
+
+    #[test]
+    fn paragraph_preserves_already_canonical_asterisk_emphasis() {
+        let graph = parse_ok("Hello *italic* and **bold**.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes[0].content.text, "Hello *italic* and **bold**.");
+    }
+
+    #[test]
+    fn paragraph_preserves_inline_code_with_backticks() {
+        let graph = parse_ok("Use `foo` here.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes[0].content.text, "Use `foo` here.");
+    }
+
+    #[test]
+    fn paragraph_preserves_inline_link_in_canonical_form() {
+        let graph = parse_ok("See [docs](https://example.com/x) for details.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(
+            nodes[0].content.text,
+            "See [docs](https://example.com/x) for details."
+        );
+    }
+
+    #[test]
+    fn paragraph_normalizes_reference_link_to_inline_canonical() {
+        // Source uses reference-link syntax `[label][ref]` with a
+        // separate `[ref]: url` definition. Per C-7b, the canonical form
+        // in body text is `[label](url)`. pulldown-cmark resolves the
+        // reference's dest_url at parse time; the event-walk emits the
+        // resolved canonical form.
+        let graph = parse_ok("See [docs][d] for details.\n\n[d]: https://example.com/x\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(
+            nodes[0].content.text,
+            "See [docs](https://example.com/x) for details."
+        );
+    }
+
+    #[test]
+    fn heading_with_emphasis_normalizes_to_canonical_asterisk_form() {
+        // Section heading text picks up the same canonical-form rule —
+        // the inline-parser layer is the same as paragraphs per C-7b.
+        let graph = parse_ok("# Hello _italic_ world\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes[0].node_type, "Section");
+        assert_eq!(nodes[0].content.text, "Hello *italic* world");
+    }
+
+    #[test]
+    fn heading_with_inline_code_preserves_backticks() {
+        // Previously the heading event-walk dropped backticks on Code
+        // events (Section text became "Use foo here" for source
+        // "# Use `foo` here"). CR-61 fixes the incidental bug as part
+        // of canonical-form reconstruction.
+        let graph = parse_ok("# Use `foo` here\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes[0].content.text, "Use `foo` here");
+    }
+
+    #[test]
+    fn codeblock_preserves_double_underscore_verbatim() {
+        // CodeBlock body is in the literal domain (C-7a). The inline
+        // parser does not apply inside; `__init__` stays as literal
+        // underscores regardless of any emphasis-normalization rule.
+        let input = "```python\ndef __init__(self):\n    pass\n```\n";
+        let graph = parse_ok(input);
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_type, "CodeBlock");
+        assert!(
+            nodes[0].content.text.contains("__init__"),
+            "CodeBlock should preserve `__init__` verbatim; got: {:?}",
+            nodes[0].content.text,
+        );
+    }
+
+    #[test]
+    fn blockquote_preserves_underscore_emphasis_verbatim() {
+        // Blockquote body is literal-with-markers (C-7a). `>` markers
+        // AND inline emphasis sequences in the body are preserved as
+        // raw source — the inline parser doesn't normalize across the
+        // block-cluster boundary.
+        let graph = parse_ok("> This is _italic_-styled quotation.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes[0].node_type, "Blockquote");
+        assert!(
+            nodes[0].content.text.contains("_italic_"),
+            "Blockquote should preserve raw `_italic_` underscores; got: {:?}",
+            nodes[0].content.text,
+        );
+    }
+
+    #[test]
+    fn paragraph_combined_bold_italic_in_source_round_trips_canonical() {
+        // `***word***` in source = Strong containing Emphasis (or vice
+        // versa, depending on parse). Reconstructs to the same canonical
+        // form. Source `**_word_**` (mixed delimiters) also collapses
+        // to `***word***`.
+        let graph = parse_ok("This is **_combined_** styling.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(
+            nodes[0].content.text,
+            "This is ***combined*** styling.",
+            "Combined bold-italic should normalize to ***triple-asterisk*** form",
+        );
     }
 }

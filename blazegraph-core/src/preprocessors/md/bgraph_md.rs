@@ -217,22 +217,25 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
             SemanticElementType::Section => p.metadata.location.semantic.depth,
             _ => p.metadata.location.semantic.depth,
         };
-        semantic_elements.push(SemanticTreeElement {
-            text: p.body.clone(),
-            element_type,
-            hierarchy_level,
-            text_order: p.metadata.text_order,
-            physical_location: p.metadata.location.physical.clone(),
-            // CR-45 (v2.1.0+): per-element `style` is a first-class field
-            // in the bgraph fence's JSON. The graph builder copies
-            // `element.style` onto `DocumentNode.style_info`, restoring
-            // round-trip identity for PDF-source graphs that carry style.
-            // CR-59 (v2.1.0+): emission is gated by
-            // `EmitOptions::include_style_info`; the parser still tolerates
-            // the field on inputs that carry it.
-            style: p.metadata.style.clone(),
-            token_count: p.metadata.token_count,
-        });
+        semantic_elements.push(
+            SemanticTreeElement {
+                text: p.body.clone(),
+                element_type,
+                hierarchy_level,
+                text_order: p.metadata.text_order,
+                physical_location: p.metadata.location.physical.clone(),
+                // CR-45 (v2.1.0+): per-element `style` is a first-class field
+                // in the bgraph fence's JSON. The graph builder copies
+                // `element.style` onto `DocumentNode.style_info`, restoring
+                // round-trip identity for PDF-source graphs that carry style.
+                // CR-59 (v2.1.0+): emission is gated by
+                // `EmitOptions::include_style_info`; the parser still tolerates
+                // the field on inputs that carry it.
+                style: p.metadata.style.clone(),
+                token_count: p.metadata.token_count,
+            }
+            .validate(),
+        );
     }
 
     // NodeIdGenerator from doc-level provenance. CR-47 dropped

@@ -875,7 +875,10 @@ pub struct GraphAnalytics;
 /// projection-time vec position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticTreeElement {
-    /// The text content of this element.
+    /// The text content of this element. Must be non-empty (post-trim)
+    /// for any variant where `element_type.requires_non_empty_body()`
+    /// returns `true` — see [C-7a body-content domain in `08-bgraph-md-format.md`].
+    /// Construction sites enforce this via [`SemanticTreeElement::validate`].
     pub text: String,
 
     /// What kind of element this is.
@@ -903,6 +906,37 @@ pub struct SemanticTreeElement {
 
     /// Pre-computed token count.
     pub token_count: usize,
+}
+
+impl SemanticTreeElement {
+    /// Enforce C-7a empty-body validation (v2.2.0+ / CR-61). Panics if
+    /// the element type requires a non-empty body and `text` is empty
+    /// or whitespace-only after trim.
+    ///
+    /// Chain after struct-literal construction:
+    /// ```ignore
+    /// let element = SemanticTreeElement { text, element_type, ... }.validate();
+    /// ```
+    ///
+    /// Empty body at the channel-exit stage is a programming error in
+    /// the channel projection (the channel should not produce
+    /// empty-bodied elements for "body required" variants per C-7a).
+    /// The panic surfaces such bugs immediately at the point of
+    /// construction rather than letting them propagate downstream as
+    /// malformed bgraph.md output. Tests are the first-line catch;
+    /// the panic is the safety net (see CR-61 design dialogue).
+    pub fn validate(self) -> Self {
+        if self.element_type.requires_non_empty_body() && self.text.trim().is_empty() {
+            panic!(
+                "SemanticTreeElement::validate: {:?} requires a non-empty body per C-7a \
+                 (08-bgraph-md-format.md / CR-61), but got empty / whitespace-only `text`. \
+                 This is a channel-projection bug — fix the producer rather than relaxing \
+                 the validator.",
+                self.element_type,
+            );
+        }
+        self
+    }
 }
 
 /// Element kinds carried at the SemanticTreeElement boundary.
@@ -952,6 +986,50 @@ pub enum SemanticElementType {
     /// the wire-format boundary).
     Message,
 }
+
+impl SemanticElementType {
+    /// Whether body text for this element type is parsed as markdown-inline
+    /// content (per spec § C-7a body-content domain table, v2.2.0+ / CR-61).
+    ///
+    /// Returning `true` means the inline parser applies inside the body and
+    /// canonical inline projections (C-7b: `**bold**` / `*italic*` /
+    /// `` `code` `` / `[label](url)`) are the only allowed shapes. Returning
+    /// `false` means the body is either *literal* (CodeBlock — verbatim
+    /// source preserved, no inline parser) or *literal-with-markers* (List
+    /// / Blockquote / Table — verbatim source with block-level markers
+    /// preserved). The PDF channel-exit projection uses this to decide
+    /// whether to apply element-level emphasis wrapping; the empty-body
+    /// validator uses [`requires_non_empty_body`](Self::requires_non_empty_body)
+    /// instead, which is a separate axis.
+    ///
+    /// `Message` panics — it is the orphan sentinel (CR-59) and has no
+    /// wire-format domain.
+    pub fn body_is_markdown_inline(self) -> bool {
+        match self {
+            Self::Section
+            | Self::Paragraph
+            | Self::Header
+            | Self::Footer
+            | Self::Margin => true,
+            Self::CodeBlock | Self::List | Self::Blockquote | Self::Table => false,
+            Self::Message => panic!(
+                "SemanticElementType::Message::body_is_markdown_inline called — \
+                 Message is the orphan sentinel (CR-59); no wire-format domain. \
+                 Stream-topology code paths must not reach this function.",
+            ),
+        }
+    }
+
+    /// Whether the spec requires this element's body to be non-empty
+    /// (per spec § C-7a, v2.2.0+ / CR-61). All current wire-format variants
+    /// require non-empty bodies — an empty body in *any* domain has no
+    /// rendered representation and would collide with the C-3 body-placement
+    /// signal. `Message` returns `false` (orphan sentinel — never constructed).
+    pub fn requires_non_empty_body(self) -> bool {
+        !matches!(self, Self::Message)
+    }
+}
+
 /// Complete output from document preprocessing
 ///
 /// Contains all the data extracted from document parsing, including
@@ -1165,5 +1243,111 @@ mod node_content_escape_tests {
         // the whole text is stripped, but internal newlines preserve.
         let nc = NodeContent::new("  \n```bgraph\nbody\n  ".to_string());
         assert_eq!(nc.text, "\\```bgraph\nbody");
+    }
+}
+
+#[cfg(test)]
+mod semantic_tree_element_validate_tests {
+    use super::*;
+
+    fn build(text: &str, element_type: SemanticElementType) -> SemanticTreeElement {
+        SemanticTreeElement {
+            text: text.to_string(),
+            element_type,
+            hierarchy_level: 1,
+            text_order: 0,
+            physical_location: None,
+            style: None,
+            token_count: 0,
+        }
+    }
+
+    #[test]
+    fn validate_passes_non_empty_paragraph() {
+        let v = build("hello", SemanticElementType::Paragraph).validate();
+        assert_eq!(v.text, "hello");
+    }
+
+    #[test]
+    fn validate_passes_non_empty_section() {
+        let v = build("Title", SemanticElementType::Section).validate();
+        assert_eq!(v.text, "Title");
+    }
+
+    #[test]
+    fn validate_passes_non_empty_codeblock() {
+        // CodeBlock body is in the literal domain — empty still
+        // forbidden per C-7a, but non-empty literal content is fine.
+        let v = build("```\nfn main() {}\n```", SemanticElementType::CodeBlock).validate();
+        assert!(v.text.contains("fn main"));
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_paragraph() {
+        let _ = build("", SemanticElementType::Paragraph).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_whitespace_only_paragraph() {
+        let _ = build("   \n\t  ", SemanticElementType::Paragraph).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_section() {
+        let _ = build("", SemanticElementType::Section).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_codeblock() {
+        let _ = build("", SemanticElementType::CodeBlock).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_header() {
+        let _ = build("", SemanticElementType::Header).validate();
+    }
+
+    #[test]
+    fn body_is_markdown_inline_classifies_each_variant_correctly() {
+        // Markdown-inline domain: Section / Paragraph / Header / Footer / Margin
+        assert!(SemanticElementType::Section.body_is_markdown_inline());
+        assert!(SemanticElementType::Paragraph.body_is_markdown_inline());
+        assert!(SemanticElementType::Header.body_is_markdown_inline());
+        assert!(SemanticElementType::Footer.body_is_markdown_inline());
+        assert!(SemanticElementType::Margin.body_is_markdown_inline());
+        // Literal / literal-with-markers domain
+        assert!(!SemanticElementType::CodeBlock.body_is_markdown_inline());
+        assert!(!SemanticElementType::List.body_is_markdown_inline());
+        assert!(!SemanticElementType::Blockquote.body_is_markdown_inline());
+        assert!(!SemanticElementType::Table.body_is_markdown_inline());
+    }
+
+    #[test]
+    fn requires_non_empty_body_is_true_for_all_wire_variants() {
+        for t in [
+            SemanticElementType::Section,
+            SemanticElementType::Paragraph,
+            SemanticElementType::Header,
+            SemanticElementType::Footer,
+            SemanticElementType::Margin,
+            SemanticElementType::CodeBlock,
+            SemanticElementType::List,
+            SemanticElementType::Blockquote,
+            SemanticElementType::Table,
+        ] {
+            assert!(
+                t.requires_non_empty_body(),
+                "{t:?} should require non-empty body per C-7a",
+            );
+        }
+        assert!(
+            !SemanticElementType::Message.requires_non_empty_body(),
+            "Message is orphan; never constructed",
+        );
     }
 }

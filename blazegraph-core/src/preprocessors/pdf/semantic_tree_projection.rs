@@ -22,6 +22,20 @@ use crate::types::{
 /// everything downstream (`GraphBuilder`) operates on the universal type.
 ///
 /// See module docs for what's preserved vs dropped.
+///
+/// **Canonical-form projection (v2.2.0+, CR-61).** Before constructing the
+/// `SemanticTreeElement`, body text in the markdown-inline domain
+/// (Section / Paragraph / Header / Footer / Margin per C-7a) is wrapped in
+/// canonical emphasis tokens based on element-level style flags:
+/// `is_bold && is_italic` → `***text***`, `is_bold` → `**text**`,
+/// `is_italic` → `*text*`. This makes the in-graph `text` already
+/// canonical (C-7b); the emitter stays dumb. Element-level only —
+/// span-level emphasis (per-segment style preservation through merge)
+/// is future work, and equation typography is explicitly out of scope
+/// (see DT-05). The `style` field on the element is still populated
+/// verbatim from Tika (DT-03) — the body-text emphasis tokens are the
+/// canonical-form projection, the `style` JSON is the verbatim record;
+/// they are not redundant.
 pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<SemanticTreeElement> {
     elements
         .into_iter()
@@ -32,19 +46,55 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
                 page: p.page_number,
                 bounding_box: p.bounding_box.clone(),
             });
-            let style = Some(project_style(&parsed));
+            let style = project_style(&parsed);
+
+            // C-7b canonical emphasis projection. Applies only to elements
+            // whose body is in the markdown-inline domain (C-7a). For
+            // literal / literal-with-markers domains (CodeBlock / List /
+            // Blockquote / Table) we skip wrapping — those preserve raw
+            // source verbatim. Today's PDF channel never produces those
+            // variants (rule engine maps List/ListItem → Paragraph; no
+            // CodeBlock detection yet); the guard makes the rule explicit
+            // for when classification improves.
+            let text = if element_type.body_is_markdown_inline() {
+                apply_canonical_emphasis(parsed.text, &style)
+            } else {
+                parsed.text
+            };
 
             SemanticTreeElement {
-                text: parsed.text,
+                text,
                 element_type,
                 hierarchy_level: parsed.hierarchy_level,
                 text_order: index as u32,
                 physical_location,
-                style,
+                style: Some(style),
                 token_count: parsed.token_count,
             }
+            .validate()
         })
         .collect()
+}
+
+/// Apply C-7b canonical inline emphasis tokens (`**bold**` / `*italic*` /
+/// `***bold-italic***`) to body text based on element-level style flags.
+/// Empty / whitespace-only text is returned unchanged — C-7a empty-body
+/// validation (Part D) rejects those at construction; this function does
+/// not duplicate that check.
+fn apply_canonical_emphasis(text: String, style: &StyleInfo) -> String {
+    if !style.is_bold && !style.is_italic {
+        return text;
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return text;
+    }
+    match (style.is_bold, style.is_italic) {
+        (true, true) => format!("***{trimmed}***"),
+        (true, false) => format!("**{trimmed}**"),
+        (false, true) => format!("*{trimmed}*"),
+        (false, false) => unreachable!("guarded by early return above"),
+    }
 }
 
 /// Map `ParsedElementType` (rule-engine output, PDF-channel-internal) to
@@ -149,8 +199,12 @@ mod tests {
         assert_eq!(projected.len(), 1);
         let element = &projected[0];
 
-        // Universal fields preserved.
-        assert_eq!(element.text, "sample text");
+        // Universal fields preserved. v2.2.0+ (CR-61): the fixture has
+        // font_style="italic" + font_weight="bold", so canonical-form
+        // projection wraps the body in `***...***` (C-7b bold-italic).
+        // See `applies_canonical_emphasis_per_c7b` below for the dedicated
+        // projection-behavior tests.
+        assert_eq!(element.text, "***sample text***");
         assert_eq!(element.element_type, SemanticElementType::Section);
         assert_eq!(element.hierarchy_level, 2);
         assert_eq!(element.text_order, 0);
@@ -260,6 +314,80 @@ mod tests {
                 projected[0].hierarchy_level,
             );
         }
+    }
+
+    // ---------- CR-61 / v2.2.0+: canonical-form emphasis projection ----------
+
+    /// Build a fixture with explicit bold/italic flags. Helper for the
+    /// C-7b projection tests below.
+    fn fixture_with_emphasis(
+        element_type: ParsedElementType,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> ParsedPdfElement {
+        let mut fx = fixture(element_type, 1);
+        fx.text = text.to_string();
+        fx.style_info.font_weight = if bold { "bold" } else { "normal" }.to_string();
+        fx.style_info.font_style = if italic { "italic" } else { "normal" }.to_string();
+        fx
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_italic_only_wraps_text_in_asterisks() {
+        let input = fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", false, true);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "*lorem ipsum*");
+        // Style flag also preserved verbatim per DT-03 — the body wrap
+        // and the JSON `style` field carry the same signal.
+        assert!(projected[0].style.as_ref().unwrap().is_italic);
+        assert!(!projected[0].style.as_ref().unwrap().is_bold);
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_bold_only_wraps_text_in_double_asterisks() {
+        let input = fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", true, false);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "**lorem ipsum**");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_bold_and_italic_wraps_in_triple_asterisks() {
+        let input = fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", true, true);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "***lorem ipsum***");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_no_flags_leaves_text_unchanged() {
+        let input =
+            fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", false, false);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "lorem ipsum");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_trims_surrounding_whitespace_before_wrap() {
+        // Whitespace at the edges would break CommonMark emphasis (the
+        // delimiters must be adjacent to non-whitespace inside). Trim
+        // before wrap; NodeContent::new will trim again downstream as a
+        // no-op.
+        let input =
+            fixture_with_emphasis(ParsedElementType::Paragraph, "  lorem  ", false, true);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "*lorem*");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_to_section_heading_text() {
+        // PDF section headings with bold style get the canonical wrap
+        // too — this is the "redundant-but-canonical" case (the # prefix
+        // already implies emphasis, but the rule is uniform across
+        // markdown-inline-domain types per C-7a).
+        let input = fixture_with_emphasis(ParsedElementType::Section, "Introduction", true, false);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "**Introduction**");
+        assert_eq!(projected[0].element_type, SemanticElementType::Section);
     }
 
     #[test]
