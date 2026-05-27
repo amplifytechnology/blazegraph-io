@@ -342,9 +342,15 @@ impl DocumentProcessor {
             }
         }
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
+        // CR-66 ordering: structural profile is computed twice — once
+        // before graph_sanity (so invariant checks can reason from a
+        // current node-type / depth-distribution view) and once after
+        // (so consumers see post-mutation counts). Breadcrumbs run only
+        // after, since they're a derived output, not a sanity input.
+        graph.compute_structural_profile();
+        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
-        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
 
         println!("📋 Stage 3: Graph captured ({} nodes)", graph.nodes.len());
 
@@ -507,9 +513,15 @@ impl DocumentProcessor {
             }
         }
         graph.document_info.bookmark_data = preprocessor_output.bookmark_data.clone();
+        // CR-66 ordering: structural profile is computed twice — once
+        // before graph_sanity (so invariant checks can reason from a
+        // current node-type / depth-distribution view) and once after
+        // (so consumers see post-mutation counts). Breadcrumbs run only
+        // after, since they're a derived output, not a sanity input.
+        graph.compute_structural_profile();
+        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
-        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
 
         Ok(graph)
     }
