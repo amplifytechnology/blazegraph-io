@@ -577,6 +577,14 @@ impl<'a> SectionDetectionV2Rule<'a> {
             return false;
         }
 
+        // CR-64: Tika emits rotated text as per-glyph zero-width spans on
+        // non-first pages (single-pass mode). Their projected vertical extent
+        // is recorded as font_size and would otherwise trip the structural-
+        // size gate. See DT-07.
+        if element.bounding_box().width == 0.0 {
+            return false;
+        }
+
         // Hard reject: bold-in-paragraph case. A bold candidate sharing its
         // Y-line in its (page, leaf) with a non-bold neighbor (or vice
         // versa) is body emphasis, not a structural element. Lifted above
@@ -1191,6 +1199,25 @@ mod tests {
     fn test_reject_below_body_minus_tolerance() {
         let body = 10.0;
         let elements = vec![make_element(8.0, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-64 — Zero-width-bbox elements rejected at pass-1.
+    ///
+    /// Tika emits rotated text on non-first pages as per-glyph zero-width
+    /// spans (e.g. a vertical "Parameters" y-axis label arrives as ten
+    /// single-letter spans at width=0.0, font_size 26pt — the projected
+    /// vertical extent). Without the guard those would be auto-promoted as
+    /// Region 1 candidates because 26 > body+margin.
+    #[test]
+    fn test_cr64_zero_width_bbox_is_rejected() {
+        let body = 10.0;
+        // Element that WOULD be Region 1 (big font) — but width=0 disqualifies.
+        let mut element = make_element(26.0, false, "body", 0);
+        element.placement.bounding_box.width = 0.0;
+        let elements = vec![element];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         let config = make_config(1.0, 5.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
