@@ -63,6 +63,8 @@ fn build_synthetic_graph() -> DocumentGraph {
             physical_location: None,
             style: None,
             token_count: 1,
+            internal_refs: Vec::new(),
+            external_refs: Vec::new(),
         },
         SemanticTreeElement {
             text: "First paragraph body.".to_string(),
@@ -72,6 +74,8 @@ fn build_synthetic_graph() -> DocumentGraph {
             physical_location: None,
             style: None,
             token_count: 3,
+            internal_refs: Vec::new(),
+            external_refs: Vec::new(),
         },
         SemanticTreeElement {
             text: "Background".to_string(),
@@ -81,6 +85,8 @@ fn build_synthetic_graph() -> DocumentGraph {
             physical_location: None,
             style: None,
             token_count: 1,
+            internal_refs: Vec::new(),
+            external_refs: Vec::new(),
         },
         SemanticTreeElement {
             text: "Some background prose.".to_string(),
@@ -90,6 +96,8 @@ fn build_synthetic_graph() -> DocumentGraph {
             physical_location: None,
             style: None,
             token_count: 3,
+            internal_refs: Vec::new(),
+            external_refs: Vec::new(),
         },
         SemanticTreeElement {
             text: "Running header".to_string(),
@@ -99,6 +107,8 @@ fn build_synthetic_graph() -> DocumentGraph {
             physical_location: None,
             style: None,
             token_count: 2,
+            internal_refs: Vec::new(),
+            external_refs: Vec::new(),
         },
         SemanticTreeElement {
             text: "Confidential".to_string(),
@@ -108,6 +118,8 @@ fn build_synthetic_graph() -> DocumentGraph {
             physical_location: None,
             style: None,
             token_count: 1,
+            internal_refs: Vec::new(),
+            external_refs: Vec::new(),
         },
     ];
     let mut graph = GraphBuilder::new()
