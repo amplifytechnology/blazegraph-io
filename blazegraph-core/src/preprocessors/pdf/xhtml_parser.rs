@@ -197,6 +197,77 @@ fn parse_attr_u32(tag: &str, name: &str) -> Option<u32> {
     parse_attr_str(tag, name).and_then(|s| s.parse().ok())
 }
 
+/// Parse a comma-separated `x,y,w,h` bbox string into a BoundingBox.
+/// Returns None on malformed input (wrong arity or unparseable floats).
+fn parse_bbox_string(s: &str) -> Option<BoundingBox> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let x = parts[0].trim().parse::<f32>().ok()?;
+    let y = parts[1].trim().parse::<f32>().ok()?;
+    let width = parts[2].trim().parse::<f32>().ok()?;
+    let height = parts[3].trim().parse::<f32>().ok()?;
+    Some(BoundingBox {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// CR-62: Parse the `data-link-*` attribute family on a `<span>` tag into a
+/// typed PdfLinkAnnotation. Returns `None` when `data-link-kind` is absent
+/// (the vast majority of spans) or when required per-kind fields are missing.
+///
+/// Attribute schema (defined by Tika-side `addLinkAttributes` in
+/// `BlazePDF2XHTML.java`):
+///
+/// - `data-link-bbox="x,y,w,h"` — required when kind present (annotation rect,
+///   top-origin coords matching `data-bbox`).
+/// - `data-link-kind` — one of `internal-named`, `internal-page`, `external-uri`.
+/// - Per kind:
+///   - `internal-named`: `data-link-target-name` (required), optional
+///     `data-link-target-page` / `-x` / `-y` (resolved by name tree).
+///   - `internal-page`: `data-link-target-page` (required), optional `-x` / `-y`.
+///   - `external-uri`: `data-link-target-url` (required).
+fn parse_link_annotation(tag: &str) -> Option<PdfLinkAnnotation> {
+    let kind_str = parse_attr_str(tag, "data-link-kind")?;
+    let bbox_str = parse_attr_str(tag, "data-link-bbox")?;
+    let source_bbox = parse_bbox_string(bbox_str)?;
+
+    let target_page = parse_attr_u32(tag, "data-link-target-page");
+    let target_x = parse_attr_str(tag, "data-link-target-x").and_then(|s| s.parse::<f32>().ok());
+    let target_y = parse_attr_str(tag, "data-link-target-y").and_then(|s| s.parse::<f32>().ok());
+
+    let kind = match kind_str {
+        "internal-named" => {
+            let name = parse_attr_str(tag, "data-link-target-name")?.to_string();
+            PdfLinkKind::InternalNamed {
+                name,
+                target_page,
+                target_x,
+                target_y,
+            }
+        }
+        "internal-page" => {
+            let target_page = target_page?;
+            PdfLinkKind::InternalPage {
+                target_page,
+                target_x,
+                target_y,
+            }
+        }
+        "external-uri" => {
+            let url = parse_attr_str(tag, "data-link-target-url")?.to_string();
+            PdfLinkKind::ExternalUri { url }
+        }
+        _ => return None, // Unrecognized kind — degrade gracefully.
+    };
+
+    Some(PdfLinkAnnotation { source_bbox, kind })
+}
+
 /// Walk a span's inner content and accumulate text outside any inner tag
 /// region. Equivalent to the prior pull-parser semantics where Event::Text
 /// was captured only when span_nesting == 0 — i.e., text inside
@@ -320,6 +391,8 @@ fn extract_text_elements(
                 .to_string();
             let line = parse_attr_u32(matched, "data-line").unwrap_or(0);
             let segment = parse_attr_u32(matched, "data-segment").unwrap_or(0);
+            // CR-62: data-link-* attrs are present only on link-bearing spans.
+            let link = parse_link_annotation(matched);
 
             let inner_start = m.end();
             let close_offset = match xhtml[inner_start..].find("</span>") {
@@ -346,6 +419,7 @@ fn extract_text_elements(
                     segment,
                     text_content,
                     raw_tags,
+                    link,
                     style_data,
                     &bookmark_lookup,
                 ) {
@@ -474,23 +548,18 @@ fn build_element(
     segment_number: u32,
     text_content: String,
     raw_tags: Vec<String>,
+    link: Option<PdfLinkAnnotation>,
     style_data: &StyleData,
     bookmark_lookup: &HashMap<String, BookmarkSection>,
 ) -> Option<PdfTextElement> {
     // Parse bounding box: "x,y,width,height"
-    let bbox_parts: Vec<&str> = span_bbox.split(',').collect();
-    if bbox_parts.len() != 4 {
-        return None;
-    }
-    let (x, y, width, height) = match (
-        bbox_parts[0].trim().parse::<f32>(),
-        bbox_parts[1].trim().parse::<f32>(),
-        bbox_parts[2].trim().parse::<f32>(),
-        bbox_parts[3].trim().parse::<f32>(),
-    ) {
-        (Ok(x), Ok(y), Ok(w), Ok(h)) => (x, y, w, h),
-        _ => return None,
-    };
+    let bbox = parse_bbox_string(span_bbox)?;
+    let BoundingBox {
+        x,
+        y,
+        width,
+        height,
+    } = bbox;
 
     // Resolve font class
     let font_class = if let Some(fc) = style_data.font_classes.get(span_class) {
@@ -527,6 +596,7 @@ fn build_element(
         bookmark_match,
         token_count: estimate_token_count(&text_content),
         raw_tags,
+        link,
     })
 }
 
@@ -807,6 +877,86 @@ mod tests {
         );
     }
 
+    // ── CR-62: data-link-* attribute parsing ─────────────────────────────────
+
+    /// CR-62: span carrying `data-link-kind="internal-named"` attrs lands on
+    /// `PdfTextElement.link` as the typed `InternalNamed` variant with the
+    /// Tika-resolved target page + coords carried through. Matches what
+    /// BlazePDF2XHTML emits for academic-paper citations (PDActionGoTo →
+    /// PDNamedDestination → PDPageXYZDestination).
+    #[test]
+    fn cr62_span_with_internal_named_link_lands_on_element() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="612" data-height="792" />
+<p>
+<span class="f5" data-bbox="327.0,99.9,10.0,8.7" data-line="0" data-segment="1" data-link-bbox="326.0,98.9,12.0,8.8" data-link-kind="internal-named" data-link-target-name="cite.hochreiter1997" data-link-target-page="10" data-link-target-x="108.0" data-link-target-y="339.0">13</span>
+</p>
+</div>"#,
+        );
+        let out = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(out.text_elements.len(), 1);
+        let el = &out.text_elements[0];
+        let link = el.link.as_ref().expect("link should be Some");
+        assert_eq!(link.source_bbox.x, 326.0);
+        assert_eq!(link.source_bbox.y, 98.9);
+        assert_eq!(link.source_bbox.width, 12.0);
+        assert_eq!(link.source_bbox.height, 8.8);
+        match &link.kind {
+            PdfLinkKind::InternalNamed {
+                name,
+                target_page,
+                target_x,
+                target_y,
+            } => {
+                assert_eq!(name, "cite.hochreiter1997");
+                assert_eq!(*target_page, Some(10));
+                assert_eq!(*target_x, Some(108.0));
+                assert_eq!(*target_y, Some(339.0));
+            }
+            other => panic!("expected InternalNamed, got {:?}", other),
+        }
+    }
+
+    /// CR-62: span carrying `data-link-kind="external-uri"` attrs lands on
+    /// `PdfTextElement.link` as `ExternalUri`. Matches what BlazePDF2XHTML
+    /// emits for PDActionURI link annotations.
+    #[test]
+    fn cr62_span_with_external_uri_link_lands_on_element() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="612" data-height="792" />
+<p>
+<span class="f6" data-bbox="405.7,527.1,99.4,8.0" data-line="11" data-segment="1" data-link-bbox="404.7,525.2,100.3,11.1" data-link-kind="external-uri" data-link-target-url="https://github.com/tensorflow/tensor2tensor">https://github.com/</span>
+</p>
+</div>"#,
+        );
+        let out = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(out.text_elements.len(), 1);
+        let link = out.text_elements[0].link.as_ref().expect("link Some");
+        match &link.kind {
+            PdfLinkKind::ExternalUri { url } => {
+                assert_eq!(url, "https://github.com/tensorflow/tensor2tensor");
+            }
+            other => panic!("expected ExternalUri, got {:?}", other),
+        }
+    }
+
+    /// CR-62: backward-compat — spans without any `data-link-*` attrs have
+    /// `link == None`. Verifies the parser stays a no-op on pre-CR-62 XHTML.
+    #[test]
+    fn cr62_span_without_link_attrs_has_no_link_field() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="100.0" data-height="100.0" />
+<p>
+<span class="f1" data-bbox="10,10,50,12" data-line="0" data-segment="0">just text</span>
+</p>
+</div>"#,
+        );
+        let out = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(out.text_elements.len(), 1);
+        assert!(out.text_elements[0].link.is_none(),
+            "spans without data-link-* should produce link: None");
+    }
+
     /// CR-40 acceptance: spans inside `<aside data-rotation="...">` inherit
     /// the rotation; spans outside the aside have rotation=0.
     #[test]
@@ -1034,6 +1184,7 @@ mod tests {
             bookmark_match: None,
             token_count: 1,
             raw_tags: vec![],
+            link: None,
         }
     }
 }

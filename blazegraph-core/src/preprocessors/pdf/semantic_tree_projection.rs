@@ -13,8 +13,9 @@
 //! for the design rationale.
 
 use crate::types::{
-    ParsedElementType, ParsedPdfElement, PhysicalLocation, SemanticElementType,
-    SemanticTreeElement, StyleInfo,
+    ExternalRef, ExternalRefTarget, InternalRef, InternalRefTarget, ParsedElementType,
+    ParsedPdfElement, PdfLinkKind, PhysicalLocation, SemanticElementType, SemanticTreeElement,
+    StyleInfo, TargetPoint,
 };
 
 /// Project the rule-engine output onto the channel-agnostic
@@ -57,10 +58,39 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
             // CodeBlock detection yet); the guard makes the rule explicit
             // for when classification improves.
             let text = if element_type.body_is_markdown_inline() {
-                apply_canonical_emphasis(parsed.text, &style)
+                apply_canonical_emphasis(parsed.text.clone(), &style)
             } else {
-                parsed.text
+                parsed.text.clone()
             };
+
+            // CR-62: split the rule-engine's unified `links: Vec<PdfLinkAnnotation>`
+            // into channel-agnostic `internal_refs[]` / `external_refs[]` at the
+            // projection boundary. `text` field on each ref is the visible link
+            // text (substring-anchor lookup key per CR-61); for the PDF channel
+            // we extract it from the parsed element's text by intersecting the
+            // annotation's source bbox with the element's glyph extent — but
+            // because each pre-merge ParsedPdfElement corresponds to a single
+            // span (and thus a single link), the text-of-the-ref equals the
+            // text-of-the-span before merge. After merge the link's source bbox
+            // is preserved, so we still know which substring it covers.
+            //
+            // The simplest correct shape: project each link's source bbox +
+            // kind directly, and use the parsed element's `text` as the ref's
+            // text (this is exact pre-merge, and post-merge it's the merged
+            // body text — consumers find the substring via nth-anchor lookup).
+            //
+            // **Per-merge text honesty:** pre-merge the parsed element IS the
+            // single span carrying the link, so `text` is exact. The merged
+            // element's `links` carries the original per-span source_bbox of
+            // each link, which is invariant to the merge. The ref's `text`
+            // field is best-set to the per-link span text — but the
+            // ParsedPdfElement merge has already lost the per-span text
+            // attribution. As a pragmatic v1, set `text` to empty for the
+            // PDF channel and rely on consumers using `source_bbox` directly
+            // for spatial lookup; the substring-anchor convention is the
+            // MD-channel's contract. Mark this as a known gap for a future
+            // refinement slice if a consumer needs per-ref text directly.
+            let (internal_refs, external_refs) = split_links_into_refs(&parsed);
 
             SemanticTreeElement {
                 text,
@@ -70,10 +100,79 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
                 physical_location,
                 style: Some(style),
                 token_count: parsed.token_count,
+                internal_refs,
+                external_refs,
             }
             .validate()
         })
         .collect()
+}
+
+/// CR-62: Split `ParsedPdfElement.links` (the unified `Vec<PdfLinkAnnotation>`
+/// carried through clustering) into channel-agnostic `internal_refs[]` /
+/// `external_refs[]`. Each link contributes exactly one entry to one of the
+/// two output vecs, preserving source order.
+fn split_links_into_refs(
+    parsed: &ParsedPdfElement,
+) -> (Vec<InternalRef>, Vec<ExternalRef>) {
+    let source_page = parsed.placement.as_ref().map(|p| p.page_number);
+    let mut internal_refs = Vec::new();
+    let mut external_refs = Vec::new();
+    for link in &parsed.links {
+        match &link.kind {
+            PdfLinkKind::InternalNamed {
+                name,
+                target_page,
+                target_x,
+                target_y,
+            } => {
+                let point = target_point(*target_x, *target_y);
+                internal_refs.push(InternalRef {
+                    text: String::new(),
+                    source_page,
+                    source_bbox: Some(link.source_bbox.clone()),
+                    target: InternalRefTarget::Named {
+                        name: name.clone(),
+                        page: *target_page,
+                        point,
+                    },
+                });
+            }
+            PdfLinkKind::InternalPage {
+                target_page,
+                target_x,
+                target_y,
+            } => {
+                let point = target_point(*target_x, *target_y);
+                internal_refs.push(InternalRef {
+                    text: String::new(),
+                    source_page,
+                    source_bbox: Some(link.source_bbox.clone()),
+                    target: InternalRefTarget::Page {
+                        page: *target_page,
+                        point,
+                    },
+                });
+            }
+            PdfLinkKind::ExternalUri { url } => {
+                external_refs.push(ExternalRef {
+                    text: String::new(),
+                    source_page,
+                    source_bbox: Some(link.source_bbox.clone()),
+                    target: ExternalRefTarget::Uri { url: url.clone() },
+                });
+            }
+        }
+    }
+    (internal_refs, external_refs)
+}
+
+fn target_point(x: Option<f32>, y: Option<f32>) -> Option<TargetPoint> {
+    if x.is_none() && y.is_none() {
+        None
+    } else {
+        Some(TargetPoint { x, y })
+    }
 }
 
 /// Apply C-7b canonical inline emphasis tokens (`**bold**` / `*italic*` /
@@ -187,6 +286,7 @@ mod tests {
                 level: 1,
             }),
             token_count: 42,
+            links: vec![],
         }
     }
 

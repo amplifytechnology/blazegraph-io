@@ -847,6 +847,7 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
                     reading_order: te.reading_order,
                     bookmark_match: te.bookmark_match.clone(),
                     token_count: te.token_count,
+                    links: vec![],
                 })
                 .collect()
         } else {
@@ -962,8 +963,8 @@ mod tests {
             placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,
-            raw_tags: vec![],
+            token_count: 1,            raw_tags: vec![],
+            link: None,
         }
     }
 
@@ -1000,8 +1001,8 @@ mod tests {
             },
             reading_order: 1,
             bookmark_match: None,
-            token_count: 1,
-            raw_tags: vec![],
+            token_count: 1,            raw_tags: vec![],
+            link: None,
         }
     }
 
@@ -1320,8 +1321,8 @@ mod tests {
             placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,
-            raw_tags: vec![],
+            token_count: 1,            raw_tags: vec![],
+            link: None,
         }
     }
 
@@ -1391,8 +1392,8 @@ mod tests {
             },
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,
-            raw_tags: vec![],
+            token_count: 1,            raw_tags: vec![],
+            link: None,
         }
     }
 
@@ -1576,8 +1577,8 @@ mod tests {
             },
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,
-            raw_tags: vec![],
+            token_count: 1,            raw_tags: vec![],
+            link: None,
         }
     }
 

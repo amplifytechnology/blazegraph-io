@@ -625,6 +625,7 @@ fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextEleme
         bookmark_match: None,
         token_count: 1,
         raw_tags: vec![],
+        link: None,
     }
 }
 
@@ -730,6 +731,7 @@ fn make_v2_element(
         bookmark_match: None,
         token_count: 1,
         raw_tags: vec![],
+        link: None,
     }
 }
 

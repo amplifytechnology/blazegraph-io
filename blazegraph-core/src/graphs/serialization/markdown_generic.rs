@@ -321,6 +321,8 @@ mod tests {
                     token_count: 1,
                     parent: Some(root_id),
                     children: Vec::new(),
+                    internal_refs: vec![],
+                    external_refs: vec![],
                 },
             );
         }
@@ -346,6 +348,8 @@ mod tests {
                 token_count: 0,
                 parent: None,
                 children: child_ids,
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
 

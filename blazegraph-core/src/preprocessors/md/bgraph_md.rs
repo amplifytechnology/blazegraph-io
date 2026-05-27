@@ -233,6 +233,8 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                 // the field on inputs that carry it.
                 style: p.metadata.style.clone(),
                 token_count: p.metadata.token_count,
+                internal_refs: vec![],
+                external_refs: vec![],
             }
             .validate(),
         );
@@ -534,6 +536,14 @@ struct NodeMetadata {
     location: NodeLocation,
     text_order: u32,
     token_count: usize,
+    /// CR-62 (v2.3.0+): per-element refs to other locations within this
+    /// document. `#[serde(default)]` so pre-v2.3.0 fixtures parse cleanly.
+    #[serde(default)]
+    internal_refs: Vec<crate::types::InternalRef>,
+    /// CR-62 (v2.3.0+): per-element refs to external locations. Same
+    /// forward-compat tolerance.
+    #[serde(default)]
+    external_refs: Vec<crate::types::ExternalRef>,
     /// CR-45: per-element verbatim Tika style projection. `#[serde(default)]`
     /// makes the field tolerant of fixtures / hand-edited inputs that
     /// omit it (forward-compat with the spec's "tolerate absent optional
@@ -675,6 +685,8 @@ mod tests {
                     physical_location: None,
                     style: None,
                     token_count: text.split_whitespace().count(),
+                    internal_refs: vec![],
+                    external_refs: vec![],
                 }
             })
             .collect();

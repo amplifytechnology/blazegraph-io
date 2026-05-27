@@ -253,6 +253,14 @@ pub struct DocumentNode {
     pub token_count: usize,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
+    /// CR-62 (v2.3.0+): references to other locations within this document.
+    /// Empty omitted from the wire format. Reading-order sorted by source
+    /// segment position (CR-61 invariant).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_refs: Vec<InternalRef>,
+    /// CR-62 (v2.3.0+): references to external locations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_refs: Vec<ExternalRef>,
 }
 
 impl DocumentNode {
@@ -275,6 +283,8 @@ impl DocumentNode {
             token_count: 0,
             parent: None,
             children: Vec::new(),
+            internal_refs: vec![],
+            external_refs: vec![],
         }
     }
 
@@ -297,6 +307,8 @@ impl DocumentNode {
             token_count: 0,
             parent: None,
             children: Vec::new(),
+            internal_refs: vec![],
+            external_refs: vec![],
         }
     }
 
@@ -604,9 +616,66 @@ pub struct PdfTextElement {
     pub token_count: usize,
     /// Unrecognized XHTML tag fragments that are descendants of this span (any depth).
     /// Each entry is the full unparsed fragment including content text.
-    /// Empty for all spans in current core Tika output. A future corpus-tier Tika JAR
-    /// will emit <a href>, <annotation>, etc. here.
+    /// CR-62 superseded the closed-source raw_html design by emitting typed
+    /// `data-link-*` attrs on spans and parsing them into `link` below; the
+    /// `raw_tags` field is retained for backward-compatibility with the CR-40
+    /// reception infrastructure but is empty for spans whose link data lands
+    /// in `link`. Future cleanup slice may remove it entirely.
     pub raw_tags: Vec<String>,
+    /// CR-62: PDF link annotation that covers this span, when one exists.
+    /// `None` when the span carries no `data-link-*` attributes (the vast
+    /// majority of spans on any given page). The splitter discipline in
+    /// `BlazePDF2XHTML.splitByLinkAnnotation` guarantees a span overlaps
+    /// at most one annotation; 0-or-1 is the type-level invariant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub link: Option<PdfLinkAnnotation>,
+}
+
+/// CR-62: A PDF link annotation correlated with a single span. The bbox is
+/// the annotation rect in top-origin page coords (the Tika-side conversion
+/// already happened); the source-side page number lives on the carrying
+/// `PdfTextElement.placement.page_number` and isn't duplicated here.
+///
+/// Aggregation into `SemanticTreeElement.internal_refs[]` /
+/// `.external_refs[]` happens at projection time
+/// (see `preprocessors/pdf/semantic_tree_projection.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdfLinkAnnotation {
+    /// Annotation rect, top-origin coords on the source page. Differs
+    /// slightly from the span's text bbox — annotation rects typically
+    /// inflate beyond glyph extent for click-target margin.
+    pub source_bbox: BoundingBox,
+    pub kind: PdfLinkKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PdfLinkKind {
+    /// Internal goto via a named destination (`cite.hochreiter1997`,
+    /// `name-section-1.1`). Tika resolves the name to a target page +
+    /// (left, top) via the PDF's name tree when possible; the resolved
+    /// fields are `None` when name-tree lookup fails (rare; 0% in the
+    /// current corpus per the S8 probe).
+    InternalNamed {
+        name: String,
+        target_page: Option<u32>,
+        target_x: Option<f32>,
+        /// Top-origin Y on the *target* page (Tika converted from PDF
+        /// bottom-origin using the target page's height).
+        target_y: Option<f32>,
+    },
+    /// Internal goto by raw page index (no name). Target coords optional
+    /// (set when the destination was a PDPageXYZDestination).
+    InternalPage {
+        target_page: u32,
+        target_x: Option<f32>,
+        target_y: Option<f32>,
+    },
+    /// External URI (typically `https://...`; future enrichment slice
+    /// CR-63 may also produce `mailto:...` for pattern-detected emails).
+    ExternalUri {
+        url: String,
+    },
 }
 
 impl PdfTextElement {
@@ -906,6 +975,86 @@ pub struct SemanticTreeElement {
 
     /// Pre-computed token count.
     pub token_count: usize,
+
+    /// CR-62 (v2.3.0+): References from this element to other locations
+    /// **within this document** (PDF goto annotations resolving to named
+    /// destinations or specific page coordinates; MD anchor links). Reading-
+    /// order sorted by source segment position. Empty vec omitted from
+    /// emission. Consumer-side substring lookup matches the nth occurrence
+    /// of `ref.text` in `text` to the nth list entry with that text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_refs: Vec<InternalRef>,
+
+    /// CR-62 (v2.3.0+): References from this element to locations
+    /// **outside this document** (PDF URI annotations; MD external links).
+    /// Same reading-order + substring-anchor invariants as `internal_refs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_refs: Vec<ExternalRef>,
+}
+
+/// CR-62: A reference from an element to a location within the same document.
+///
+/// `text` is the visible link text from the source — the substring-anchor
+/// lookup key per CR-61. `source_page` and `source_bbox` are present for the
+/// PDF channel (Tika-extracted annotation rect) and absent for free-flow
+/// channels (MD). `target` discriminates the resolution surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalRef {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_bbox: Option<BoundingBox>,
+    pub target: InternalRefTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum InternalRefTarget {
+    /// PDF goto via named destination (`cite.hochreiter1997`, `name-section-1.1`)
+    /// or MD anchor (`#section-slug`). Optional resolved page + (x, y) carried
+    /// when Tika's name-tree walk produced a `PDPageXYZDestination`.
+    Named {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        page: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        point: Option<TargetPoint>,
+    },
+    /// Bare page-coord goto (no name). Page required; point optional.
+    Page {
+        page: u32,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        point: Option<TargetPoint>,
+    },
+}
+
+/// CR-62: A reference from an element to a location outside the document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalRef {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_bbox: Option<BoundingBox>,
+    pub target: ExternalRefTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ExternalRefTarget {
+    Uri { url: String },
+}
+
+/// CR-62: Resolved destination point on the target page (top-origin coords).
+/// Either coordinate may be absent depending on the source destination
+/// flavor; both present indicates a `PDPageXYZDestination`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetPoint {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub x: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub y: Option<f32>,
 }
 
 impl SemanticTreeElement {
@@ -1061,6 +1210,14 @@ pub struct ParsedPdfElement {
     pub reading_order: u32,
     pub bookmark_match: Option<BookmarkSection>,
     pub token_count: usize,
+    /// CR-62: Link annotations carried through clustering / merging. A pre-
+    /// merge element carries 0 or 1 (from the source `PdfTextElement.link`);
+    /// after merge, the vec is concatenated in source-segment order so the
+    /// reading-order invariant from CR-61 is preserved by construction.
+    /// Split into channel-agnostic `internal_refs[]` / `external_refs[]` at
+    /// projection time (see `preprocessors/pdf/semantic_tree_projection.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<PdfLinkAnnotation>,
 }
 
 impl ParsedPdfElement {
@@ -1259,6 +1416,8 @@ mod semantic_tree_element_validate_tests {
             physical_location: None,
             style: None,
             token_count: 0,
+            internal_refs: vec![],
+            external_refs: vec![],
         }
     }
 

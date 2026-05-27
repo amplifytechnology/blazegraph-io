@@ -249,6 +249,7 @@ fn node_type_to_fence_tag(node_type: &str) -> &'static str {
 /// `parent`/`children` (derivable from heading structure on reverse
 /// parse).
 fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
+    use crate::types::{ExternalRef, InternalRef};
     #[derive(Serialize)]
     struct NodeMetadata<'a> {
         id: &'a NodeId,
@@ -256,6 +257,14 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         location: &'a NodeLocation,
         text_order: &'a Option<u32>,
         token_count: usize,
+        /// CR-62 (v2.3.0+): per-element refs within this document. Omitted
+        /// when empty so pre-CR-62 fixtures stay byte-identical when no link
+        /// extraction is in play.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        internal_refs: &'a Vec<InternalRef>,
+        /// CR-62 (v2.3.0+): per-element refs to external locations.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        external_refs: &'a Vec<ExternalRef>,
         /// CR-45: verbatim Tika style projection (foreground / background
         /// color, font_family, font_size, is_bold, is_italic, font_class).
         /// CR-59 (v2.1.0+): gated on `EmitOptions::include_style_info`. When
@@ -282,6 +291,8 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         location: &node.location,
         text_order: &node.text_order,
         token_count: node.token_count,
+        internal_refs: &node.internal_refs,
+        external_refs: &node.external_refs,
         style,
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
@@ -344,6 +355,8 @@ mod tests {
                     token_count: 1,
                     parent: Some(root_id),
                     children: Vec::new(),
+                    internal_refs: vec![],
+                    external_refs: vec![],
                 },
             );
         }
@@ -369,6 +382,8 @@ mod tests {
                 token_count: 0,
                 parent: None,
                 children: child_ids,
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
 

@@ -60,7 +60,7 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 ///
 /// The parser at [`bgraph_md::parse`] accepts every previous major's
 /// shape as well, per the dual-support contract (spec § Amendment H).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.2.0";
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.3.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -119,7 +119,7 @@ mod tests {
         // v2.1.0+: doc-level block carries no `title` (moved to
         // bgraph-metadata fence — CR-56 § I.4).
         "```bgraph\n\
-         {\"schema\":\"2.2.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
+         {\"schema\":\"2.3.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
          ```\n"
     }
 
@@ -156,6 +156,8 @@ mod tests {
                 token_count: 0,
                 parent: None,
                 children: vec![para_id],
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
         nodes.insert(
@@ -179,6 +181,8 @@ mod tests {
                 token_count: 1,
                 parent: Some(root_id),
                 children: Vec::new(),
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
         let graph = DocumentGraph {

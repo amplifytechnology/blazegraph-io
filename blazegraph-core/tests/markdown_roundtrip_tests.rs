@@ -61,6 +61,8 @@ fn build_synthetic_graph(
                 physical_location: None,
                 style: None,
                 token_count: text.split_whitespace().count(),
+                internal_refs: vec![],
+                external_refs: vec![],
             }
         })
         .collect();
@@ -133,6 +135,8 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
                 // v1.0.0 spec does not carry per-element style.
                 style: None,
                 token_count: n.token_count,
+                internal_refs: vec![],
+                external_refs: vec![],
             }
         })
         .collect();

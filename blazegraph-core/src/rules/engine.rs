@@ -525,6 +525,10 @@ impl RuleEngine {
                 text_element.placement.region_label.as_deref(),
             );
 
+            // CR-62: thread the per-span link annotation (0 or 1) into the
+            // ParsedPdfElement's `links` vec so it survives clustering merge.
+            let links: Vec<_> = text_element.link.iter().cloned().collect();
+
             let parsed_element = ParsedPdfElement {
                 element_type,
                 text: text_element.text.trim().to_string(),
@@ -535,6 +539,7 @@ impl RuleEngine {
                 reading_order: text_element.reading_order,
                 bookmark_match: text_element.bookmark_match.clone(),
                 token_count: text_element.token_count,
+                links,
             };
 
             elements.push(parsed_element);

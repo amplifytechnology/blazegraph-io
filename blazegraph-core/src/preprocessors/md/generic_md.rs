@@ -156,6 +156,8 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                             physical_location: None,
                             style: None,
                             token_count: estimate_token_count(&heading_text),
+                            internal_refs: vec![],
+                            external_refs: vec![],
                         }
                         .validate(),
                     );
@@ -187,6 +189,8 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                             physical_location: None,
                             style: None,
                             token_count: estimate_token_count(&para_text),
+                            internal_refs: vec![],
+                            external_refs: vec![],
                         }
                         .validate(),
                     );
@@ -270,6 +274,8 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                                 physical_location: None,
                                 style: None,
                                 token_count: estimate_token_count(&source),
+                                internal_refs: vec![],
+                                external_refs: vec![],
                             }
                             .validate(),
                         );
@@ -333,6 +339,8 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                             physical_location: None,
                             style: None,
                             token_count: estimate_token_count(&source),
+                            internal_refs: vec![],
+                            external_refs: vec![],
                         }
                         .validate(),
                     );
@@ -352,6 +360,8 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                             physical_location: None,
                             style: None,
                             token_count: estimate_token_count(&source),
+                            internal_refs: vec![],
+                            external_refs: vec![],
                         }
                         .validate(),
                     );

@@ -73,6 +73,8 @@ impl GraphBuilder {
             token_count: 0,
             parent: None,
             children: Vec::new(),
+            internal_refs: vec![],
+            external_refs: vec![],
         };
         graph.nodes.insert(root_id, document_node);
 
@@ -173,6 +175,8 @@ impl GraphBuilder {
             token_count: 0,
             parent: None,
             children: Vec::new(),
+            internal_refs: vec![],
+            external_refs: vec![],
         };
         graph.nodes.insert(root_id, document_node);
 
@@ -268,6 +272,11 @@ impl GraphBuilder {
         node.text_order = Some(order);
         node.token_count = element.token_count;
         node.style_info = element.style.clone();
+        // CR-62: thread internal/external refs from the channel-projected
+        // SemanticTreeElement through to the in-graph DocumentNode so the
+        // bgraph.md emitter can serialize them per the v2.3.0 schema.
+        node.internal_refs = element.internal_refs.clone();
+        node.external_refs = element.external_refs.clone();
         node
     }
 
@@ -279,6 +288,9 @@ impl GraphBuilder {
         node.text_order = Some(order);
         node.token_count = element.token_count;
         node.style_info = element.style.clone();
+        // CR-62: see above.
+        node.internal_refs = element.internal_refs.clone();
+        node.external_refs = element.external_refs.clone();
         node
     }
 }

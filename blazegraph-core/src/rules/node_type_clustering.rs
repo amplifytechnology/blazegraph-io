@@ -317,6 +317,15 @@ fn merge_group(
 
     let position = sorted_elements[0].position;
 
+    // CR-62: concatenate link annotations from all merged source elements
+    // in source order. Reading-order preserved by construction because
+    // sorted_elements is already in source order (per DT-02 Tika within-line
+    // bbox.x sort + line/paragraph order).
+    let merged_links: Vec<_> = sorted_elements
+        .iter()
+        .flat_map(|el| el.links.iter().cloned())
+        .collect();
+
     Some(ParsedPdfElement {
         element_type,
         text,
@@ -327,6 +336,7 @@ fn merge_group(
         reading_order: min_reading_order,
         bookmark_match,
         token_count: sum_tokens,
+        links: merged_links,
     })
 }
 
@@ -547,6 +557,7 @@ mod tests {
             reading_order,
             bookmark_match: None,
             token_count: 1,
+            links: vec![],
         }
     }
 
