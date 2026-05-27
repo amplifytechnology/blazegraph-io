@@ -13,8 +13,9 @@
 //! for the design rationale.
 
 use crate::types::{
-    ParsedElementType, ParsedPdfElement, PhysicalLocation, SemanticElementType,
-    SemanticTreeElement, StyleInfo,
+    ExternalRef, ExternalRefTarget, InternalRef, InternalRefTarget, ParsedElementType,
+    ParsedPdfElement, PdfLinkKind, PhysicalLocation, SemanticElementType, SemanticTreeElement,
+    StyleInfo, TargetPoint,
 };
 
 /// Project the rule-engine output onto the channel-agnostic
@@ -22,6 +23,20 @@ use crate::types::{
 /// everything downstream (`GraphBuilder`) operates on the universal type.
 ///
 /// See module docs for what's preserved vs dropped.
+///
+/// **Canonical-form projection (v2.2.0+, CR-61).** Before constructing the
+/// `SemanticTreeElement`, body text in the markdown-inline domain
+/// (Section / Paragraph / Header / Footer / Margin per C-7a) is wrapped in
+/// canonical emphasis tokens based on element-level style flags:
+/// `is_bold && is_italic` → `***text***`, `is_bold` → `**text**`,
+/// `is_italic` → `*text*`. This makes the in-graph `text` already
+/// canonical (C-7b); the emitter stays dumb. Element-level only —
+/// span-level emphasis (per-segment style preservation through merge)
+/// is future work, and equation typography is explicitly out of scope
+/// (see DT-05). The `style` field on the element is still populated
+/// verbatim from Tika (DT-03) — the body-text emphasis tokens are the
+/// canonical-form projection, the `style` JSON is the verbatim record;
+/// they are not redundant.
 pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<SemanticTreeElement> {
     elements
         .into_iter()
@@ -32,19 +47,153 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
                 page: p.page_number,
                 bounding_box: p.bounding_box.clone(),
             });
-            let style = Some(project_style(&parsed));
+            let style = project_style(&parsed);
+
+            // C-7b canonical emphasis projection. Applies only to elements
+            // whose body is in the markdown-inline domain (C-7a). For
+            // literal / literal-with-markers domains (CodeBlock / List /
+            // Blockquote / Table) we skip wrapping — those preserve raw
+            // source verbatim. Today's PDF channel never produces those
+            // variants (rule engine maps List/ListItem → Paragraph; no
+            // CodeBlock detection yet); the guard makes the rule explicit
+            // for when classification improves.
+            let text = if element_type.body_is_markdown_inline() {
+                apply_canonical_emphasis(parsed.text.clone(), &style)
+            } else {
+                parsed.text.clone()
+            };
+
+            // CR-62: split the rule-engine's unified `links: Vec<PdfLinkAnnotation>`
+            // into channel-agnostic `internal_refs[]` / `external_refs[]` at the
+            // projection boundary. `text` field on each ref is the visible link
+            // text (substring-anchor lookup key per CR-61); for the PDF channel
+            // we extract it from the parsed element's text by intersecting the
+            // annotation's source bbox with the element's glyph extent — but
+            // because each pre-merge ParsedPdfElement corresponds to a single
+            // span (and thus a single link), the text-of-the-ref equals the
+            // text-of-the-span before merge. After merge the link's source bbox
+            // is preserved, so we still know which substring it covers.
+            //
+            // The simplest correct shape: project each link's source bbox +
+            // kind directly, and use the parsed element's `text` as the ref's
+            // text (this is exact pre-merge, and post-merge it's the merged
+            // body text — consumers find the substring via nth-anchor lookup).
+            //
+            // **Per-merge text honesty:** pre-merge the parsed element IS the
+            // single span carrying the link, so `text` is exact. The merged
+            // element's `links` carries the original per-span source_bbox of
+            // each link, which is invariant to the merge. The ref's `text`
+            // field is best-set to the per-link span text — but the
+            // ParsedPdfElement merge has already lost the per-span text
+            // attribution. As a pragmatic v1, set `text` to empty for the
+            // PDF channel and rely on consumers using `source_bbox` directly
+            // for spatial lookup; the substring-anchor convention is the
+            // MD-channel's contract. Mark this as a known gap for a future
+            // refinement slice if a consumer needs per-ref text directly.
+            let (internal_refs, external_refs) = split_links_into_refs(&parsed);
 
             SemanticTreeElement {
-                text: parsed.text,
+                text,
                 element_type,
                 hierarchy_level: parsed.hierarchy_level,
                 text_order: index as u32,
                 physical_location,
-                style,
+                style: Some(style),
                 token_count: parsed.token_count,
+                internal_refs,
+                external_refs,
             }
+            .validate()
         })
         .collect()
+}
+
+/// CR-62: Split `ParsedPdfElement.links` (the unified `Vec<PdfLinkAnnotation>`
+/// carried through clustering) into channel-agnostic `internal_refs[]` /
+/// `external_refs[]`. Each link contributes exactly one entry to one of the
+/// two output vecs, preserving source order.
+fn split_links_into_refs(
+    parsed: &ParsedPdfElement,
+) -> (Vec<InternalRef>, Vec<ExternalRef>) {
+    let source_page = parsed.placement.as_ref().map(|p| p.page_number);
+    let mut internal_refs = Vec::new();
+    let mut external_refs = Vec::new();
+    for link in &parsed.links {
+        match &link.kind {
+            PdfLinkKind::InternalNamed {
+                name,
+                target_page,
+                target_x,
+                target_y,
+            } => {
+                let point = target_point(*target_x, *target_y);
+                internal_refs.push(InternalRef {
+                    text: String::new(),
+                    source_page,
+                    source_bbox: Some(link.source_bbox.clone()),
+                    target: InternalRefTarget::Named {
+                        name: name.clone(),
+                        page: *target_page,
+                        point,
+                    },
+                });
+            }
+            PdfLinkKind::InternalPage {
+                target_page,
+                target_x,
+                target_y,
+            } => {
+                let point = target_point(*target_x, *target_y);
+                internal_refs.push(InternalRef {
+                    text: String::new(),
+                    source_page,
+                    source_bbox: Some(link.source_bbox.clone()),
+                    target: InternalRefTarget::Page {
+                        page: *target_page,
+                        point,
+                    },
+                });
+            }
+            PdfLinkKind::ExternalUri { url } => {
+                external_refs.push(ExternalRef {
+                    text: String::new(),
+                    source_page,
+                    source_bbox: Some(link.source_bbox.clone()),
+                    target: ExternalRefTarget::Uri { url: url.clone() },
+                });
+            }
+        }
+    }
+    (internal_refs, external_refs)
+}
+
+fn target_point(x: Option<f32>, y: Option<f32>) -> Option<TargetPoint> {
+    if x.is_none() && y.is_none() {
+        None
+    } else {
+        Some(TargetPoint { x, y })
+    }
+}
+
+/// Apply C-7b canonical inline emphasis tokens (`**bold**` / `*italic*` /
+/// `***bold-italic***`) to body text based on element-level style flags.
+/// Empty / whitespace-only text is returned unchanged — C-7a empty-body
+/// validation (Part D) rejects those at construction; this function does
+/// not duplicate that check.
+fn apply_canonical_emphasis(text: String, style: &StyleInfo) -> String {
+    if !style.is_bold && !style.is_italic {
+        return text;
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return text;
+    }
+    match (style.is_bold, style.is_italic) {
+        (true, true) => format!("***{trimmed}***"),
+        (true, false) => format!("**{trimmed}**"),
+        (false, true) => format!("*{trimmed}*"),
+        (false, false) => unreachable!("guarded by early return above"),
+    }
 }
 
 /// Map `ParsedElementType` (rule-engine output, PDF-channel-internal) to
@@ -70,14 +219,22 @@ fn project_element_type(input: &ParsedElementType) -> SemanticElementType {
 /// channel-agnostic `StyleInfo` (alias for `StyleMetadata`). Lossless on
 /// the fields the downstream consumer (`DocumentNode.style_info`)
 /// historically populates: font_family, font_size, is_bold, is_italic,
-/// color, font_class.
+/// foreground_color, font_class.
+///
+/// CR-45: `foreground_color` is sourced from Tika's CSS `color:` (which
+/// is the foreground per CSS spec). `background_color` stays `None` here
+/// — Tika's current `FontClass` regex captures `color:` only and we
+/// don't see `background-color:` on the CSS spans across the corpus. The
+/// `None` is the honest answer; DT-03 covers why we project verbatim
+/// rather than synthesize.
 fn project_style(parsed: &ParsedPdfElement) -> StyleInfo {
     let font = &parsed.style_info;
     StyleInfo {
         font_class: font.class_name.clone(),
         font_size: Some(font.font_size),
         font_family: Some(font.font_family.clone()),
-        color: Some(font.color.clone()),
+        foreground_color: Some(font.color.clone()),
+        background_color: None,
         is_bold: font.font_weight.to_lowercase().contains("bold"),
         is_italic: font.font_style.to_lowercase().contains("italic"),
     }
@@ -129,6 +286,7 @@ mod tests {
                 level: 1,
             }),
             token_count: 42,
+            links: vec![],
         }
     }
 
@@ -141,8 +299,12 @@ mod tests {
         assert_eq!(projected.len(), 1);
         let element = &projected[0];
 
-        // Universal fields preserved.
-        assert_eq!(element.text, "sample text");
+        // Universal fields preserved. v2.2.0+ (CR-61): the fixture has
+        // font_style="italic" + font_weight="bold", so canonical-form
+        // projection wraps the body in `***...***` (C-7b bold-italic).
+        // See `applies_canonical_emphasis_per_c7b` below for the dedicated
+        // projection-behavior tests.
+        assert_eq!(element.text, "***sample text***");
         assert_eq!(element.element_type, SemanticElementType::Section);
         assert_eq!(element.hierarchy_level, 2);
         assert_eq!(element.text_order, 0);
@@ -164,7 +326,11 @@ mod tests {
         assert_eq!(style.font_class, "f1");
         assert_eq!(style.font_size, Some(12.0));
         assert_eq!(style.font_family.as_deref(), Some("LiberationSerif"));
-        assert_eq!(style.color.as_deref(), Some("#112233"));
+        assert_eq!(style.foreground_color.as_deref(), Some("#112233"));
+        assert_eq!(
+            style.background_color, None,
+            "background_color stays None — Tika CSS regex captures color only (CR-45)",
+        );
         assert!(style.is_bold);
         assert!(style.is_italic);
     }
@@ -248,6 +414,80 @@ mod tests {
                 projected[0].hierarchy_level,
             );
         }
+    }
+
+    // ---------- CR-61 / v2.2.0+: canonical-form emphasis projection ----------
+
+    /// Build a fixture with explicit bold/italic flags. Helper for the
+    /// C-7b projection tests below.
+    fn fixture_with_emphasis(
+        element_type: ParsedElementType,
+        text: &str,
+        bold: bool,
+        italic: bool,
+    ) -> ParsedPdfElement {
+        let mut fx = fixture(element_type, 1);
+        fx.text = text.to_string();
+        fx.style_info.font_weight = if bold { "bold" } else { "normal" }.to_string();
+        fx.style_info.font_style = if italic { "italic" } else { "normal" }.to_string();
+        fx
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_italic_only_wraps_text_in_asterisks() {
+        let input = fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", false, true);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "*lorem ipsum*");
+        // Style flag also preserved verbatim per DT-03 — the body wrap
+        // and the JSON `style` field carry the same signal.
+        assert!(projected[0].style.as_ref().unwrap().is_italic);
+        assert!(!projected[0].style.as_ref().unwrap().is_bold);
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_bold_only_wraps_text_in_double_asterisks() {
+        let input = fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", true, false);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "**lorem ipsum**");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_bold_and_italic_wraps_in_triple_asterisks() {
+        let input = fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", true, true);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "***lorem ipsum***");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_no_flags_leaves_text_unchanged() {
+        let input =
+            fixture_with_emphasis(ParsedElementType::Paragraph, "lorem ipsum", false, false);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "lorem ipsum");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_trims_surrounding_whitespace_before_wrap() {
+        // Whitespace at the edges would break CommonMark emphasis (the
+        // delimiters must be adjacent to non-whitespace inside). Trim
+        // before wrap; NodeContent::new will trim again downstream as a
+        // no-op.
+        let input =
+            fixture_with_emphasis(ParsedElementType::Paragraph, "  lorem  ", false, true);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "*lorem*");
+    }
+
+    #[test]
+    fn applies_canonical_emphasis_to_section_heading_text() {
+        // PDF section headings with bold style get the canonical wrap
+        // too — this is the "redundant-but-canonical" case (the # prefix
+        // already implies emphasis, but the rule is uniform across
+        // markdown-inline-domain types per C-7a).
+        let input = fixture_with_emphasis(ParsedElementType::Section, "Introduction", true, false);
+        let projected = project_to_semantic_tree(vec![input]);
+        assert_eq!(projected[0].text, "**Introduction**");
+        assert_eq!(projected[0].element_type, SemanticElementType::Section);
     }
 
     #[test]

@@ -537,12 +537,18 @@ fn test_parser_raw_tags_anchor() {
 
 #[test]
 fn test_integration_rfc_quic_post_strip_defaults() {
+    // Fixture: test_fixtures/xhtml/rfc-quic.xhtml — checked into the repo
+    // alongside test_fixtures/pdfs/rfc-quic.pdf. Regenerate with
+    // `make test-generate-xhtml-fixtures` (from parent repo root) when the
+    // Tika output shape changes. Previously this read from cache/c1-xhtml/
+    // and broke whenever the cache got wiped or the source-hash scheme
+    // changed (CR-47 was one such event).
     let path = format!(
-        "{}/../../cache/c1-xhtml/7b1ea3317b5bea95f28cb546fdb925e2dcd66eb0cee2c02ceb66d9772ec927f2.xhtml",
+        "{}/test_fixtures/xhtml/rfc-quic.xhtml",
         env!("CARGO_MANIFEST_DIR")
     );
     let xhtml = std::fs::read_to_string(&path)
-        .expect("Pre-populated XHTML not found — see worktree setup in handoff (rfc-quic)");
+        .expect("XHTML fixture missing — regenerate with `make test-generate-xhtml-fixtures`");
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
     assert!(!e.is_empty(), "rfc-quic parses to non-empty element list");
@@ -561,14 +567,16 @@ fn test_integration_rfc_quic_post_strip_defaults() {
 }
 
 #[test]
-#[ignore = "CR-33: fixture-dependent — requires pre-populated XHTML cache (see worktree setup in original handoff). Not runnable under default `cargo test`."]
 fn test_integration_attention_rotation() {
+    // Fixture: test_fixtures/xhtml/attention-is-all-you-need.xhtml — checked
+    // in alongside the source PDF in test_fixtures/pdfs/. Regenerate with
+    // `make test-generate-xhtml-fixtures` from parent repo root.
     let path = format!(
-        "{}/../../cache/c1-xhtml/e1feb60eb4fd74de2432c67eff97517f59fdb3364751f38aa636fdc1b82dc9ea.xhtml",
+        "{}/test_fixtures/xhtml/attention-is-all-you-need.xhtml",
         env!("CARGO_MANIFEST_DIR")
     );
     let xhtml = std::fs::read_to_string(&path)
-        .expect("Pre-populated XHTML not found — see worktree setup in handoff (attention)");
+        .expect("XHTML fixture missing — regenerate with `make test-generate-xhtml-fixtures`");
     let output = xhtml_parser::parse_xhtml(&xhtml).expect("parse failed");
     let e = &output.text_elements;
     assert!(
@@ -617,6 +625,7 @@ fn make_element(class_name: &str, font_size: f32, rotation: i32) -> PdfTextEleme
         bookmark_match: None,
         token_count: 1,
         raw_tags: vec![],
+        link: None,
     }
 }
 
@@ -722,6 +731,7 @@ fn make_v2_element(
         bookmark_match: None,
         token_count: 1,
         raw_tags: vec![],
+        link: None,
     }
 }
 

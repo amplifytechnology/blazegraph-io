@@ -49,9 +49,11 @@ use unicode_normalization::UnicodeNormalization;
 static RAW_TAG_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)(?:<[^>]+/>|<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>)").unwrap());
 
-static META_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<meta\s+name="([^"]*)"[^>]*content="([^"]*)"[^>]*/?>"#).unwrap()
-});
+// CR-57 Phase B: the META regex + flat tag dispatch moved to
+// `crate::preprocessors::pdf::metadata::PdfMetadataExtractor`. The
+// metadata-extraction entry point in `parse_xhtml` now drives the trait,
+// so unrecognized XMP tags surface in `pdf.extras` rather than being
+// silently dropped.
 
 static STYLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)<style[^>]*>(.*?)</style>").unwrap());
@@ -70,8 +72,11 @@ static FONT_CLASS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Main entry point. Extracts text elements (with full structural context),
 /// document metadata, style data, and bookmark data.
 pub fn parse_xhtml(xhtml: &str) -> Result<PreprocessorOutput> {
+    use crate::preprocessors::metadata::extract_document_metadata;
+    use crate::preprocessors::pdf::metadata::PdfMetadataExtractor;
+
     let t0 = Instant::now();
-    let metadata = extract_enhanced_metadata(xhtml)?;
+    let metadata = extract_document_metadata(&PdfMetadataExtractor::new(xhtml), &());
     let t1 = Instant::now();
     let style_data = extract_style_data(xhtml)?;
     let t2 = Instant::now();
@@ -190,6 +195,77 @@ fn parse_attr_i32(tag: &str, name: &str) -> Option<i32> {
 
 fn parse_attr_u32(tag: &str, name: &str) -> Option<u32> {
     parse_attr_str(tag, name).and_then(|s| s.parse().ok())
+}
+
+/// Parse a comma-separated `x,y,w,h` bbox string into a BoundingBox.
+/// Returns None on malformed input (wrong arity or unparseable floats).
+fn parse_bbox_string(s: &str) -> Option<BoundingBox> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let x = parts[0].trim().parse::<f32>().ok()?;
+    let y = parts[1].trim().parse::<f32>().ok()?;
+    let width = parts[2].trim().parse::<f32>().ok()?;
+    let height = parts[3].trim().parse::<f32>().ok()?;
+    Some(BoundingBox {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// CR-62: Parse the `data-link-*` attribute family on a `<span>` tag into a
+/// typed PdfLinkAnnotation. Returns `None` when `data-link-kind` is absent
+/// (the vast majority of spans) or when required per-kind fields are missing.
+///
+/// Attribute schema (defined by Tika-side `addLinkAttributes` in
+/// `BlazePDF2XHTML.java`):
+///
+/// - `data-link-bbox="x,y,w,h"` — required when kind present (annotation rect,
+///   top-origin coords matching `data-bbox`).
+/// - `data-link-kind` — one of `internal-named`, `internal-page`, `external-uri`.
+/// - Per kind:
+///   - `internal-named`: `data-link-target-name` (required), optional
+///     `data-link-target-page` / `-x` / `-y` (resolved by name tree).
+///   - `internal-page`: `data-link-target-page` (required), optional `-x` / `-y`.
+///   - `external-uri`: `data-link-target-url` (required).
+fn parse_link_annotation(tag: &str) -> Option<PdfLinkAnnotation> {
+    let kind_str = parse_attr_str(tag, "data-link-kind")?;
+    let bbox_str = parse_attr_str(tag, "data-link-bbox")?;
+    let source_bbox = parse_bbox_string(bbox_str)?;
+
+    let target_page = parse_attr_u32(tag, "data-link-target-page");
+    let target_x = parse_attr_str(tag, "data-link-target-x").and_then(|s| s.parse::<f32>().ok());
+    let target_y = parse_attr_str(tag, "data-link-target-y").and_then(|s| s.parse::<f32>().ok());
+
+    let kind = match kind_str {
+        "internal-named" => {
+            let name = parse_attr_str(tag, "data-link-target-name")?.to_string();
+            PdfLinkKind::InternalNamed {
+                name,
+                target_page,
+                target_x,
+                target_y,
+            }
+        }
+        "internal-page" => {
+            let target_page = target_page?;
+            PdfLinkKind::InternalPage {
+                target_page,
+                target_x,
+                target_y,
+            }
+        }
+        "external-uri" => {
+            let url = parse_attr_str(tag, "data-link-target-url")?.to_string();
+            PdfLinkKind::ExternalUri { url }
+        }
+        _ => return None, // Unrecognized kind — degrade gracefully.
+    };
+
+    Some(PdfLinkAnnotation { source_bbox, kind })
 }
 
 /// Walk a span's inner content and accumulate text outside any inner tag
@@ -315,6 +391,8 @@ fn extract_text_elements(
                 .to_string();
             let line = parse_attr_u32(matched, "data-line").unwrap_or(0);
             let segment = parse_attr_u32(matched, "data-segment").unwrap_or(0);
+            // CR-62: data-link-* attrs are present only on link-bearing spans.
+            let link = parse_link_annotation(matched);
 
             let inner_start = m.end();
             let close_offset = match xhtml[inner_start..].find("</span>") {
@@ -341,6 +419,7 @@ fn extract_text_elements(
                     segment,
                     text_content,
                     raw_tags,
+                    link,
                     style_data,
                     &bookmark_lookup,
                 ) {
@@ -374,29 +453,79 @@ fn extract_text_elements(
     Ok(all_elements)
 }
 
-/// Sort page elements spatially (Y then X) and assign global reading_order.
+/// Sort page elements by Tika's structural reading-order anchor and assign
+/// global reading_order.
+///
+/// CR-51 (initial): replaced the previous Y-then-X spatial sort that
+/// mis-clustered same-line spans with different font baselines (Shannon's
+/// small-caps section header, attention's superscript citations).
+///
+/// CR-51 (revision after rfc-quic regression): the within-line key is
+/// `bounding_box.x` — NOT `segment_number`. Tika walks PDF content streams in
+/// source order, which is monotonic-in-X for Shannon/attention but not for
+/// rfc-quic (where inline-emphasized words like `MAY`/`SHOULD` and URL
+/// hyperlinks are emitted as a later `data-segment` than their visual
+/// neighbors). Sorting by `bounding_box.x` within a `(paragraph, line)` group
+/// is the lossless reading-order reconstruction: Tika's `data-line` grouping
+/// is reliable, and geometric X within line gives the correct order for
+/// inline-styled spans regardless of stream-emission order.
+///
+/// `segment_number` is retained as a tiebreaker for the (rare) case where two
+/// spans share an X coordinate within epsilon. `bounding_box.y` is the final
+/// fallback for fully-degenerate inputs.
+///
+/// The full lex hierarchy is `(page, region_rank, paragraph, line,
+/// bounding_box.x, segment_number, bounding_box.y)`. `region_rank` is a no-op
+/// at this point in the pipeline because `region_label` is `None` until
+/// `analytics::reading_order::tag_and_resort` runs; it is included here so
+/// this sort remains the right "Tika-document-order" anchor if the parser is
+/// ever consumed without the analytics resort.
 fn finalize_page_elements(
     page_elements: &mut Vec<PdfTextElement>,
     all_elements: &mut Vec<PdfTextElement>,
     global_reading_order: &mut u32,
 ) {
-    page_elements.sort_unstable_by(|a, b| {
-        a.placement
-            .bounding_box
-            .y
-            .total_cmp(&b.placement.bounding_box.y)
+    page_elements.sort_by(|a, b| {
+        let pa = &a.placement;
+        let pb = &b.placement;
+        pa.page_number
+            .cmp(&pb.page_number)
             .then_with(|| {
-                a.placement
-                    .bounding_box
-                    .x
-                    .total_cmp(&b.placement.bounding_box.x)
+                region_rank(pa.region_label.as_deref())
+                    .cmp(&region_rank(pb.region_label.as_deref()))
             })
+            .then(pa.paragraph_number.cmp(&pb.paragraph_number))
+            .then(pa.line_number.cmp(&pb.line_number))
+            // Within line: X drives reading order. This is the load-bearing
+            // bit of CR-51 — see the docstring above for the rfc-quic
+            // motivation.
+            .then(pa.bounding_box.x.total_cmp(&pb.bounding_box.x))
+            // Tiebreakers — only fire when X is degenerate (two glyphs at
+            // identical X within a line, which is unusual visually but can
+            // happen for stacked annotations).
+            .then(pa.segment_number.cmp(&pb.segment_number))
+            .then(pa.bounding_box.y.total_cmp(&pb.bounding_box.y))
     });
     for el in page_elements.iter_mut() {
         el.reading_order = *global_reading_order;
         *global_reading_order += 1;
     }
     all_elements.append(page_elements);
+}
+
+/// Stable rank for a region label so the sort hierarchy can disambiguate
+/// columns when Tika's `paragraph_number` collides across regions.
+///
+/// Lexicographic on the `Option<String>` — `None` sorts FIRST (treated as
+/// "no region claim yet"), then string labels in `.cmp` order. At parser
+/// time every element has `region_label == None`, so this is a no-op; it
+/// becomes load-bearing only if a future consumer re-sorts elements after
+/// `analytics::reading_order::tag_and_resort` has tagged them.
+fn region_rank(label: Option<&str>) -> (u8, Option<&str>) {
+    match label {
+        None => (0, None),
+        Some(s) => (1, Some(s)),
+    }
 }
 
 /// NFKC + whitespace fold for cross-source string equivalence. Used to align
@@ -419,23 +548,18 @@ fn build_element(
     segment_number: u32,
     text_content: String,
     raw_tags: Vec<String>,
+    link: Option<PdfLinkAnnotation>,
     style_data: &StyleData,
     bookmark_lookup: &HashMap<String, BookmarkSection>,
 ) -> Option<PdfTextElement> {
     // Parse bounding box: "x,y,width,height"
-    let bbox_parts: Vec<&str> = span_bbox.split(',').collect();
-    if bbox_parts.len() != 4 {
-        return None;
-    }
-    let (x, y, width, height) = match (
-        bbox_parts[0].trim().parse::<f32>(),
-        bbox_parts[1].trim().parse::<f32>(),
-        bbox_parts[2].trim().parse::<f32>(),
-        bbox_parts[3].trim().parse::<f32>(),
-    ) {
-        (Ok(x), Ok(y), Ok(w), Ok(h)) => (x, y, w, h),
-        _ => return None,
-    };
+    let bbox = parse_bbox_string(span_bbox)?;
+    let BoundingBox {
+        x,
+        y,
+        width,
+        height,
+    } = bbox;
 
     // Resolve font class
     let font_class = if let Some(fc) = style_data.font_classes.get(span_class) {
@@ -472,6 +596,7 @@ fn build_element(
         bookmark_match,
         token_count: estimate_token_count(&text_content),
         raw_tags,
+        link,
     })
 }
 
@@ -539,43 +664,13 @@ fn fallback_font(font_class_name: &str) -> FontClass {
 }
 
 // ============================================================================
-// Metadata extraction (regex, stable)
+// Metadata extraction
 // ============================================================================
-
-/// Extract enhanced metadata from <meta> tags.
-fn extract_enhanced_metadata(xhtml: &str) -> Result<DocumentMetadata> {
-    let mut metadata = DocumentMetadata::default();
-
-    for cap in META_REGEX.captures_iter(xhtml) {
-        if let (Some(name), Some(content)) = (cap.get(1), cap.get(2)) {
-            let name_str = name.as_str();
-            let content_str = content.as_str().to_string();
-
-            match name_str {
-                "dc:title" => metadata.title = Some(content_str),
-                "dc:creator" => metadata.author = Some(content_str),
-                "dc:language" => metadata.language = Some(content_str),
-                "xmp:dc:publisher" | "dc:publisher" => metadata.publisher = Some(content_str),
-                "xmp:CreatorTool" => metadata.creator_tool = Some(content_str),
-                "pdf:producer" => metadata.producer = Some(content_str),
-                "pdf:PDFVersion" => metadata.pdf_version = Some(content_str),
-                "dcterms:created" => metadata.created = Some(content_str),
-                "dcterms:modified" => metadata.modified = Some(content_str),
-                "dc:description" => metadata.description = Some(content_str),
-                "pdf:encrypted" => metadata.encrypted = Some(content_str == "true"),
-                "pdf:hasMarkedContent" => metadata.has_marked_content = Some(content_str == "true"),
-                "xmpTPg:NPages" => {
-                    if let Ok(pages) = content_str.parse::<u32>() {
-                        metadata.page_count = pages;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(metadata)
-}
+//
+// The flat `extract_enhanced_metadata` from pre-CR-57 was replaced by
+// `crate::preprocessors::pdf::metadata::PdfMetadataExtractor` — the
+// trait-driven extractor that lives next to the trait it implements.
+// `parse_xhtml` (above) drives that extractor directly.
 
 // ============================================================================
 // Style data extraction (regex, stable)
@@ -782,6 +877,86 @@ mod tests {
         );
     }
 
+    // ── CR-62: data-link-* attribute parsing ─────────────────────────────────
+
+    /// CR-62: span carrying `data-link-kind="internal-named"` attrs lands on
+    /// `PdfTextElement.link` as the typed `InternalNamed` variant with the
+    /// Tika-resolved target page + coords carried through. Matches what
+    /// BlazePDF2XHTML emits for academic-paper citations (PDActionGoTo →
+    /// PDNamedDestination → PDPageXYZDestination).
+    #[test]
+    fn cr62_span_with_internal_named_link_lands_on_element() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="612" data-height="792" />
+<p>
+<span class="f5" data-bbox="327.0,99.9,10.0,8.7" data-line="0" data-segment="1" data-link-bbox="326.0,98.9,12.0,8.8" data-link-kind="internal-named" data-link-target-name="cite.hochreiter1997" data-link-target-page="10" data-link-target-x="108.0" data-link-target-y="339.0">13</span>
+</p>
+</div>"#,
+        );
+        let out = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(out.text_elements.len(), 1);
+        let el = &out.text_elements[0];
+        let link = el.link.as_ref().expect("link should be Some");
+        assert_eq!(link.source_bbox.x, 326.0);
+        assert_eq!(link.source_bbox.y, 98.9);
+        assert_eq!(link.source_bbox.width, 12.0);
+        assert_eq!(link.source_bbox.height, 8.8);
+        match &link.kind {
+            PdfLinkKind::InternalNamed {
+                name,
+                target_page,
+                target_x,
+                target_y,
+            } => {
+                assert_eq!(name, "cite.hochreiter1997");
+                assert_eq!(*target_page, Some(10));
+                assert_eq!(*target_x, Some(108.0));
+                assert_eq!(*target_y, Some(339.0));
+            }
+            other => panic!("expected InternalNamed, got {:?}", other),
+        }
+    }
+
+    /// CR-62: span carrying `data-link-kind="external-uri"` attrs lands on
+    /// `PdfTextElement.link` as `ExternalUri`. Matches what BlazePDF2XHTML
+    /// emits for PDActionURI link annotations.
+    #[test]
+    fn cr62_span_with_external_uri_link_lands_on_element() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="612" data-height="792" />
+<p>
+<span class="f6" data-bbox="405.7,527.1,99.4,8.0" data-line="11" data-segment="1" data-link-bbox="404.7,525.2,100.3,11.1" data-link-kind="external-uri" data-link-target-url="https://github.com/tensorflow/tensor2tensor">https://github.com/</span>
+</p>
+</div>"#,
+        );
+        let out = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(out.text_elements.len(), 1);
+        let link = out.text_elements[0].link.as_ref().expect("link Some");
+        match &link.kind {
+            PdfLinkKind::ExternalUri { url } => {
+                assert_eq!(url, "https://github.com/tensorflow/tensor2tensor");
+            }
+            other => panic!("expected ExternalUri, got {:?}", other),
+        }
+    }
+
+    /// CR-62: backward-compat — spans without any `data-link-*` attrs have
+    /// `link == None`. Verifies the parser stays a no-op on pre-CR-62 XHTML.
+    #[test]
+    fn cr62_span_without_link_attrs_has_no_link_field() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="100.0" data-height="100.0" />
+<p>
+<span class="f1" data-bbox="10,10,50,12" data-line="0" data-segment="0">just text</span>
+</p>
+</div>"#,
+        );
+        let out = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(out.text_elements.len(), 1);
+        assert!(out.text_elements[0].link.is_none(),
+            "spans without data-link-* should produce link: None");
+    }
+
     /// CR-40 acceptance: spans inside `<aside data-rotation="...">` inherit
     /// the rotation; spans outside the aside have rotation=0.
     #[test]
@@ -820,5 +995,196 @@ mod tests {
             normal.placement.rotation, 0,
             "span outside aside should have rotation=0"
         );
+    }
+
+    // ── CR-51: data-segment as reading-order anchor ──────────────────────────
+
+    /// CR-51: Shannon-shape — alternating f1/f4 spans on the same `data-line`
+    /// have different Y baselines (small-caps font drops a pixel). Pre-fix,
+    /// the Y-first spatial sort flattened them into `T D N C HE ISCRETE …`.
+    /// Post-fix, within-line X drives reading_order (which here happens to
+    /// equal segment order 0..7, since Tika emitted Shannon's section header
+    /// in left-to-right source order).
+    #[test]
+    fn cr51_within_line_x_overrides_y_baseline_for_shannon_header() {
+        let xhtml = xhtml_with(
+            r#"<div class="page"><div class="page-meta" data-page="0" data-width="612.0" data-height="792.0" />
+<p>
+<span class="f4" data-bbox="219.2,249.8,19.5,9.7" data-line="0" data-segment="0">1. T</span>
+<span class="f1" data-bbox="239.3,251.3,11.1,7.7" data-line="0" data-segment="1">HE</span>
+<span class="f4" data-bbox="253.3,249.8,7.2,9.7" data-line="0" data-segment="2">D</span>
+<span class="f1" data-bbox="261.0,251.3,35.2,7.7" data-line="0" data-segment="3">ISCRETE</span>
+<span class="f4" data-bbox="299.3,249.8,7.2,9.7" data-line="0" data-segment="4">N</span>
+<span class="f1" data-bbox="307.0,251.3,39.8,7.7" data-line="0" data-segment="5">OISELESS</span>
+<span class="f4" data-bbox="349.7,249.8,6.7,9.7" data-line="0" data-segment="6">C</span>
+<span class="f1" data-bbox="356.8,251.3,35.3,7.7" data-line="0" data-segment="7">HANNEL</span>
+</p>
+</div>"#,
+        );
+        let output = parse_xhtml(&xhtml).expect("parse should succeed");
+        assert_eq!(output.text_elements.len(), 8);
+
+        // After the fix, reading_order matches the within-line X order
+        // (which here equals segment order 0..7 because Tika emitted these
+        // spans in left-to-right source order). The text stream reads
+        // `1. T`, `HE`, `D`, `ISCRETE`, `N`, `OISELESS`, `C`, `HANNEL`.
+        let mut by_order: Vec<&PdfTextElement> = output.text_elements.iter().collect();
+        by_order.sort_by_key(|e| e.reading_order);
+        let texts: Vec<&str> = by_order.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["1. T", "HE", "D", "ISCRETE", "N", "OISELESS", "C", "HANNEL"],
+            "spans must read in within-line X order (Y baseline must not split)"
+        );
+
+        // And the segment_number field on each element matches its position.
+        for (i, el) in by_order.iter().enumerate() {
+            assert_eq!(
+                el.placement.segment_number, i as u32,
+                "element {} should have segment_number={}, got {}",
+                i, i, el.placement.segment_number
+            );
+        }
+    }
+
+    /// CR-51: Multi-column synth — two elements with identical
+    /// `(paragraph, line, segment)` but different `region_label` must be
+    /// disambiguated by `region_rank`. All "1" before all "2", regardless of
+    /// the order the parser saw them (Tika in a two-column doc may
+    /// interleave). We test the sort directly here since `region_label` is
+    /// always `None` after `parse_xhtml` — it's set later by
+    /// `analytics::reading_order::tag_and_resort`. The sort itself, though,
+    /// must respect the field when present.
+    #[test]
+    fn cr51_region_rank_disambiguates_multi_column() {
+        // Build four elements: two columns, two lines each. Tika emitted
+        // interleaved (L1, R1, L2, R2). After the sort, region "1" (left)
+        // must come before region "2" (right).
+        let mut elements: Vec<PdfTextElement> = vec![
+            mk_test_element(1, "L1", 110.0, 100.0, 0, 0, 0, Some("1")),
+            mk_test_element(1, "R1", 400.0, 100.0, 0, 0, 0, Some("2")),
+            mk_test_element(1, "L2", 110.0, 120.0, 0, 1, 0, Some("1")),
+            mk_test_element(1, "R2", 400.0, 120.0, 0, 1, 0, Some("2")),
+        ];
+
+        let mut all_elements: Vec<PdfTextElement> = Vec::new();
+        let mut global_reading_order: u32 = 0;
+        finalize_page_elements(&mut elements, &mut all_elements, &mut global_reading_order);
+
+        let texts: Vec<&str> = all_elements.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["L1", "L2", "R1", "R2"],
+            "region_rank must drive all of column 1 before all of column 2"
+        );
+    }
+
+    /// CR-51: Within-line X is the primary key — when two elements share
+    /// `(page, paragraph, line)`, the one with the smaller X wins regardless
+    /// of which arrived first in document order.
+    #[test]
+    fn cr51_within_line_x_drives_order() {
+        // Same (paragraph, line); different X. Left (110) must come before
+        // right (400) in reading order.
+        let mut elements: Vec<PdfTextElement> = vec![
+            mk_test_element(1, "right", 400.0, 100.0, 0, 0, 0, None),
+            mk_test_element(1, "left", 110.0, 100.0, 0, 0, 0, None),
+        ];
+
+        let mut all_elements: Vec<PdfTextElement> = Vec::new();
+        let mut global_reading_order: u32 = 0;
+        finalize_page_elements(&mut elements, &mut all_elements, &mut global_reading_order);
+
+        let texts: Vec<&str> = all_elements.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["left", "right"],
+            "within-line X drives reading order"
+        );
+
+        // Reading-order also assigned monotonically.
+        assert_eq!(all_elements[0].reading_order, 0);
+        assert_eq!(all_elements[1].reading_order, 1);
+    }
+
+    /// CR-51 (revision): rfc-quic-shape — Tika emits an inline-emphasized
+    /// span (`MAY` in f9-class) with a LATER `data-segment` than its visual
+    /// neighbors. The X coordinate puts it between segments 0 and 1, but the
+    /// PDF content-stream order is 0, 1, 2. The fix asserts X-within-line
+    /// drives reading order, so the styled span lands at its visual position
+    /// regardless of segment number.
+    #[test]
+    fn cr51_within_line_x_overrides_segment_for_rfc_quic_emphasis() {
+        // X positions reproduce the rfc-quic RESET_STREAM line: body 0 ends
+        // at ~x=207, MAY starts at x=207.1, body 1 starts at x=228.0.
+        // Segments are 0, 1, 2 in Tika emission order, but visual order is
+        // body0 → MAY → body1.
+        let mut elements: Vec<PdfTextElement> = vec![
+            mk_test_element(1, "received. An implementation ", 65.9, 457.0, 0, 2, 0, None),
+            mk_test_element(1, " interrupt delivery of stream data", 228.0, 457.0, 0, 2, 1, None),
+            mk_test_element(1, "MAY", 207.1, 457.0, 0, 2, 2, None),
+        ];
+
+        let mut all_elements: Vec<PdfTextElement> = Vec::new();
+        let mut global_reading_order: u32 = 0;
+        finalize_page_elements(&mut elements, &mut all_elements, &mut global_reading_order);
+
+        let texts: Vec<&str> = all_elements.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "received. An implementation ",
+                "MAY",
+                " interrupt delivery of stream data",
+            ],
+            "within-line X order must beat data-segment order — the rfc-quic regression"
+        );
+    }
+
+    // Helper for CR-51 sort tests — builds a minimal PdfTextElement with the
+    // sort-relevant fields set; everything else gets defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn mk_test_element(
+        page: u32,
+        text: &str,
+        x: f32,
+        y: f32,
+        paragraph: u32,
+        line: u32,
+        segment: u32,
+        region: Option<&str>,
+    ) -> PdfTextElement {
+        PdfTextElement {
+            text: text.to_string(),
+            style_info: FontClass {
+                class_name: "f1".to_string(),
+                font_family: "Times".to_string(),
+                font_size: 10.0,
+                font_style: "normal".to_string(),
+                font_weight: "normal".to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Placement {
+                page_number: page,
+                bounding_box: BoundingBox {
+                    x,
+                    y,
+                    width: 50.0,
+                    height: 10.0,
+                },
+                line_number: line,
+                segment_number: segment,
+                rotation: 0,
+                paragraph_number: paragraph,
+                region_label: region.map(|s| s.to_string()),
+                page_width: 612.0,
+                page_height: 792.0,
+            },
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            raw_tags: vec![],
+            link: None,
+        }
     }
 }

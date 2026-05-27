@@ -1,9 +1,9 @@
 //! YAML frontmatter pre-pass for the generic markdown channel.
 //!
 //! Recognizes the `---\n…\n---\n` block convention at the top of a
-//! markdown file. Canonical fields land in their typed slots on
-//! [`DocumentMetadata`]; everything else passes through as opaque
-//! `serde_json::Value` in `DocumentMetadata.extras`.
+//! markdown file. The parsed frontmatter populates a
+//! [`crate::types::DocumentMetadata`] via the channel-agnostic
+//! [`MetadataExtractor`] trait (CR-57 / v2.1.0 wire-format).
 //!
 //! ## Lenient parsing
 //!
@@ -19,15 +19,20 @@
 //! [`gray_matter`] handles both the `---` detection and the YAML
 //! decoding via its internal YAML engine. The lib's result is a
 //! `gray_matter::Pod`, which we convert immediately to
-//! `serde_json::Value` so `DocumentMetadata.extras` and the canonical-
-//! field deserialization never see a `gray_matter` type. The YAML lib
-//! coupling lives entirely inside this module — swapping to a different
-//! YAML engine is a one-file change.
+//! `serde_json::Value` so the public surface depends only on serde_json.
+//! The YAML lib coupling lives entirely inside this module — swapping to
+//! a different YAML engine is a one-file change.
 //!
-//! See the B6 AAR (`docs/P3/core/aars/2026-05-12-B6-...`) for the
-//! handoff's `serde_norway` library lock and why `gray_matter` is
-//! the actual implementation choice.
+//! ## Where the per-field dispatch lives
+//!
+//! Pre-CR-57: the YAML-to-`DocumentMetadata` dispatch was flat and
+//! lived here. Post-CR-57 it lives in [`MdMetadataExtractor`] (in
+//! [`crate::preprocessors::md::metadata`]) so the discipline-not-data
+//! contract from `09-metadata-first-class.md` § The trait shape is
+//! honored — same shape as PDF, DOCX, and any future channel.
 
+use crate::preprocessors::md::metadata::MdMetadataExtractor;
+use crate::preprocessors::metadata::extract_document_metadata;
 use crate::types::DocumentMetadata;
 use gray_matter::engine::YAML;
 use gray_matter::{Matter, Pod};
@@ -43,29 +48,23 @@ const FRONTMATTER_CLOSER_SEARCH_LIMIT: usize = 200;
 /// Detect, extract, and parse YAML frontmatter from a markdown string.
 ///
 /// Returns `(metadata, body)` where:
-/// - `metadata` carries the parsed frontmatter (canonical fields typed,
-///   unknown fields in `extras`). [`DocumentMetadata::default`] when
-///   there is no frontmatter or it fails to parse.
+/// - `metadata` carries the parsed frontmatter assembled through the
+///   [`MdMetadataExtractor`] trait impl (canonical fields flat at the
+///   top; strong-convention + opaque keys under `metadata.md`).
+///   [`DocumentMetadata::default`] when there is no frontmatter or it
+///   fails to parse.
 /// - `body` is the input slice with the frontmatter block (and its
 ///   trailing newline) stripped. The original input slice unchanged
 ///   when there's no frontmatter.
 ///
 /// Lenient by design: malformed YAML returns the default metadata and
 /// the unchanged input, so the `---` block is interpreted as ordinary
-/// markdown by the downstream parser. This matches the design pass's
-/// "no errors on malformed frontmatter — capture what exists; don't
-/// assume correctness" rule.
+/// markdown by the downstream parser.
 pub fn extract_frontmatter(input: &str) -> (DocumentMetadata, &str) {
     let Some(closer_offset) = find_frontmatter_block(input) else {
         return (DocumentMetadata::default(), input);
     };
 
-    // Parse via gray_matter. In 0.3.x, `parse` returns
-    // `Result<ParsedEntity, gray_matter::Error>`; on YAML failure we
-    // get `Err(_)`. ParsedEntity.data is `Option<Pod>` (None on empty
-    // frontmatter block). We do not use `parse_with_struct` because
-    // we need to keep all unknown keys in `extras` rather than
-    // dropping them.
     let matter = Matter::<YAML>::new();
     let Ok(parsed) = matter.parse(input) else {
         // YAML parse failed → lenient: keep the input unchanged so
@@ -77,11 +76,6 @@ pub fn extract_frontmatter(input: &str) -> (DocumentMetadata, &str) {
 
     let metadata = pod_to_metadata(&pod);
 
-    // Slice off the frontmatter block + its trailing newline. We
-    // computed the closer offset ourselves rather than using
-    // `parsed.content` because the latter is owned and we want to
-    // hand back a borrowed slice (the downstream parser doesn't need
-    // a new allocation here).
     let body_start = closer_offset;
     let body = &input[body_start..];
     (metadata, body)
@@ -93,21 +87,13 @@ pub fn extract_frontmatter(input: &str) -> (DocumentMetadata, &str) {
 /// Returns `None` if `input` does not start with a frontmatter block
 /// (no `---\n` opener, or no `---` closer within
 /// [`FRONTMATTER_CLOSER_SEARCH_LIMIT`] lines).
-///
-/// **Detection rule.** Line 1 must be exactly `---` (with optional
-/// trailing whitespace tolerated). Subsequent lines are scanned until
-/// either (a) a line exactly matching `---`, in which case the body
-/// starts on the next line, or (b) the search limit is exceeded, in
-/// which case there is no frontmatter.
 fn find_frontmatter_block(input: &str) -> Option<usize> {
-    // Quick reject: must start with --- on line 1.
     let first_line_end = input.find('\n')?;
     let first_line = &input[..first_line_end];
     if first_line.trim_end() != "---" {
         return None;
     }
 
-    // Scan subsequent lines for the closer.
     let mut cursor = first_line_end + 1;
     let mut lines_scanned = 0;
     while cursor < input.len() && lines_scanned < FRONTMATTER_CLOSER_SEARCH_LIMIT {
@@ -115,7 +101,6 @@ fn find_frontmatter_block(input: &str) -> Option<usize> {
         let line_end = rest.find('\n').map(|n| cursor + n).unwrap_or(input.len());
         let line = &input[cursor..line_end];
         if line.trim_end() == "---" {
-            // Body starts after this `---\n`.
             return Some(line_end + 1);
         }
         cursor = line_end + 1;
@@ -125,82 +110,33 @@ fn find_frontmatter_block(input: &str) -> Option<usize> {
 }
 
 /// Project a `gray_matter::Pod` (the lib's untyped YAML representation)
-/// onto `DocumentMetadata`. Canonical keys (`title`, `author`, `date`,
-/// `tags`, `description`, `draft`) land in their typed fields; everything
-/// else passes through to `extras` as `serde_json::Value`.
-fn pod_to_metadata(pod: &Pod) -> DocumentMetadata {
-    let mut metadata = DocumentMetadata::default();
-
+/// onto a `BTreeMap<String, serde_json::Value>` — the format
+/// [`MdMetadataExtractor`] consumes. Top-level maps project key by key;
+/// anything else (a bare scalar, an array, null) returns an empty map
+/// (lenient).
+fn pod_to_frontmatter_map(pod: &Pod) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
     let Pod::Hash(map) = pod else {
-        // Frontmatter that doesn't parse as a top-level map (e.g.,
-        // just a bare string) — we have nothing to project. Lenient:
-        // return defaults, the `---` block is still stripped.
-        return metadata;
+        return out;
     };
-
     for (key, value) in map {
-        match key.as_str() {
-            "title" => metadata.title = pod_as_string(value),
-            "author" => metadata.author = pod_as_string(value),
-            "date" => metadata.date = pod_as_string(value),
-            "description" => metadata.description = pod_as_string(value),
-            "draft" => metadata.draft = pod_as_bool(value),
-            "tags" => {
-                if let Some(tags) = pod_as_string_array(value) {
-                    metadata.tags = tags;
-                }
-            }
-            other => {
-                if let Some(json_value) = pod_to_json(value) {
-                    metadata.extras.insert(other.to_string(), json_value);
-                }
-            }
+        if let Some(json_value) = pod_to_json(value) {
+            out.insert(key.clone(), json_value);
         }
     }
-
-    // Stable extras key ordering is guaranteed by `BTreeMap`'s
-    // ordered iteration — required for the canonical JSON / graph_sha
-    // invariant under round-trip.
-    let _: &BTreeMap<_, _> = &metadata.extras;
-
-    metadata
+    out
 }
 
-/// Coerce a `Pod` to a string if it's representable as one. Numbers
-/// and booleans are stringified (frontmatter `date: 2026-05-12` parses
-/// as YAML int/date, but a stringified rendering is the lossless
-/// projection onto our free-form `Option<String>` field).
-fn pod_as_string(pod: &Pod) -> Option<String> {
-    match pod {
-        Pod::String(s) => Some(s.clone()),
-        Pod::Integer(i) => Some(i.to_string()),
-        Pod::Float(f) => Some(f.to_string()),
-        Pod::Boolean(b) => Some(b.to_string()),
-        Pod::Null => None,
-        _ => None,
-    }
+fn pod_to_metadata(pod: &Pod) -> DocumentMetadata {
+    let frontmatter = pod_to_frontmatter_map(pod);
+    let extractor = MdMetadataExtractor::from_map(frontmatter);
+    extract_document_metadata(&extractor, &())
 }
 
-fn pod_as_bool(pod: &Pod) -> Option<bool> {
-    match pod {
-        Pod::Boolean(b) => Some(*b),
-        _ => None,
-    }
-}
-
-/// Coerce a `Pod::Array` of string-coercible scalars to `Vec<String>`.
-/// Non-array shapes return None; non-string elements within an array
-/// are stringified via `pod_as_string`.
-fn pod_as_string_array(pod: &Pod) -> Option<Vec<String>> {
-    let Pod::Array(items) = pod else {
-        return None;
-    };
-    Some(items.iter().filter_map(pod_as_string).collect())
-}
-
-/// Convert a `Pod` to `serde_json::Value` for storage in `extras`.
-/// Returns `None` only for shapes that cannot be projected at all
-/// (which `Pod` doesn't have today; all variants are mappable).
+/// Convert a `Pod` to `serde_json::Value` for routing into the
+/// extractor's frontmatter map. Returns `None` only for shapes that
+/// cannot be projected at all (which `Pod` doesn't have today; all
+/// variants are mappable).
 fn pod_to_json(pod: &Pod) -> Option<serde_json::Value> {
     Some(match pod {
         Pod::Null => serde_json::Value::Null,
@@ -215,8 +151,8 @@ fn pod_to_json(pod: &Pod) -> Option<serde_json::Value> {
             serde_json::Value::Array(json_items)
         }
         Pod::Hash(map) => {
-            // serde_json::Map preserves insertion order; for
-            // determinism (graph_sha256 invariant) sort keys.
+            // Sorted-key order for canonicalization (graph_sha256
+            // invariant requires deterministic serialization).
             let mut entries: Vec<(&String, &Pod)> = map.iter().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             let mut out = serde_json::Map::new();
@@ -248,6 +184,7 @@ mod tests {
         let input = "# Heading\n\nBody.\n";
         let (meta, body) = extract_frontmatter(input);
         assert!(meta.title.is_none());
+        assert!(meta.md.is_none());
         assert_eq!(body, input);
     }
 
@@ -273,27 +210,29 @@ mod tests {
         let (meta, _body) = extract_frontmatter(input);
         assert_eq!(meta.title.as_deref(), Some("My Doc"));
         assert_eq!(meta.author.as_deref(), Some("Marcus"));
-        assert_eq!(meta.date.as_deref(), Some("2026-05-12"));
+        // `date` → canonical `created` per design doc § Notes on `created`.
+        assert_eq!(meta.created.as_deref(), Some("2026-05-12"));
         assert_eq!(meta.description.as_deref(), Some("Long form"));
-        assert_eq!(meta.draft, Some(true));
+        let md_ns = meta.md.expect("md namespace populated");
+        assert_eq!(md_ns.draft, Some(true));
         assert_eq!(
-            meta.tags,
+            md_ns.tags,
             vec![
                 "rust".to_string(),
                 "blazegraph".to_string(),
                 "b6".to_string()
             ]
         );
-        // No unknown keys → extras empty.
+        // No unknown keys → md.extras empty.
         assert!(
-            meta.extras.is_empty(),
-            "canonical-only input should produce empty extras; got {:?}",
-            meta.extras
+            md_ns.extras.is_empty(),
+            "canonical-only input should produce empty md.extras; got {:?}",
+            md_ns.extras
         );
     }
 
     #[test]
-    fn extract_frontmatter_unknown_fields_go_to_extras() {
+    fn extract_frontmatter_unknown_fields_go_to_md_extras() {
         let input = "---\n\
                      title: Doc\n\
                      custom_key: custom_value\n\
@@ -302,21 +241,34 @@ mod tests {
                      Body.\n";
         let (meta, _body) = extract_frontmatter(input);
         assert_eq!(meta.title.as_deref(), Some("Doc"));
+        let md_ns = meta.md.expect("md namespace populated");
         assert_eq!(
-            meta.extras.get("custom_key"),
+            md_ns.extras.get("custom_key"),
             Some(&serde_json::Value::String("custom_value".to_string())),
         );
         assert_eq!(
-            meta.extras.get("priority"),
+            md_ns.extras.get("priority"),
             Some(&serde_json::Value::Number(7.into())),
         );
     }
 
     #[test]
+    fn extract_frontmatter_categories_route_to_md_namespace() {
+        let input = "---\n\
+                     title: Doc\n\
+                     categories: [news, updates]\n\
+                     ---\n\
+                     Body.\n";
+        let (meta, _body) = extract_frontmatter(input);
+        let md_ns = meta.md.expect("md namespace populated");
+        assert_eq!(
+            md_ns.categories,
+            vec!["news".to_string(), "updates".to_string()]
+        );
+    }
+
+    #[test]
     fn extract_frontmatter_malformed_yaml_is_lenient() {
-        // YAML with mismatched braces — gray_matter returns
-        // `data: None`. We treat this as "no frontmatter" and leave
-        // the `---` block in the body verbatim.
         let input = "---\ntitle: [unclosed\n---\nBody.\n";
         let (meta, body) = extract_frontmatter(input);
         assert!(
@@ -334,9 +286,14 @@ mod tests {
         let input = "---\n---\nBody.\n";
         let (meta, body) = extract_frontmatter(input);
         assert!(meta.title.is_none());
-        assert!(meta.extras.is_empty());
         // Empty frontmatter block IS stripped — the `---\n---\n` are
         // gone, leaving only the body.
         assert_eq!(body, "Body.\n");
+        // Empty hash → empty channel-md namespace (extractor still
+        // returns Some(MdMetadata::default()) so downstream code that
+        // assumes `md.is_some()` after parsing MD frontmatter holds).
+        assert!(
+            meta.md.as_ref().map(|m| m.extras.is_empty()).unwrap_or(true)
+        );
     }
 }

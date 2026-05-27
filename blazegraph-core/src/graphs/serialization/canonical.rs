@@ -142,6 +142,8 @@ mod tests {
                 token_count: 0,
                 parent: None,
                 children: vec![para_id],
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
         nodes.insert(
@@ -165,6 +167,8 @@ mod tests {
                 token_count: 2,
                 parent: Some(root_id),
                 children: Vec::new(),
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
 
@@ -181,6 +185,7 @@ mod tests {
                     source_sha256: format!("{seed}-src"),
                     config_hash: format!("{seed}-cfg"),
                 }),
+                topology: None,
             },
             structural_profile: StructuralProfile::default(),
         }

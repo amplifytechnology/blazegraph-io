@@ -78,6 +78,8 @@ fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph
                 physical_location: None,
                 style: None,
                 token_count: text.split_whitespace().count(),
+                internal_refs: vec![],
+                external_refs: vec![],
             }
         })
         .collect();
@@ -132,21 +134,28 @@ fn assert_semantically_equal(g1: &DocumentGraph, g2: &DocumentGraph) {
         g1.document_info.document_metadata.author, g2.document_info.document_metadata.author,
         "author drift"
     );
+    // Post-CR-57: `date` migrated to canonical `created`; channel-specific
+    // fields live under `metadata.md.*`.
     assert_eq!(
-        g1.document_info.document_metadata.date, g2.document_info.document_metadata.date,
-        "date drift"
+        g1.document_info.document_metadata.created, g2.document_info.document_metadata.created,
+        "created drift"
+    );
+    let g1_md = g1.document_info.document_metadata.md.as_ref();
+    let g2_md = g2.document_info.document_metadata.md.as_ref();
+    assert_eq!(
+        g1_md.map(|m| &m.tags),
+        g2_md.map(|m| &m.tags),
+        "md.tags drift"
     );
     assert_eq!(
-        g1.document_info.document_metadata.tags, g2.document_info.document_metadata.tags,
-        "tags drift"
+        g1_md.and_then(|m| m.draft),
+        g2_md.and_then(|m| m.draft),
+        "md.draft drift"
     );
     assert_eq!(
-        g1.document_info.document_metadata.draft, g2.document_info.document_metadata.draft,
-        "draft drift"
-    );
-    assert_eq!(
-        g1.document_info.document_metadata.extras, g2.document_info.document_metadata.extras,
-        "extras drift"
+        g1_md.map(|m| &m.extras),
+        g2_md.map(|m| &m.extras),
+        "md.extras drift"
     );
 }
 

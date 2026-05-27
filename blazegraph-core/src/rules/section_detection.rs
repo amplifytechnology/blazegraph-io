@@ -56,6 +56,7 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
                         reading_order: text_element.reading_order,
                         bookmark_match: text_element.bookmark_match.clone(),
                         token_count: text_element.token_count,
+                        links: vec![],
                     }
                 })
                 .collect()

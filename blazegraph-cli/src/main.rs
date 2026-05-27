@@ -50,11 +50,14 @@ enum Command {
 
     /// Strip bgraph fences from a bgraph.md file.
     ///
-    /// Two modes: `body-only` (default) removes every bgraph fence
-    /// for Unstructured-equivalent body-only output; `keep-metadata`
-    /// preserves the doc-level identity block while stripping
-    /// per-element fences. All body content is preserved in both modes
-    /// (v2.0.0 body-outside convention).
+    /// `body-with-frontmatter` (default) strips every bgraph fence and
+    /// lifts the doc-level `bgraph` block to YAML frontmatter at the
+    /// top of the output — produces docling-comparable plain markdown
+    /// with provenance preserved. `body-only` strips every bgraph
+    /// fence and drops metadata entirely (Unstructured-equivalent).
+    /// `--node-types` is an orthogonal filter that removes specified
+    /// element types entirely via the spec's structural rule;
+    /// composes with `--mode`.
     Strip(StripArgs),
 }
 
@@ -108,8 +111,14 @@ struct ParseArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Include style_info on each node (font_class, font_size, font_family, bold, italic, color).
-    /// Stripped by default to reduce output size (~20%). PDF channel only.
+    /// Include `style` on every per-element fence in the emitted bgraph.md
+    /// (verbatim Tika projection — `foreground_color`, `background_color`,
+    /// `font_family`, `font_size`, `is_bold`, `is_italic`, `font_class`).
+    /// CR-59 reverted the default to opt-in: by default the wire-format
+    /// emitter omits `style` (the in-memory `node.style_info` is still
+    /// populated for library consumers). Pass this flag to round-trip a
+    /// PDF-source graph with style preserved in the emitted bgraph.md.
+    /// PDF channel only.
     #[arg(long)]
     include_style_info: bool,
 
@@ -160,7 +169,7 @@ struct ParseArgs {
 
 #[derive(ClapArgs)]
 struct StripArgs {
-    /// Path to the bgraph.md file to strip.
+    /// Path to the bgraph.md file to strip. Source file is never modified.
     #[arg(short, long)]
     input: String,
 
@@ -168,29 +177,96 @@ struct StripArgs {
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Strip mode. Default: `body-only` (Unstructured-equivalent body text).
-    #[arg(long, value_enum, default_value_t = CliStripMode::BodyOnly)]
+    /// Strip mode. Default: `body-with-frontmatter` — strip every
+    /// fence, lift doc-level metadata to YAML frontmatter. Produces
+    /// docling-comparable plain markdown with provenance preserved.
+    ///
+    /// Alternative:
+    /// - `body-only`: strip every fence, drop metadata entirely.
+    #[arg(long, value_enum, default_value_t = CliStripMode::BodyWithFrontmatter)]
     mode: CliStripMode,
+
+    /// Comma-separated list of element types to strip entirely (body +
+    /// fence) via the spec's structural rule. E.g.,
+    /// `--node-types header,footer,margin` for RAG-clean output
+    /// without running noise. Orthogonal to `--mode`: composes with
+    /// the default and with any explicit mode (filter pass first,
+    /// then mode pass).
+    ///
+    /// Valid types (current v2.0.0 set): header, footer, margin,
+    /// section, paragraph, codeblock, list, blockquote, table,
+    /// bookmarks. Unknown types are rejected with a list of valid
+    /// values. `bgraph` (the doc-level fence) cannot be a node-type
+    /// target — use `--mode body-only` to drop metadata instead.
+    #[arg(long, value_delimiter = ',', value_parser = parse_node_type)]
+    node_types: Vec<String>,
 }
 
-/// CLI mirror of [`blazegraph_io_core::preprocessors::md::StripMode`].
+/// Valid v2.0.0 per-element fence tags (un-prefixed). Used for
+/// CLI-level validation of `--node-types`. Mirrors the dashed-info-
+/// string discipline in
+/// `blazegraph_io_core::preprocessors::md::bgraph_md::bgraph_fence_open_tag`.
+const VALID_NODE_TYPES: &[&str] = &[
+    "bookmarks",
+    "section",
+    "paragraph",
+    "header",
+    "footer",
+    "margin",
+    "codeblock",
+    "list",
+    "blockquote",
+    "table",
+];
+
+/// clap value-parser for `--node-types`. Rejects unknown tags and the
+/// bare `bgraph` doc-level tag at the CLI layer with a hint to use
+/// `--mode body-only` instead.
+fn parse_node_type(s: &str) -> std::result::Result<String, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty node type".to_string());
+    }
+    if s == "bgraph" {
+        return Err(
+            "`bgraph` (the doc-level fence) cannot be a --node-types target; \
+             use `--mode body-only` to drop metadata entirely"
+                .to_string(),
+        );
+    }
+    if VALID_NODE_TYPES.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "unknown node type `{s}`; valid types: {}",
+            VALID_NODE_TYPES.join(", ")
+        ))
+    }
+}
+
+
+
+/// CLI mirror of [`blazegraph_io_core::preprocessors::md::StripMode`]
+/// (the two exposed-as-`--mode` variants — `NodeTypes` is reached via
+/// the orthogonal `--node-types` flag, not as a `--mode` value).
 ///
 /// Held separately so the CLI surface can use clap's `ValueEnum`
 /// derive without imposing it on the lib type.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum CliStripMode {
+    /// Strip every bgraph fence and lift the doc-level block to YAML
+    /// frontmatter. Produces docling-comparable plain markdown.
+    BodyWithFrontmatter,
     /// Remove all bgraph fences (Unstructured-equivalent body output).
     BodyOnly,
-    /// Keep doc-level fence; strip every dashed fence. All body content survives.
-    KeepMetadata,
 }
 
 impl From<CliStripMode> for blazegraph_io_core::preprocessors::md::StripMode {
     fn from(m: CliStripMode) -> Self {
         use blazegraph_io_core::preprocessors::md::StripMode as Core;
         match m {
+            CliStripMode::BodyWithFrontmatter => Core::BodyWithFrontmatter,
             CliStripMode::BodyOnly => Core::BodyOnly,
-            CliStripMode::KeepMetadata => Core::KeepMetadata,
         }
     }
 }
@@ -351,19 +427,16 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
         &cache_defaults,
         args.profile,
     ) {
-        Ok(mut graph) => {
+        Ok(graph) => {
             println!("✅ Successfully processed document");
             println!("📊 Graph: {} nodes", graph.nodes.len());
 
-            // Strip style_info from output unless explicitly requested
-            if !args.include_style_info {
-                for node in graph.nodes.values_mut() {
-                    node.style_info = None;
-                }
-            }
-
+            // CR-59 (v2.1.0+): style emission is opt-in. The pipeline
+            // always populates `node.style_info` for library consumers;
+            // only the bgraph.md serializer gates emission, threaded
+            // through `save_graph` → `EmitOptions::include_style_info`.
             let output_path = resolve_output_path(&args);
-            save_graph(&graph, &output_path, &args.output_format)?;
+            save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
 
             // Fast exit - skip JVM shutdown sequence
             #[cfg(feature = "jni-backend")]
@@ -437,19 +510,14 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
         }
     }
 
-    let mut graph = result.graph;
+    let graph = result.graph;
     println!("📊 Graph: {} nodes", graph.nodes.len());
 
-    if !args.include_style_info {
-        // bgraph.md v1.0.0 doesn't carry style_info, but the toggle
-        // is symmetric with the PDF path — keep behavior consistent.
-        for node in graph.nodes.values_mut() {
-            node.style_info = None;
-        }
-    }
-
+    // CR-59 (v2.1.0+): style emission is opt-in. Pipeline keeps
+    // `node.style_info` populated for library consumers; the bgraph.md
+    // serializer is gated via `EmitOptions::include_style_info`.
     let output_path = resolve_output_path(&args);
-    save_graph(&graph, &output_path, &args.output_format)?;
+    save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
     Ok(())
 }
 
@@ -458,33 +526,38 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
 // =========================================================================
 
 fn run_strip(args: StripArgs) -> Result<()> {
-    use blazegraph_io_core::preprocessors::md::{strip, ParseError};
+    use blazegraph_io_core::preprocessors::md::StripMode;
 
     let content = std::fs::read_to_string(&args.input)
         .map_err(|e| anyhow!("failed to read {}: {e}", args.input))?;
 
-    let stripped = match strip(&content, args.mode.into()) {
-        Ok(s) => s,
-        Err(ParseError::MalformedFence(msg)) => {
-            eprintln!("❌ strip failed: malformed bgraph fence — {msg}");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("❌ strip failed: {e}");
-            std::process::exit(1);
-        }
+    // Run order (CR-55): if `--node-types` non-empty, apply the
+    // structural-rule deletion pass first, then the `--mode` pass on
+    // the result. The structural-rule pass walks body-above + fence
+    // pair as a paired range deletion; the mode passes work on
+    // remaining fences without needing the deleted ranges.
+    let after_filter = if args.node_types.is_empty() {
+        content
+    } else {
+        run_strip_step(&content, StripMode::NodeTypes(args.node_types.clone()))
     };
+    let stripped = run_strip_step(&after_filter, args.mode.into());
 
     match &args.output {
         Some(path) => {
             std::fs::write(path, &stripped)
                 .map_err(|e| anyhow!("failed to write {}: {e}", path))?;
             let mode_label = match args.mode {
+                CliStripMode::BodyWithFrontmatter => "body-with-frontmatter",
                 CliStripMode::BodyOnly => "body-only",
-                CliStripMode::KeepMetadata => "keep-metadata",
+            };
+            let filter_label = if args.node_types.is_empty() {
+                String::new()
+            } else {
+                format!(" + --node-types={}", args.node_types.join(","))
             };
             println!(
-                "💾 Stripped ({mode_label}, {} bytes) saved to: {path}",
+                "💾 Stripped ({mode_label}{filter_label}, {} bytes) saved to: {path}",
                 stripped.len()
             );
         }
@@ -494,6 +567,24 @@ fn run_strip(args: StripArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run a single strip pass, exiting the process on error. Used by
+/// `run_strip` to compose the optional `--node-types` filter pass
+/// with the `--mode` pass.
+fn run_strip_step(content: &str, mode: blazegraph_io_core::preprocessors::md::StripMode) -> String {
+    use blazegraph_io_core::preprocessors::md::{strip, ParseError};
+    match strip(content, mode) {
+        Ok(s) => s,
+        Err(ParseError::MalformedFence(msg)) => {
+            eprintln!("❌ strip failed: malformed bgraph fence — {msg}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("❌ strip failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 // =========================================================================
@@ -711,9 +802,12 @@ fn show_help() {
 
     println!("\n🪓 `strip` modes:");
     println!(
-        "  --mode body-only        Remove all bgraph fences (default; Unstructured-equivalent)"
+        "  --mode body-with-frontmatter  (default) Strip every fence; lift doc-level metadata to YAML frontmatter"
     );
-    println!("  --mode keep-metadata    Keep doc-level block + body; strip per-element fences");
+    println!("  --mode body-only        Remove all bgraph fences (Unstructured-equivalent body output)");
+    println!(
+        "  --node-types <list>     Comma-sep types to strip entirely via structural rule (e.g. header,footer,margin)"
+    );
 
     println!("\n📝 Usage Examples:");
     println!("  blazegraph parse -i document.pdf");
@@ -722,8 +816,9 @@ fn show_help() {
     println!("  blazegraph parse -i document.md -f graph -o document.json");
     println!("  blazegraph parse -i document.bgraph.md -o document.json");
     println!("  blazegraph parse -i document.bgraph.md --accept-drift -o derived.json");
-    println!("  blazegraph strip -i document.bgraph.md -o document_body.md");
-    println!("  blazegraph strip -i document.bgraph.md --mode keep-metadata -o document_meta.md");
+    println!("  blazegraph strip -i document.bgraph.md -o document.md   # default: body+frontmatter");
+    println!("  blazegraph strip -i document.bgraph.md --mode body-only -o document_body.md");
+    println!("  blazegraph strip -i document.bgraph.md --node-types header,footer,margin -o clean.md");
 
     #[cfg(feature = "jni-backend")]
     {
@@ -782,7 +877,12 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<()> {
+fn save_graph(
+    graph: &DocumentGraph,
+    output_path: &str,
+    format: &str,
+    include_style_info: bool,
+) -> Result<()> {
     match format {
         // B6: `-f markdown` is the generic-markdown emitter.
         // `-f bgraph-md` (new) is the bgraph.md round-trip artifact
@@ -813,7 +913,18 @@ fn save_graph(graph: &DocumentGraph, output_path: &str, format: &str) -> Result<
             println!("💾 Markdown saved to: {}", output_path);
         }
         "bgraph-md" => {
-            let md = blazegraph_io_core::graphs::serialization::markdown::emit_markdown(graph);
+            // CR-59 (v2.1.0+): the bgraph.md emitter takes an explicit
+            // options struct; the CLI threads `--include-style-info`
+            // through. Other output formats don't carry style on the
+            // wire (graph.json carries it via `DocumentNode.style_info`
+            // directly; generic markdown has no per-element JSON).
+            let opts = blazegraph_io_core::graphs::serialization::markdown::EmitOptions {
+                include_style_info,
+            };
+            let md =
+                blazegraph_io_core::graphs::serialization::markdown::emit_markdown_with_options(
+                    graph, opts,
+                );
             std::fs::write(output_path, md)?;
             println!("💾 bgraph.md saved to: {}", output_path);
         }
@@ -936,6 +1047,7 @@ mod tests {
                 document_metadata: DocumentMetadata::default(),
                 bookmark_data: None,
                 parse_provenance: None,
+                topology: None,
             },
             structural_profile: StructuralProfile::default(),
         }

@@ -73,6 +73,49 @@ pub struct DocumentInfo {
     /// Schema 0.6.0 (B2 of MD+DOCX flow).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parse_provenance: Option<ParseProvenance>,
+
+    /// Parsing-semantics signal. Bgraph.md v2.1.0+ (CR-49):
+    ///
+    /// - `"tree"` — spacelike content (documents, notes, derived corpus.md
+    ///   files). Default semantically; absence means tree.
+    /// - `"stream"` — timelike content (conversations, message logs).
+    ///
+    /// Lives on the doc-level `bgraph` block. The bgraph.md emitter writes
+    /// this field when populated and skips it when `None`. URD's
+    /// topology-aware storage uses this signal to choose dedup strategy
+    /// (cross-pack global vs pack-scoped) at write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<String>,
+
+    // CR-60 (2026-05-22) retracted `source_identity` and `supersedes`
+    // here per the byte-in/byte-out schema-boundary principle
+    // (`docs/P2/core/architecture/11-byte-in-byte-out.md`,
+    //  `docs/P2/core/deliberate-tradeoffs/DT-04-byte-in-byte-out-schema-boundary.md`).
+    // Filesystem paths and URD addresses are stateful concepts owned by
+    // the storage-layer adapter (URD), not the stateless parser.
+    // `topology` stays — it's parser-known (channel decides) + immutable.
+}
+
+/// Orphan struct reserved for the future stream-topology design slice.
+///
+/// CR-49 introduced this as the variant-specific metadata carrier for
+/// `SemanticElementType::Message` on the shared `DocumentNode` /
+/// `SemanticTreeElement` shapes. CR-59 retracted the wire format and
+/// removed the field — the struct survives only as a placeholder for
+/// the future stream-topology pipeline.
+///
+/// The shape (`speaker: Option<String>`, `timestamp: Option<String>`,
+/// `turn_number: Option<u32>`) is provisional — the real stream-topology
+/// design will likely promote `speaker` to a richer `{role, identifier?}`
+/// object, and may add fields not anticipated here. Treat this as a
+/// placeholder, not a contract.
+///
+/// Not constructed anywhere in v2.1.0.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MessageMetadata {
+    pub speaker: Option<String>,
+    pub timestamp: Option<String>,
+    pub turn_number: Option<u32>,
 }
 
 /// Provenance record for a specific parse run. Persisted on
@@ -210,6 +253,14 @@ pub struct DocumentNode {
     pub token_count: usize,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
+    /// CR-62 (v2.3.0+): references to other locations within this document.
+    /// Empty omitted from the wire format. Reading-order sorted by source
+    /// segment position (CR-61 invariant).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_refs: Vec<InternalRef>,
+    /// CR-62 (v2.3.0+): references to external locations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_refs: Vec<ExternalRef>,
 }
 
 impl DocumentNode {
@@ -232,6 +283,8 @@ impl DocumentNode {
             token_count: 0,
             parent: None,
             children: Vec::new(),
+            internal_refs: vec![],
+            external_refs: vec![],
         }
     }
 
@@ -254,6 +307,8 @@ impl DocumentNode {
             token_count: 0,
             parent: None,
             children: Vec::new(),
+            internal_refs: vec![],
+            external_refs: vec![],
         }
     }
 
@@ -347,6 +402,7 @@ pub enum NodeType {
     Footer,
 }
 
+/// Verbatim Tika style projection — see DT-03 for why this is the right shape now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleMetadata {
     pub font_class: String,
@@ -354,7 +410,17 @@ pub struct StyleMetadata {
     pub is_bold: bool,
     pub is_italic: bool,
     pub font_family: Option<String>,
-    pub color: Option<String>, // CSS color value (e.g., "#FF0000" or "rgb(255,0,0)")
+    /// CSS foreground color value (e.g., "#FF0000" or "rgb(255,0,0)").
+    /// Renamed from `color` in CR-45 — this field has always been the
+    /// foreground color; the rename clarifies that against the new
+    /// `background_color` slot.
+    pub foreground_color: Option<String>,
+    /// CSS background color value (e.g., "#FFFFFF" or "rgb(255,255,255)").
+    /// PDF channel: populated only when Tika surfaces `background-color` on
+    /// the wrapping element. Most body-text spans have no explicit
+    /// background, so `None` is the dominant case — see DT-03 for why we
+    /// project verbatim rather than synthesize.
+    pub background_color: Option<String>,
 }
 
 /// Channel-agnostic style information attached to `SemanticTreeElement`.
@@ -550,9 +616,66 @@ pub struct PdfTextElement {
     pub token_count: usize,
     /// Unrecognized XHTML tag fragments that are descendants of this span (any depth).
     /// Each entry is the full unparsed fragment including content text.
-    /// Empty for all spans in current core Tika output. A future corpus-tier Tika JAR
-    /// will emit <a href>, <annotation>, etc. here.
+    /// CR-62 superseded the closed-source raw_html design by emitting typed
+    /// `data-link-*` attrs on spans and parsing them into `link` below; the
+    /// `raw_tags` field is retained for backward-compatibility with the CR-40
+    /// reception infrastructure but is empty for spans whose link data lands
+    /// in `link`. Future cleanup slice may remove it entirely.
     pub raw_tags: Vec<String>,
+    /// CR-62: PDF link annotation that covers this span, when one exists.
+    /// `None` when the span carries no `data-link-*` attributes (the vast
+    /// majority of spans on any given page). The splitter discipline in
+    /// `BlazePDF2XHTML.splitByLinkAnnotation` guarantees a span overlaps
+    /// at most one annotation; 0-or-1 is the type-level invariant.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub link: Option<PdfLinkAnnotation>,
+}
+
+/// CR-62: A PDF link annotation correlated with a single span. The bbox is
+/// the annotation rect in top-origin page coords (the Tika-side conversion
+/// already happened); the source-side page number lives on the carrying
+/// `PdfTextElement.placement.page_number` and isn't duplicated here.
+///
+/// Aggregation into `SemanticTreeElement.internal_refs[]` /
+/// `.external_refs[]` happens at projection time
+/// (see `preprocessors/pdf/semantic_tree_projection.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdfLinkAnnotation {
+    /// Annotation rect, top-origin coords on the source page. Differs
+    /// slightly from the span's text bbox — annotation rects typically
+    /// inflate beyond glyph extent for click-target margin.
+    pub source_bbox: BoundingBox,
+    pub kind: PdfLinkKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PdfLinkKind {
+    /// Internal goto via a named destination (`cite.hochreiter1997`,
+    /// `name-section-1.1`). Tika resolves the name to a target page +
+    /// (left, top) via the PDF's name tree when possible; the resolved
+    /// fields are `None` when name-tree lookup fails (rare; 0% in the
+    /// current corpus per the S8 probe).
+    InternalNamed {
+        name: String,
+        target_page: Option<u32>,
+        target_x: Option<f32>,
+        /// Top-origin Y on the *target* page (Tika converted from PDF
+        /// bottom-origin using the target page's height).
+        target_y: Option<f32>,
+    },
+    /// Internal goto by raw page index (no name). Target coords optional
+    /// (set when the destination was a PDPageXYZDestination).
+    InternalPage {
+        target_page: u32,
+        target_x: Option<f32>,
+        target_y: Option<f32>,
+    },
+    /// External URI (typically `https://...`; future enrichment slice
+    /// CR-63 may also produce `mailto:...` for pattern-detected emails).
+    ExternalUri {
+        url: String,
+    },
 }
 
 impl PdfTextElement {
@@ -585,93 +708,119 @@ pub struct BoundingBox {
     // page moved to DocumentNode level
 }
 
+/// Document-extracted metadata. Universal canonical fields at the top
+/// (cross-channel consistency contract); channel-specific format-native
+/// fields under named namespaces.
+///
+/// Wire-format home: the `bgraph-metadata` doc-level fence
+/// (`docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment I.3).
+/// One per document; emitted whether or not any field is populated.
+///
+/// Canonical fields read **source-native only** — no body-side fallback
+/// (per `09-metadata-first-class.md` § F-02 deferred to composition layer).
+/// Title / author / language / description / created return `None` when the
+/// source's metadata does not carry them; cleanup is a composition-layer
+/// concern (URD or above), not extraction.
+///
+/// Schema 0.7.0 (B6): canonical fields + opaque `extras` were flat.
+/// Schema 0.7.1+ (CR-57 / v2.1.0): namespaced channel-specific sub-objects
+/// (`pdf` / `md` / `docx`) replace the flat per-channel fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DocumentMetadata {
-    // Current fields
+    // Universal extracted (canonical)
     pub title: Option<String>,
     pub author: Option<String>,
+    pub description: Option<String>,
     pub language: Option<String>,
-    pub page_count: u32,
+    pub created: Option<String>,
 
-    // Enhanced flat fields from <meta> tags
-    pub publisher: Option<String>,        // xmp:dc:publisher
-    pub creator_tool: Option<String>,     // xmp:CreatorTool
-    pub producer: Option<String>,         // pdf:producer
-    pub pdf_version: Option<String>,      // pdf:PDFVersion
-    pub created: Option<String>,          // dcterms:created
-    pub modified: Option<String>,         // dcterms:modified
-    pub description: Option<String>,      // dc:description
-    pub encrypted: Option<bool>,          // pdf:encrypted
-    pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
+    // Channel-specific namespaces (typically only one populated per document).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<PdfMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md: Option<MdMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docx: Option<DocxMetadata>,
+}
 
-    // Schema 0.7.0+ (B6): canonical frontmatter fields from the
-    // markdown channel. Free-form strings (rather than typed Date /
-    // tag-vocabulary types) because frontmatter is user-authored and
-    // lenient — we capture what's there, not normalize it.
-    #[serde(default)]
-    pub date: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub draft: Option<bool>,
-
-    // Schema 0.7.0+ (B6): opaque pass-through for non-canonical
-    // frontmatter keys. YAML values from the markdown channel are
-    // converted to `serde_json::Value` at the frontmatter-parse
-    // boundary (in `preprocessors::md::frontmatter`) so the schema
-    // type does not depend on the YAML library.
-    //
-    // `BTreeMap` (not `HashMap`) so canonical JSON serialization is
-    // deterministic — same input must produce the same `graph_sha256`.
+/// PDF-channel metadata: strong-convention typed fields + `extras`
+/// passthrough for any non-canonical XMP / `<meta>` tag the source carries.
+///
+/// `extras` closes the asymmetry from pre-CR-57 where unrecognized XMP tags
+/// were silently dropped at the `_ => {}` arm in the flat extractor —
+/// per `09-metadata-first-class.md` § Channel-specific (pdf).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PdfMetadata {
+    pub version: Option<String>,           // pdf:PDFVersion
+    pub producer: Option<String>,          // pdf:producer
+    pub creator_tool: Option<String>,      // xmp:CreatorTool
+    pub publisher: Option<String>,         // xmp:dc:publisher | dc:publisher
+    pub page_count: Option<u32>,           // xmpTPg:NPages
+    pub encrypted: Option<bool>,           // pdf:encrypted
+    pub has_marked_content: Option<bool>,  // pdf:hasMarkedContent
+    pub modified: Option<String>,          // dcterms:modified
     #[serde(default)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
-impl DocumentMetadata {
-    /// Merge extracted metadata on top of current values.
-    /// Non-None fields from `extracted` overwrite; None fields preserve existing.
-    /// page_count overwrites if > 0.
-    pub fn merge_extracted(&mut self, extracted: DocumentMetadata) {
-        if extracted.title.is_some() {
-            self.title = extracted.title;
-        }
-        if extracted.author.is_some() {
-            self.author = extracted.author;
-        }
-        if extracted.language.is_some() {
-            self.language = extracted.language;
-        }
-        if extracted.page_count > 0 {
-            self.page_count = extracted.page_count;
-        }
-        if extracted.publisher.is_some() {
-            self.publisher = extracted.publisher;
-        }
-        if extracted.creator_tool.is_some() {
-            self.creator_tool = extracted.creator_tool;
-        }
-        if extracted.producer.is_some() {
-            self.producer = extracted.producer;
-        }
-        if extracted.pdf_version.is_some() {
-            self.pdf_version = extracted.pdf_version;
-        }
-        if extracted.created.is_some() {
-            self.created = extracted.created;
-        }
-        if extracted.modified.is_some() {
-            self.modified = extracted.modified;
-        }
-        if extracted.description.is_some() {
-            self.description = extracted.description;
-        }
-        if extracted.encrypted.is_some() {
-            self.encrypted = extracted.encrypted;
-        }
-        if extracted.has_marked_content.is_some() {
-            self.has_marked_content = extracted.has_marked_content;
-        }
-    }
+/// MD-channel metadata: strong-convention frontmatter slots (`draft`,
+/// `tags`, `categories`) plus `extras` for everything else (Hugo `slug` /
+/// `layout`, Astro `pubDate`, Obsidian aliases, …).
+///
+/// `BTreeMap` (not `HashMap`) so canonical JSON serialization is
+/// deterministic — same input must produce the same `graph_sha256`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MdMetadata {
+    pub draft: Option<bool>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+/// DOCX-channel metadata: strong-convention typed fields drawn from
+/// `docProps/core.xml` + `docProps/app.xml`; `extras` passthrough for
+/// `docProps/custom.xml` and any non-canonical OOXML properties.
+///
+/// Stub-ready (CR-57): the type lands in v2.1.0 so the schema is
+/// complete and Track C (S10) does not need a follow-on schema bump.
+/// The DOCX channel extractor is a stub returning `Default` until S10
+/// wires the real OOXML probe.
+/// Tagged union for channel-specific metadata, produced by a channel's
+/// [`crate::preprocessors::metadata::MetadataExtractor`] impl and routed
+/// into the corresponding namespace slot on [`DocumentMetadata`].
+///
+/// Adding a new channel adds a variant here; the type system carries the
+/// dispatch — every match site updates under the compiler's eye.
+#[derive(Debug, Clone)]
+pub enum ChannelMetadata {
+    Pdf(PdfMetadata),
+    Md(MdMetadata),
+    Docx(DocxMetadata),
+    // Future: Html(HtmlMetadata), Epub(EpubMetadata), …
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DocxMetadata {
+    pub application: Option<String>,
+    pub app_version: Option<String>,
+    pub pages: Option<u32>,
+    pub words: Option<u32>,
+    pub characters: Option<u32>,
+    pub lines: Option<u32>,
+    pub paragraphs: Option<u32>,
+    pub company: Option<String>,
+    pub manager: Option<String>,
+    pub template: Option<String>,
+    pub total_time: Option<u32>,
+    pub doc_security: Option<u32>,
+    pub last_modified_by: Option<String>,
+    pub revision: Option<String>,
+    pub modified: Option<String>,
+    #[serde(default)]
+    pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -795,7 +944,10 @@ pub struct GraphAnalytics;
 /// projection-time vec position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticTreeElement {
-    /// The text content of this element.
+    /// The text content of this element. Must be non-empty (post-trim)
+    /// for any variant where `element_type.requires_non_empty_body()`
+    /// returns `true` — see [C-7a body-content domain in `08-bgraph-md-format.md`].
+    /// Construction sites enforce this via [`SemanticTreeElement::validate`].
     pub text: String,
 
     /// What kind of element this is.
@@ -823,6 +975,117 @@ pub struct SemanticTreeElement {
 
     /// Pre-computed token count.
     pub token_count: usize,
+
+    /// CR-62 (v2.3.0+): References from this element to other locations
+    /// **within this document** (PDF goto annotations resolving to named
+    /// destinations or specific page coordinates; MD anchor links). Reading-
+    /// order sorted by source segment position. Empty vec omitted from
+    /// emission. Consumer-side substring lookup matches the nth occurrence
+    /// of `ref.text` in `text` to the nth list entry with that text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_refs: Vec<InternalRef>,
+
+    /// CR-62 (v2.3.0+): References from this element to locations
+    /// **outside this document** (PDF URI annotations; MD external links).
+    /// Same reading-order + substring-anchor invariants as `internal_refs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_refs: Vec<ExternalRef>,
+}
+
+/// CR-62: A reference from an element to a location within the same document.
+///
+/// `text` is the visible link text from the source — the substring-anchor
+/// lookup key per CR-61. `source_page` and `source_bbox` are present for the
+/// PDF channel (Tika-extracted annotation rect) and absent for free-flow
+/// channels (MD). `target` discriminates the resolution surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalRef {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_bbox: Option<BoundingBox>,
+    pub target: InternalRefTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum InternalRefTarget {
+    /// PDF goto via named destination (`cite.hochreiter1997`, `name-section-1.1`)
+    /// or MD anchor (`#section-slug`). Optional resolved page + (x, y) carried
+    /// when Tika's name-tree walk produced a `PDPageXYZDestination`.
+    Named {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        page: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        point: Option<TargetPoint>,
+    },
+    /// Bare page-coord goto (no name). Page required; point optional.
+    Page {
+        page: u32,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        point: Option<TargetPoint>,
+    },
+}
+
+/// CR-62: A reference from an element to a location outside the document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalRef {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_bbox: Option<BoundingBox>,
+    pub target: ExternalRefTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ExternalRefTarget {
+    Uri { url: String },
+}
+
+/// CR-62: Resolved destination point on the target page (top-origin coords).
+/// Either coordinate may be absent depending on the source destination
+/// flavor; both present indicates a `PDPageXYZDestination`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetPoint {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub x: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub y: Option<f32>,
+}
+
+impl SemanticTreeElement {
+    /// Enforce C-7a empty-body validation (v2.2.0+ / CR-61). Panics if
+    /// the element type requires a non-empty body and `text` is empty
+    /// or whitespace-only after trim.
+    ///
+    /// Chain after struct-literal construction:
+    /// ```ignore
+    /// let element = SemanticTreeElement { text, element_type, ... }.validate();
+    /// ```
+    ///
+    /// Empty body at the channel-exit stage is a programming error in
+    /// the channel projection (the channel should not produce
+    /// empty-bodied elements for "body required" variants per C-7a).
+    /// The panic surfaces such bugs immediately at the point of
+    /// construction rather than letting them propagate downstream as
+    /// malformed bgraph.md output. Tests are the first-line catch;
+    /// the panic is the safety net (see CR-61 design dialogue).
+    pub fn validate(self) -> Self {
+        if self.element_type.requires_non_empty_body() && self.text.trim().is_empty() {
+            panic!(
+                "SemanticTreeElement::validate: {:?} requires a non-empty body per C-7a \
+                 (08-bgraph-md-format.md / CR-61), but got empty / whitespace-only `text`. \
+                 This is a channel-projection bug — fix the producer rather than relaxing \
+                 the validator.",
+                self.element_type,
+            );
+        }
+        self
+    }
 }
 
 /// Element kinds carried at the SemanticTreeElement boundary.
@@ -854,7 +1117,68 @@ pub enum SemanticElementType {
     List,
     Blockquote,
     Table,
+    /// Orphan variant reserved for the future stream-topology design slice.
+    ///
+    /// CR-49 added the variant + wire-format support; CR-59 retracted the
+    /// wire format (the variant had no in-memory production path —
+    /// PDF and generic-MD are both tree-topology channels and never emit
+    /// Message nodes — and the field-on-shared-types coupling forced
+    /// tree-topology code to know about it). The variant survives as a
+    /// sentinel marking the intended future shape: a separate
+    /// stream-topology pipeline that will live alongside (not inside)
+    /// the current tree-topology code path, with its own emitter, parser,
+    /// and carrier type.
+    ///
+    /// Do not add a `Message` arm to any tree-topology code path. The
+    /// builder maps it to `"Message"` only so `match` exhaustiveness
+    /// compiles; emitter / parser have no arm for it (and reject it at
+    /// the wire-format boundary).
+    Message,
 }
+
+impl SemanticElementType {
+    /// Whether body text for this element type is parsed as markdown-inline
+    /// content (per spec § C-7a body-content domain table, v2.2.0+ / CR-61).
+    ///
+    /// Returning `true` means the inline parser applies inside the body and
+    /// canonical inline projections (C-7b: `**bold**` / `*italic*` /
+    /// `` `code` `` / `[label](url)`) are the only allowed shapes. Returning
+    /// `false` means the body is either *literal* (CodeBlock — verbatim
+    /// source preserved, no inline parser) or *literal-with-markers* (List
+    /// / Blockquote / Table — verbatim source with block-level markers
+    /// preserved). The PDF channel-exit projection uses this to decide
+    /// whether to apply element-level emphasis wrapping; the empty-body
+    /// validator uses [`requires_non_empty_body`](Self::requires_non_empty_body)
+    /// instead, which is a separate axis.
+    ///
+    /// `Message` panics — it is the orphan sentinel (CR-59) and has no
+    /// wire-format domain.
+    pub fn body_is_markdown_inline(self) -> bool {
+        match self {
+            Self::Section
+            | Self::Paragraph
+            | Self::Header
+            | Self::Footer
+            | Self::Margin => true,
+            Self::CodeBlock | Self::List | Self::Blockquote | Self::Table => false,
+            Self::Message => panic!(
+                "SemanticElementType::Message::body_is_markdown_inline called — \
+                 Message is the orphan sentinel (CR-59); no wire-format domain. \
+                 Stream-topology code paths must not reach this function.",
+            ),
+        }
+    }
+
+    /// Whether the spec requires this element's body to be non-empty
+    /// (per spec § C-7a, v2.2.0+ / CR-61). All current wire-format variants
+    /// require non-empty bodies — an empty body in *any* domain has no
+    /// rendered representation and would collide with the C-3 body-placement
+    /// signal. `Message` returns `false` (orphan sentinel — never constructed).
+    pub fn requires_non_empty_body(self) -> bool {
+        !matches!(self, Self::Message)
+    }
+}
+
 /// Complete output from document preprocessing
 ///
 /// Contains all the data extracted from document parsing, including
@@ -886,6 +1210,14 @@ pub struct ParsedPdfElement {
     pub reading_order: u32,
     pub bookmark_match: Option<BookmarkSection>,
     pub token_count: usize,
+    /// CR-62: Link annotations carried through clustering / merging. A pre-
+    /// merge element carries 0 or 1 (from the source `PdfTextElement.link`);
+    /// after merge, the vec is concatenated in source-segment order so the
+    /// reading-order invariant from CR-61 is preserved by construction.
+    /// Split into channel-agnostic `internal_refs[]` / `external_refs[]` at
+    /// projection time (see `preprocessors/pdf/semantic_tree_projection.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<PdfLinkAnnotation>,
 }
 
 impl ParsedPdfElement {
@@ -1068,5 +1400,113 @@ mod node_content_escape_tests {
         // the whole text is stripped, but internal newlines preserve.
         let nc = NodeContent::new("  \n```bgraph\nbody\n  ".to_string());
         assert_eq!(nc.text, "\\```bgraph\nbody");
+    }
+}
+
+#[cfg(test)]
+mod semantic_tree_element_validate_tests {
+    use super::*;
+
+    fn build(text: &str, element_type: SemanticElementType) -> SemanticTreeElement {
+        SemanticTreeElement {
+            text: text.to_string(),
+            element_type,
+            hierarchy_level: 1,
+            text_order: 0,
+            physical_location: None,
+            style: None,
+            token_count: 0,
+            internal_refs: vec![],
+            external_refs: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_passes_non_empty_paragraph() {
+        let v = build("hello", SemanticElementType::Paragraph).validate();
+        assert_eq!(v.text, "hello");
+    }
+
+    #[test]
+    fn validate_passes_non_empty_section() {
+        let v = build("Title", SemanticElementType::Section).validate();
+        assert_eq!(v.text, "Title");
+    }
+
+    #[test]
+    fn validate_passes_non_empty_codeblock() {
+        // CodeBlock body is in the literal domain — empty still
+        // forbidden per C-7a, but non-empty literal content is fine.
+        let v = build("```\nfn main() {}\n```", SemanticElementType::CodeBlock).validate();
+        assert!(v.text.contains("fn main"));
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_paragraph() {
+        let _ = build("", SemanticElementType::Paragraph).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_whitespace_only_paragraph() {
+        let _ = build("   \n\t  ", SemanticElementType::Paragraph).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_section() {
+        let _ = build("", SemanticElementType::Section).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_codeblock() {
+        let _ = build("", SemanticElementType::CodeBlock).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a non-empty body per C-7a")]
+    fn validate_panics_on_empty_header() {
+        let _ = build("", SemanticElementType::Header).validate();
+    }
+
+    #[test]
+    fn body_is_markdown_inline_classifies_each_variant_correctly() {
+        // Markdown-inline domain: Section / Paragraph / Header / Footer / Margin
+        assert!(SemanticElementType::Section.body_is_markdown_inline());
+        assert!(SemanticElementType::Paragraph.body_is_markdown_inline());
+        assert!(SemanticElementType::Header.body_is_markdown_inline());
+        assert!(SemanticElementType::Footer.body_is_markdown_inline());
+        assert!(SemanticElementType::Margin.body_is_markdown_inline());
+        // Literal / literal-with-markers domain
+        assert!(!SemanticElementType::CodeBlock.body_is_markdown_inline());
+        assert!(!SemanticElementType::List.body_is_markdown_inline());
+        assert!(!SemanticElementType::Blockquote.body_is_markdown_inline());
+        assert!(!SemanticElementType::Table.body_is_markdown_inline());
+    }
+
+    #[test]
+    fn requires_non_empty_body_is_true_for_all_wire_variants() {
+        for t in [
+            SemanticElementType::Section,
+            SemanticElementType::Paragraph,
+            SemanticElementType::Header,
+            SemanticElementType::Footer,
+            SemanticElementType::Margin,
+            SemanticElementType::CodeBlock,
+            SemanticElementType::List,
+            SemanticElementType::Blockquote,
+            SemanticElementType::Table,
+        ] {
+            assert!(
+                t.requires_non_empty_body(),
+                "{t:?} should require non-empty body per C-7a",
+            );
+        }
+        assert!(
+            !SemanticElementType::Message.requires_non_empty_body(),
+            "Message is orphan; never constructed",
+        );
     }
 }

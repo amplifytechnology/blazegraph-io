@@ -67,34 +67,58 @@ pub enum ParseIdentity {
 
 /// Strip mode for the [`crate::preprocessors::md::strip`] operation.
 ///
-/// Two variants per spec § [Strip ergonomics]. The dash discriminator
-/// (`bgraph-[a-z-]*` vs. `bgraph[a-z-]*`) is the load-bearing
-/// distinction. Under v2.0.0 body-outside conventions, both modes
-/// preserve all body content for every content variant — only the
-/// fence framing differs.
+/// Under v2.0.0 body-outside conventions, every variant preserves the
+/// body content of *unfiltered* elements verbatim — only the fence
+/// framing (and for [`StripMode::NodeTypes`], the filtered elements'
+/// bodies) is removed.
 ///
-/// Pre-v2.0.0 had a third `NoiseOnly` mode for stripping
-/// Header/Footer/Margin running text; removed in CR-48 because the
-/// mode's premise (body-inside H/F/M) no longer holds. Type-based
-/// filtering is reassigned to the upcoming `blazegraph strip
-/// --node-types` CLI implementing the structural rule.
+/// Pre-v2.0.0 had a `NoiseOnly` mode for stripping Header/Footer/Margin
+/// running text; removed in CR-48 because the mode's premise
+/// (body-inside H/F/M) no longer holds. The CR-55 successor is
+/// [`StripMode::NodeTypes`], which implements the spec's structural
+/// rule for content boundaries.
+///
+/// Pre-CR-55 had a metadata-retaining mode (kept the doc-level `bgraph`
+/// fence inline, stripped per-element fences). Removed in CR-55: no
+/// fictional users for v1.0.0 inline-metadata semantics, and
+/// [`StripMode::BodyWithFrontmatter`] supersedes it under the universal
+/// YAML-frontmatter markdown convention.
 ///
 /// [Strip ergonomics]:
 /// https://github.com/AmplifyTechnology/blazegraph-io-app/blob/main/docs/P2/core/architecture/08-bgraph-md-format.md#strip-ergonomics
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [Structural rule for content boundaries]:
+/// https://github.com/AmplifyTechnology/blazegraph-io-app/blob/main/docs/P2/core/architecture/08-bgraph-md-format.md#structural-rule-for-content-boundaries
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StripMode {
+    /// **Default.** Strip every bgraph fence (per-element + doc-level)
+    /// and lift the doc-level `bgraph` block to YAML frontmatter at the
+    /// top of the output. Produces docling-comparable plain markdown
+    /// with provenance preserved. Body content for every variant
+    /// survives. `bgraph-bookmarks` fence content is dropped (not
+    /// lifted) — outlines are recoverable from the source `.bgraph.md`.
+    BodyWithFrontmatter,
     /// Remove every bgraph fence (doc-level + bookmarks + every
-    /// per-element fence). All body content survives.
+    /// per-element fence). All body content survives. No metadata
+    /// preserved.
     ///
     /// Equivalent to `sed -E '/^```bgraph[a-z-]*$/,/^```$/d'`.
     /// Output is Unstructured-equivalent body-only prose.
     BodyOnly,
-    /// Keep the doc-level `bgraph` block. Strip every dashed fence
-    /// (bookmarks + per-element). All body content survives.
+    /// Apply the spec's structural rule to remove every element whose
+    /// per-element fence tag matches one of the listed types (e.g.
+    /// `["header", "footer", "margin"]`). For each matching fence, the
+    /// element's body-above (back to the most recent boundary — blank
+    /// line, prior fence-close, or start-of-file) plus the fence pair
+    /// itself are deleted. Non-matching bgraph fences pass through
+    /// verbatim.
     ///
-    /// Equivalent to `sed -E '/^```bgraph-[a-z-]*$/,/^```$/d'`.
-    /// Plain prose + provenance + graph identity.
-    KeepMetadata,
+    /// The CLI composes this with [`StripMode::BodyWithFrontmatter`] /
+    /// [`StripMode::BodyOnly`] via a two-pass run order (filter pass
+    /// first, then mode pass). Used directly through the lib API, only
+    /// the structural-rule deletion is applied.
+    ///
+    /// See spec § Structural rule for content boundaries.
+    NodeTypes(Vec<String>),
 }
 
 /// Errors from markdown parsing.

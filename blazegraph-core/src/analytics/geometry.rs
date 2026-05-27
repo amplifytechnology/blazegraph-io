@@ -1108,6 +1108,7 @@ mod tests {
             bookmark_match: None,
             token_count: 1,
             raw_tags: vec![],
+            link: None,
         }
     }
 

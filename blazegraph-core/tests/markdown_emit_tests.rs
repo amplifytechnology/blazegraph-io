@@ -76,12 +76,14 @@ fn emit_matches_node_counts_for_shannon_fixture() {
         .expect("doc-level fence has a JSON line below the fence open");
     let parsed: Value =
         serde_json::from_str(json_line).expect("doc-level JSON parses as a JSON object");
+    // v2.1.0+ (CR-56 § I.4): `title` moved out of the doc-level block
+    // into the bgraph-metadata fence. The remaining six keys are
+    // graph-identity only.
     for key in [
         "schema",
         "blazegraph_version",
         "source",
         "flow_type",
-        "title",
         "config_hash",
         "graph_sha256",
     ] {
@@ -90,6 +92,10 @@ fn emit_matches_node_counts_for_shannon_fixture() {
             "doc-level block missing required key {key:?}",
         );
     }
+    assert!(
+        parsed.get("title").is_none(),
+        "v2.1.0 doc-level block must not carry `title`",
+    );
 
     // Structural assertion: number of `bgraph-section` opening fences
     // matches the number of Section nodes in the graph; same for each

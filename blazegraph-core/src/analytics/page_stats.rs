@@ -849,6 +849,7 @@ mod tests {
             bookmark_match: None,
             token_count: count_tokens(text) as usize,
             raw_tags: vec![],
+            link: None,
         }
     }
 

@@ -28,9 +28,25 @@
 pub mod bgraph_md;
 pub mod frontmatter;
 pub mod generic_md;
+pub mod metadata;
 pub mod strip;
 pub mod types;
 
+/// **v2.0.0 reference implementation of the bgraph.md strip surface.**
+///
+/// This function is the executable form of the format's structural
+/// rule for content boundaries (see
+/// `docs/P2/core/architecture/08-bgraph-md-format.md` § Structural
+/// rule for content boundaries). Downstream consumers that depend on
+/// v2.0.0 strip semantics should import this function; when the format
+/// moves to v3, a sibling `strip_v3` will ship alongside per the
+/// dual-support contract (CR-48).
+///
+/// Re-exports the function and its mode enum from
+/// [`crate::preprocessors::md::strip`] and
+/// [`crate::preprocessors::md::types`] at module-root for downstream
+/// pinning. The re-export pattern follows the
+/// [`BGRAPH_MD_FORMAT_VERSION`] precedent.
 pub use strip::strip;
 pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode};
 
@@ -44,7 +60,7 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 ///
 /// The parser at [`bgraph_md::parse`] accepts every previous major's
 /// shape as well, per the dual-support contract (spec § Amendment H).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.0.0";
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.3.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -100,8 +116,10 @@ mod tests {
     /// accept (the parser may reject for other reasons; this is a
     /// detection test, not a reconstruction test).
     fn sample_bgraph_md_header() -> &'static str {
+        // v2.1.0+: doc-level block carries no `title` (moved to
+        // bgraph-metadata fence — CR-56 § I.4).
         "```bgraph\n\
-         {\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"title\":null,\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
+         {\"schema\":\"2.3.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
          ```\n"
     }
 
@@ -138,6 +156,8 @@ mod tests {
                 token_count: 0,
                 parent: None,
                 children: vec![para_id],
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
         nodes.insert(
@@ -161,6 +181,8 @@ mod tests {
                 token_count: 1,
                 parent: Some(root_id),
                 children: Vec::new(),
+                internal_refs: vec![],
+                external_refs: vec![],
             },
         );
         let graph = DocumentGraph {
@@ -176,6 +198,7 @@ mod tests {
                     source_sha256: "abc".to_string(),
                     config_hash: "def".to_string(),
                 }),
+                topology: None,
             },
             structural_profile: StructuralProfile::default(),
         };
