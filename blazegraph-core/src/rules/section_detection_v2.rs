@@ -828,6 +828,99 @@ impl<'a> SectionDetectionV2Rule<'a> {
             }
         }
     }
+
+    /// CR-67 Part B — Promote section-fragment neighbors.
+    ///
+    /// For each Section, examine source-order ±1 neighbors. Promote a
+    /// non-Section neighbor to Section iff:
+    ///   (a) `neighbor.style_info.class_name == section.style_info.class_name`
+    ///   (b) `|neighbor.bbox.height - section.bbox.height| < HEIGHT_TOL` (= 2.0)
+    ///
+    /// NodeTypeClustering downstream fuses adjacent same-type elements —
+    /// a promoted `"**1.1.**"` Paragraph plus its existing
+    /// `"**Document Structure**"` Section neighbor coalesce into a single
+    /// `"**1.1. Document Structure**"` Section node.
+    ///
+    /// The height gate is load-bearing. A naive same-class rule would
+    /// promote cluster-bloated Paragraphs (e.g. an `h=256` merged-title-
+    /// and-body blob next to an `h=10.5` true Section). After
+    /// NodeTypeClustering fused those, CR-65 (`graph_sanity` height
+    /// bound) would demote the resulting 266pt-tall "Section" back to
+    /// Paragraph — losing both the true Section AND any other Section
+    /// that got fused with the bloat. The 2pt tolerance keeps promotion
+    /// to true single-line same-class fragments only.
+    pub fn promote_section_fragments(elements: &mut [ParsedPdfElement]) {
+        const HEIGHT_TOL: f32 = 2.0;
+
+        // Collect indices of Section elements (snapshot before mutation so
+        // we don't cascade-promote through a chain in a single pass).
+        let section_indices: Vec<usize> = elements
+            .iter()
+            .enumerate()
+            .filter(|(_, el)| el.element_type == ParsedElementType::Section)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Collect (neighbor_idx, hierarchy_level) to promote. Defer the
+        // mutation until after the scan so a section at index N can't
+        // promote its left neighbor and then have that newly-Section
+        // neighbor re-trigger promotion of index N-2 in the same pass.
+        let mut to_promote: Vec<(usize, u32)> = Vec::new();
+
+        for &si in &section_indices {
+            let section = &elements[si];
+            let Some(s_place) = section.placement.as_ref() else {
+                continue;
+            };
+            let s_class = &section.style_info.class_name;
+            let s_height = s_place.bounding_box.height;
+            let s_level = section.hierarchy_level;
+
+            for &offset in &[-1i32, 1i32] {
+                let ni = match (si as i32).checked_add(offset) {
+                    Some(n) if n >= 0 && (n as usize) < elements.len() => n as usize,
+                    _ => continue,
+                };
+                let neighbor = &elements[ni];
+                if neighbor.element_type == ParsedElementType::Section {
+                    continue;
+                }
+                // Header / Footer / Margin are pre-classified from region
+                // labels — never overwrite them. (Aligns with the
+                // `classify` early-out at the top of this module.)
+                if matches!(
+                    neighbor.element_type,
+                    ParsedElementType::Header
+                        | ParsedElementType::Footer
+                        | ParsedElementType::Margin
+                ) {
+                    continue;
+                }
+                if &neighbor.style_info.class_name != s_class {
+                    continue;
+                }
+                let Some(n_place) = neighbor.placement.as_ref() else {
+                    continue;
+                };
+                let n_height = n_place.bounding_box.height;
+                if (n_height - s_height).abs() >= HEIGHT_TOL {
+                    continue;
+                }
+                to_promote.push((ni, s_level));
+            }
+        }
+
+        for (idx, level) in to_promote {
+            // Re-check: a neighbor adjacent to two sections gets queued
+            // twice; the first promotion makes the second a no-op. Also
+            // honor the snapshot: don't overwrite a Section that was
+            // already there (defensive — section_indices excluded these).
+            if elements[idx].element_type != ParsedElementType::Section {
+                elements[idx].element_type = ParsedElementType::Section;
+                elements[idx].hierarchy_level = level;
+            }
+        }
+    }
 }
 
 impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
@@ -893,6 +986,16 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
         // accepting its sibling. The fragments share a structural identity:
         // if one is a Section, all of them are. Promote them together.
         Self::promote_same_line_section_fragments(&mut out);
+
+        // CR-67 Part B — source-order ±1 fragment promotion. The same-Y
+        // pass above only fires for fragments sharing a single Y line
+        // within one leaf; numbered RFC headers fragmented across spans
+        // (e.g. `**1.1.**` at one Y followed by `**Document Structure**`
+        // at a slightly different Y) miss it. This walk uses source-order
+        // adjacency + same font-class + matching bbox-height as the
+        // signature, then lets NodeTypeClustering downstream fuse the
+        // adjacent same-type elements into a single Section node.
+        Self::promote_section_fragments(&mut out);
 
         let sections = out
             .iter()
@@ -2132,5 +2235,161 @@ mod tests {
         let text_elements = vec![make_section_sized_element(Some("2-1"))];
         let types = run_apply_bootstrap(&text_elements);
         assert_eq!(types, vec![ParsedElementType::Section]);
+    }
+
+    // ── CR-67 Part B — source-order ±1 section-fragment promotion ───────
+
+    /// Build a `ParsedPdfElement` with the fields the promotion routine
+    /// reads: element_type, font class name, bbox height, hierarchy
+    /// level. Other fields get harmless defaults.
+    fn make_parsed_for_promote(
+        element_type: ParsedElementType,
+        text: &str,
+        class_name: &str,
+        height: f32,
+        hierarchy_level: u32,
+    ) -> ParsedPdfElement {
+        ParsedPdfElement {
+            element_type,
+            text: text.to_string(),
+            hierarchy_level,
+            position: 0,
+            style_info: FontClass {
+                class_name: class_name.to_string(),
+                font_family: "TestFont".to_string(),
+                font_size: 10.0,
+                font_style: "normal".to_string(),
+                font_weight: "bold".to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Some(Placement {
+                page_number: 1,
+                bounding_box: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height,
+                },
+                line_number: 0,
+                segment_number: 0,
+                rotation: 0,
+                paragraph_number: 0,
+                region_label: Some("1".to_string()),
+                page_width: 0.0,
+                page_height: 0.0,
+            }),
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            links: vec![],
+        }
+    }
+
+    /// CR-67 Part B — canonical RFC fragmentation. A `**1.1.**` Paragraph
+    /// (rejected by alpha-ratio) sits immediately before a
+    /// `**Document Structure**` Section, sharing font class `f7` and
+    /// bbox height 10.5. Same-class same-height → promotion fires; both
+    /// neighbors classify as Section (NodeTypeClustering then fuses
+    /// them into one Section node downstream).
+    #[test]
+    fn cr67_promote_same_class_same_height_fires() {
+        let mut elements = vec![
+            make_parsed_for_promote(
+                ParsedElementType::Paragraph,
+                "**1.1.**",
+                "f7",
+                10.5,
+                3,
+            ),
+            make_parsed_for_promote(
+                ParsedElementType::Section,
+                "**Document Structure**",
+                "f7",
+                10.5,
+                2,
+            ),
+        ];
+
+        SectionDetectionV2Rule::promote_section_fragments(&mut elements);
+
+        assert_eq!(
+            elements[0].element_type,
+            ParsedElementType::Section,
+            "left neighbor with same font class + matching height must promote"
+        );
+        assert_eq!(
+            elements[0].hierarchy_level, 2,
+            "promoted fragment inherits the section's hierarchy level"
+        );
+        assert_eq!(elements[1].element_type, ParsedElementType::Section);
+    }
+
+    /// CR-67 Part B — same-class but height mismatch outside HEIGHT_TOL
+    /// (2.0). 10.5 vs 12.6 → diff 2.1 ≥ 2.0 → no promotion. Defends
+    /// against picking up adjacent inline emphasis that happens to share
+    /// a font class but is visually a different glyph run.
+    #[test]
+    fn cr67_promote_height_mismatch_no_promotion() {
+        let mut elements = vec![
+            make_parsed_for_promote(
+                ParsedElementType::Paragraph,
+                "**1.1.**",
+                "f7",
+                10.5,
+                3,
+            ),
+            make_parsed_for_promote(
+                ParsedElementType::Section,
+                "**Title**",
+                "f7",
+                12.6,
+                2,
+            ),
+        ];
+
+        SectionDetectionV2Rule::promote_section_fragments(&mut elements);
+
+        assert_eq!(
+            elements[0].element_type,
+            ParsedElementType::Paragraph,
+            "height-mismatch (Δ=2.1 ≥ HEIGHT_TOL) must NOT promote",
+        );
+        assert_eq!(elements[1].element_type, ParsedElementType::Section);
+    }
+
+    /// CR-67 Part B — alphafold 3.1-bloat defense. A merged-title-and-body
+    /// blob (Paragraph, h=256) sits source-order adjacent to a true
+    /// single-line Section (h=10.5) sharing font class f22. Without the
+    /// height gate, the blob would promote → NodeTypeClustering fuses →
+    /// CR-65 demotes the 266-tall result back to Paragraph → both
+    /// nodes lost. The height gate must reject promotion.
+    #[test]
+    fn cr67_promote_bloated_paragraph_height_gate_rejects() {
+        let mut elements = vec![
+            make_parsed_for_promote(
+                ParsedElementType::Paragraph,
+                "3.1. In our first... [bloated body merge]",
+                "f22",
+                256.0,
+                3,
+            ),
+            make_parsed_for_promote(
+                ParsedElementType::Section,
+                "3.2 Section title",
+                "f22",
+                10.5,
+                2,
+            ),
+        ];
+
+        SectionDetectionV2Rule::promote_section_fragments(&mut elements);
+
+        assert_eq!(
+            elements[0].element_type,
+            ParsedElementType::Paragraph,
+            "bloated paragraph (h=256 vs section h=10.5) must NOT promote — \
+             the height gate is load-bearing against CR-65 cascade demotion",
+        );
+        assert_eq!(elements[1].element_type, ParsedElementType::Section);
     }
 }
