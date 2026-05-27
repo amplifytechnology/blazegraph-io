@@ -996,6 +996,30 @@ impl Default for InvariantToggle {
     }
 }
 
+/// CR-65 — Per-invariant config for the section-height-bounded-by-title rule.
+/// Has the same check/correct toggles as `InvariantToggle` plus a tolerance
+/// multiplier applied to the title's bbox.height.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionHeightInvariantConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Section bbox.height ≤ title.bbox.height × tolerance.
+    /// Default 2.0 — permissive enough to leave FP discrimination to downstream
+    /// rules; saves "Appendix"-class single-line big-font headers (typically
+    /// ~1.4× title height) that would otherwise be incorrectly demoted.
+    pub tolerance: f32,
+}
+
+impl Default for SectionHeightInvariantConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            tolerance: 2.0,
+        }
+    }
+}
+
 /// Set of invariants the graph sanity pipe enforces.
 /// Future invariants (childless pruning, repetition filter, etc.) will appear
 /// here as additional fields.
@@ -1004,6 +1028,12 @@ pub struct GraphSanityInvariants {
     /// `node.depth = parent.depth + 1` for every non-root node.
     /// Correction strategy: BFS from root, recompute depth.
     pub depth_consistency: InvariantToggle,
+
+    /// CR-65 — Section bbox.height bounded by document title's bbox.height.
+    /// Catches figure-cluster bloat that survives NodeTypeClustering by
+    /// demoting Sections whose bbox.height exceeds title.height × tolerance.
+    #[serde(default)]
+    pub section_height_bounded_by_title: SectionHeightInvariantConfig,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).

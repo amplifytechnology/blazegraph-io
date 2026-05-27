@@ -15,8 +15,8 @@
 //! Future invariants (childless pruning, repetition filter, empty-paragraph
 //! pruning, duplicate collapse) plug into the same check + correct pattern.
 
-use crate::config::GraphSanityConfig;
-use crate::types::{DocumentGraph, NodeId};
+use crate::config::{GraphSanityConfig, SectionHeightInvariantConfig};
+use crate::types::{DocumentGraph, DocumentNode, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Per-node record of a depth invariant violation.
@@ -28,17 +28,30 @@ pub struct DepthViolation {
     pub corrected: bool,
 }
 
+/// CR-65 — Per-node record of a section-height-bounded-by-title violation.
+#[derive(Debug, Clone)]
+pub struct SectionHeightViolation {
+    pub node_id: NodeId,
+    pub section_height: f32,
+    pub title_height: f32,
+    pub threshold: f32,
+    pub corrected: bool,
+}
+
 /// Diagnostic output from a sanity-pipe run. Always populated when the pipe
 /// runs; consumers decide what to do with it (log, attach to output, etc.).
 #[derive(Debug, Default, Clone)]
 pub struct SanityReport {
     pub depth_violations: Vec<DepthViolation>,
     pub orphan_nodes: Vec<NodeId>,
+    pub section_height_violations: Vec<SectionHeightViolation>,
 }
 
 impl SanityReport {
     pub fn is_clean(&self) -> bool {
-        self.depth_violations.is_empty() && self.orphan_nodes.is_empty()
+        self.depth_violations.is_empty()
+            && self.orphan_nodes.is_empty()
+            && self.section_height_violations.is_empty()
     }
 }
 
@@ -58,11 +71,16 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         check_and_correct_depth(graph, dc.correct, &mut report);
     }
 
+    let sh = &config.invariants.section_height_bounded_by_title;
+    if sh.check || sh.correct {
+        check_and_correct_section_height(graph, sh, &mut report);
+    }
+
     // Future invariants: childless_sections, repetition_filter, etc. plug in here.
 
     if !report.is_clean() {
         println!(
-            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes",
+            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes, {} section-height violations{}",
             report.depth_violations.len(),
             if dc.correct && !report.depth_violations.is_empty() {
                 " (corrected)"
@@ -70,6 +88,12 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
                 ""
             },
             report.orphan_nodes.len(),
+            report.section_height_violations.len(),
+            if sh.correct && !report.section_height_violations.is_empty() {
+                " (demoted to Paragraph)"
+            } else {
+                ""
+            },
         );
     }
 
@@ -139,11 +163,83 @@ fn check_and_correct_depth(
     }
 }
 
+/// CR-65 — Section bbox.height bounded by title.bbox.height × tolerance.
+///
+/// The font_size signal is unreliable on figure-heavy pages (Tika reports
+/// inflated sizes for rotated/clustered text), but bbox.height is not. A
+/// merged figure-cluster section's bbox spans many lines and is much taller
+/// than any real single-line section header. The title — the document's own
+/// declared "this is how big a heading is" element — sets the ceiling.
+///
+/// Violators are demoted to Paragraph in place (`node_type` change only,
+/// topology preserved so `depth_consistency` still holds). No-op on documents
+/// without a depth-1 Section bearing physical location (MD channel, short
+/// docs).
+fn check_and_correct_section_height(
+    graph: &mut DocumentGraph,
+    cfg: &SectionHeightInvariantConfig,
+    report: &mut SanityReport,
+) {
+    let title_height = match find_title_height(graph) {
+        Some(h) => h,
+        None => return,
+    };
+    let threshold = title_height * cfg.tolerance;
+
+    let violators: Vec<(NodeId, f32)> = graph
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.node_type == "Section")
+        .filter_map(|(id, n)| {
+            n.location
+                .physical
+                .as_ref()
+                .map(|p| (*id, p.bounding_box.height))
+        })
+        .filter(|(_, h)| *h > threshold)
+        .collect();
+
+    for (node_id, section_height) in violators {
+        report.section_height_violations.push(SectionHeightViolation {
+            node_id,
+            section_height,
+            title_height,
+            threshold,
+            corrected: cfg.correct,
+        });
+        if cfg.correct {
+            if let Some(node) = graph.nodes.get_mut(&node_id) {
+                node.node_type = "Paragraph".to_string();
+            }
+        }
+    }
+}
+
+/// CR-65 — Document title = first depth-1 Section in source order with a
+/// physical bounding box. Returns its bbox.height, or None if no such node
+/// exists (e.g., MD channel, short doc with no depth-1 sections).
+fn find_title_height(graph: &DocumentGraph) -> Option<f32> {
+    let mut candidates: Vec<&DocumentNode> = graph
+        .nodes
+        .values()
+        .filter(|n| n.node_type == "Section")
+        .filter(|n| n.location.semantic.depth == 1)
+        .filter(|n| n.location.physical.is_some())
+        .collect();
+    candidates.sort_by_key(|n| n.text_order.unwrap_or(u32::MAX));
+    candidates
+        .first()
+        .and_then(|n| n.location.physical.as_ref())
+        .map(|p| p.bounding_box.height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GraphSanityConfig, GraphSanityInvariants, InvariantToggle};
-    use crate::types::{DocumentGraph, DocumentNode};
+    use crate::config::{
+        GraphSanityConfig, GraphSanityInvariants, InvariantToggle, SectionHeightInvariantConfig,
+    };
+    use crate::types::{BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation};
     use uuid::Uuid;
 
     /// Build a minimal graph: root → child(at depth `child_depth`).
@@ -174,6 +270,7 @@ mod tests {
                     check: true,
                     correct: true,
                 },
+                ..Default::default()
             },
         }
     }
@@ -210,6 +307,7 @@ mod tests {
                     check: true,
                     correct: false,
                 },
+                ..Default::default()
             },
         };
         let report = apply(&mut graph, &cfg);
@@ -309,5 +407,134 @@ mod tests {
             graph.nodes[&section_id].location.semantic.depth + 1,
             "paragraph depth must equal section depth + 1 after correction"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CR-65 — section-height-bounded-by-title invariant tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Build a graph with root → (title Section, child Section), both depth=1
+    /// with physical locations. Heights are configurable so tests can place
+    /// the child above / below the title × tolerance threshold.
+    fn make_graph_with_title_and_child(
+        title_h: f32,
+        child_h: f32,
+    ) -> (DocumentGraph, NodeId, NodeId, NodeId) {
+        let root_id = Uuid::new_v4();
+        let title_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut graph = DocumentGraph::new_with_root(root_id);
+
+        let mut root = DocumentNode::new_with_id(root_id, "Document", "root".into());
+        root.children.push(title_id);
+        root.children.push(child_id);
+        root.location.semantic.depth = 0;
+        graph.nodes.insert(root_id, root);
+
+        let bbox = |h: f32| BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: h,
+        };
+
+        let mut title = DocumentNode::new_with_id(title_id, "Section", "Title".into());
+        title.parent = Some(root_id);
+        title.location.semantic.depth = 1;
+        title.text_order = Some(0);
+        title.location.physical = Some(PhysicalLocation {
+            page: 1,
+            bounding_box: bbox(title_h),
+        });
+        graph.nodes.insert(title_id, title);
+
+        let mut child = DocumentNode::new_with_id(child_id, "Section", "Child section".into());
+        child.parent = Some(root_id);
+        child.location.semantic.depth = 1;
+        child.text_order = Some(1);
+        child.location.physical = Some(PhysicalLocation {
+            page: 2,
+            bounding_box: bbox(child_h),
+        });
+        graph.nodes.insert(child_id, child);
+
+        (graph, root_id, title_id, child_id)
+    }
+
+    /// CR-65 Test 1 — section taller than title × tolerance gets demoted.
+    /// title.h = 18, child.h = 50, tolerance = 2.0 → threshold = 36 → 50 > 36 → demote.
+    #[test]
+    fn test_cr65_demotes_section_exceeding_threshold() {
+        let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 50.0);
+        let report = apply(&mut graph, &full_correct_config());
+        assert_eq!(report.section_height_violations.len(), 1);
+        assert_eq!(report.section_height_violations[0].node_id, child_id);
+        assert!(report.section_height_violations[0].corrected);
+        assert_eq!(graph.nodes[&child_id].node_type, "Paragraph");
+    }
+
+    /// CR-65 Test 2 — section within tolerance is preserved.
+    /// title.h = 18, child.h = 30, tolerance = 2.0 → threshold = 36 → 30 < 36 → keep.
+    #[test]
+    fn test_cr65_respects_tolerance() {
+        let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 30.0);
+        let report = apply(&mut graph, &full_correct_config());
+        assert!(
+            report.section_height_violations.is_empty(),
+            "child within tolerance should not be flagged"
+        );
+        assert_eq!(graph.nodes[&child_id].node_type, "Section");
+    }
+
+    /// CR-65 Test 3 — no depth-1 Section with physical location → no-op.
+    /// Mirrors MD-channel / short-doc behavior. The CR-28 two-node graph has
+    /// no physical locations, so the title is None and the rule no-ops.
+    #[test]
+    fn test_cr65_no_title_is_noop() {
+        let (mut graph, _, _) = make_two_node_graph(1);
+        let report = apply(&mut graph, &full_correct_config());
+        assert!(
+            report.section_height_violations.is_empty(),
+            "no depth-1 Section with physical location → no violations"
+        );
+    }
+
+    /// CR-65 Test 4 — check-only mode records violation but does not demote.
+    #[test]
+    fn test_cr65_check_only_does_not_demote() {
+        let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 50.0);
+        let cfg = GraphSanityConfig {
+            enabled: true,
+            invariants: GraphSanityInvariants {
+                section_height_bounded_by_title: SectionHeightInvariantConfig {
+                    check: true,
+                    correct: false,
+                    tolerance: 2.0,
+                },
+                ..Default::default()
+            },
+        };
+        let report = apply(&mut graph, &cfg);
+        assert_eq!(report.section_height_violations.len(), 1);
+        assert!(!report.section_height_violations[0].corrected);
+        assert_eq!(
+            graph.nodes[&child_id].node_type,
+            "Section",
+            "check-only must preserve node_type"
+        );
+    }
+
+    /// CR-65 Test 5 — demoted section keeps text content + id (only node_type changes).
+    #[test]
+    fn test_cr65_demoted_section_keeps_content_and_id() {
+        let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 50.0);
+        let original_text = graph.nodes[&child_id].content.text.clone();
+        apply(&mut graph, &full_correct_config());
+        assert!(graph.nodes.contains_key(&child_id), "id must be preserved");
+        assert_eq!(
+            graph.nodes[&child_id].content.text, original_text,
+            "text content must be preserved"
+        );
+        assert_eq!(graph.nodes[&child_id].node_type, "Paragraph");
     }
 }

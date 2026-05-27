@@ -14,6 +14,17 @@ graph_sanity:
       check: true
       correct: true
 
+    # CR-65 — Section bbox.height bounded by document title's bbox.height.
+    # Catches figure-cluster bloat that survives NodeTypeClustering by
+    # demoting Sections whose bbox.height exceeds title.height × tolerance.
+    # Title = first depth-1 Section in source order with a physical bbox.
+    # Default tolerance 2.0 is permissive — leaves FP refinement to downstream
+    # rules; saves single-line big-font headers like "Appendix" (~1.4× title).
+    section_height_bounded_by_title:
+      check: true
+      correct: true
+      tolerance: 2.0
+
 # Pipeline configuration - defines which rules to run and in what order
 # NEW APPROACH: Section detection FIRST, then spatial clustering
 pipeline:
