@@ -1040,8 +1040,43 @@ impl Default for SectionParagraphOverlapInvariantConfig {
         Self {
             check: true,
             correct: true,
-            threshold: 0.20,
+            // Off by default (0.0 = OFF sentinel). Superseded by CR-69's
+            // geometry-only count rule: the fraction signal could not separate
+            // figure callouts from over-merge victims without the bookmark-
+            // bypass crutch (demoted 11 real rfc-dpop headers, corpus −0.026).
+            // Code retained, gated off — slated for cleanup once the evidence-
+            // first redesign (CR-71+) lands. See Sb LOGBOOK 2026-05-28.
+            threshold: 0.0,
             bookmark_bypass: true,
+        }
+    }
+}
+
+/// CR-69 — Per-invariant config for the geometry-only overlap-COUNT demote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionOverlapCountInvariantConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Demote a Section whose bbox overlaps at least this many same-page nodes
+    /// of ANY type (excluding itself). A figure callout misclassified as a
+    /// Section sits in a cluttered figure region and overlaps several sibling
+    /// callouts + figure elements (count >= 3); a real header — even one
+    /// engulfed by a single over-merged paragraph — overlaps <= 2. This is the
+    /// geometry-only safety mechanism CR-68's fraction rule lacked (no
+    /// bookmark-bypass needed).
+    pub count_threshold: u32,
+    /// Minimum overlap, as a fraction of the Section's own area, for another
+    /// node to count toward the tally. 0.0 = any positive overlap counts.
+    pub min_overlap_frac: f32,
+}
+
+impl Default for SectionOverlapCountInvariantConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            count_threshold: 3,
+            min_overlap_frac: 0.0,
         }
     }
 }
@@ -1061,9 +1096,15 @@ pub struct GraphSanityInvariants {
     #[serde(default)]
     pub section_height_bounded_by_title: SectionHeightInvariantConfig,
 
-    /// CR-68 — Section demoted when its bbox overlaps a same-page Paragraph.
+    /// CR-68 — Section demoted when its bbox overlaps a same-page Paragraph
+    /// (fraction rule, bookmark-bypass). Runs with CR-69's count rule.
     #[serde(default)]
     pub section_paragraph_overlap: SectionParagraphOverlapInvariantConfig,
+
+    /// CR-69 — Section demoted when its bbox overlaps >= count_threshold
+    /// same-page nodes of any type (geometry-only figure-cluster detector).
+    #[serde(default)]
+    pub section_overlap_count: SectionOverlapCountInvariantConfig,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).

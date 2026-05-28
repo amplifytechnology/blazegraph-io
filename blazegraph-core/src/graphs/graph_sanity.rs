@@ -16,7 +16,8 @@
 //! pruning, duplicate collapse) plug into the same check + correct pattern.
 
 use crate::config::{
-    GraphSanityConfig, SectionHeightInvariantConfig, SectionParagraphOverlapInvariantConfig,
+    GraphSanityConfig, SectionHeightInvariantConfig, SectionOverlapCountInvariantConfig,
+    SectionParagraphOverlapInvariantConfig,
 };
 use crate::preprocessors::pdf::xhtml_parser::normalize_for_match;
 use crate::types::{BoundingBox, DocumentGraph, DocumentNode, NodeId};
@@ -50,6 +51,15 @@ pub struct SectionOverlapViolation {
     pub corrected: bool,
 }
 
+/// CR-69 — Per-node record of a section overlap-COUNT demote violation.
+#[derive(Debug, Clone)]
+pub struct SectionOverlapCountViolation {
+    pub node_id: NodeId,
+    pub overlap_count: u32,
+    pub count_threshold: u32,
+    pub corrected: bool,
+}
+
 /// Diagnostic output from a sanity-pipe run. Always populated when the pipe
 /// runs; consumers decide what to do with it (log, attach to output, etc.).
 #[derive(Debug, Default, Clone)]
@@ -58,6 +68,7 @@ pub struct SanityReport {
     pub orphan_nodes: Vec<NodeId>,
     pub section_height_violations: Vec<SectionHeightViolation>,
     pub section_overlap_violations: Vec<SectionOverlapViolation>,
+    pub section_overlap_count_violations: Vec<SectionOverlapCountViolation>,
 }
 
 impl SanityReport {
@@ -66,6 +77,7 @@ impl SanityReport {
             && self.orphan_nodes.is_empty()
             && self.section_height_violations.is_empty()
             && self.section_overlap_violations.is_empty()
+            && self.section_overlap_count_violations.is_empty()
     }
 }
 
@@ -95,11 +107,16 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         check_and_correct_section_overlap(graph, so, &mut report);
     }
 
+    let soc = &config.invariants.section_overlap_count;
+    if soc.check || soc.correct {
+        check_and_correct_section_overlap_count(graph, soc, &mut report);
+    }
+
     // Future invariants: childless_sections, repetition_filter, etc. plug in here.
 
     if !report.is_clean() {
         println!(
-            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes, {} section-height violations{}, {} section-overlap violations{}",
+            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes, {} section-height violations{}, {} section-overlap violations{}, {} section-overlap-count violations{}",
             report.depth_violations.len(),
             if dc.correct && !report.depth_violations.is_empty() {
                 " (corrected)"
@@ -115,6 +132,12 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
             },
             report.section_overlap_violations.len(),
             if so.correct && !report.section_overlap_violations.is_empty() {
+                " (demoted to Paragraph)"
+            } else {
+                ""
+            },
+            report.section_overlap_count_violations.len(),
+            if soc.correct && !report.section_overlap_count_violations.is_empty() {
                 " (demoted to Paragraph)"
             } else {
                 ""
@@ -364,12 +387,94 @@ fn check_and_correct_section_overlap(
     }
 }
 
+/// CR-69 — geometry-only overlap-COUNT demote (supersedes CR-68's fraction
+/// rule). Demote a Section whose bbox overlaps at least `count_threshold`
+/// same-page nodes of ANY type (excluding itself) by more than
+/// `min_overlap_frac` of the Section's own area.
+///
+/// A figure callout misclassified as a Section sits in a cluttered figure
+/// region and overlaps several sibling callouts + figure elements (count >= 3);
+/// a real header — even one engulfed by a single over-merged Paragraph —
+/// overlaps <= 2. So unlike CR-68's overlap-*fraction* (which can't tell a
+/// figure callout from an over-merge victim, both high-fraction), the *count*
+/// separates them on geometry alone — no bookmark-bypass needed. Composes after
+/// CR-65 (height) + CR-68 (fraction, now off). node_type-only demote (topology
+/// preserved, so depth_consistency still holds).
+fn check_and_correct_section_overlap_count(
+    graph: &mut DocumentGraph,
+    cfg: &SectionOverlapCountInvariantConfig,
+    report: &mut SanityReport,
+) {
+    if cfg.count_threshold == 0 {
+        return; // a 0 threshold would demote every section — treat as OFF
+    }
+
+    // Every node with a physical bbox: (id, page, bbox). Any node type counts
+    // toward a section's overlap tally — CR-69 is a figure-CLUSTER detector.
+    let nodes: Vec<(NodeId, u32, BoundingBox)> = graph
+        .nodes
+        .iter()
+        .filter_map(|(id, n)| {
+            n.location
+                .physical
+                .as_ref()
+                .map(|p| (*id, p.page, p.bounding_box.clone()))
+        })
+        .collect();
+
+    // Pass 1 — find violators (immutable borrow).
+    let mut violators: Vec<(NodeId, u32)> = Vec::new();
+    for (id, n) in graph.nodes.iter() {
+        if n.node_type != "Section" {
+            continue;
+        }
+        let phys = match n.location.physical.as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+        let s = &phys.bounding_box;
+        let section_area = s.width * s.height;
+        if section_area <= 0.0 {
+            continue;
+        }
+        let count = nodes
+            .iter()
+            .filter(|(other_id, page, _)| *other_id != *id && *page == phys.page)
+            .filter(|(_, _, b)| {
+                let ix = (s.x + s.width).min(b.x + b.width) - s.x.max(b.x);
+                let iy = (s.y + s.height).min(b.y + b.height) - s.y.max(b.y);
+                ix > 0.0 && iy > 0.0 && (ix * iy) / section_area > cfg.min_overlap_frac
+            })
+            .count() as u32;
+        if count >= cfg.count_threshold {
+            violators.push((*id, count));
+        }
+    }
+
+    // Pass 2 — record + (optionally) demote.
+    for (node_id, overlap_count) in violators {
+        report
+            .section_overlap_count_violations
+            .push(SectionOverlapCountViolation {
+                node_id,
+                overlap_count,
+                count_threshold: cfg.count_threshold,
+                corrected: cfg.correct,
+            });
+        if cfg.correct {
+            if let Some(node) = graph.nodes.get_mut(&node_id) {
+                node.node_type = "Paragraph".to_string();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
         GraphSanityConfig, GraphSanityInvariants, InvariantToggle, SectionHeightInvariantConfig,
-        SectionParagraphOverlapInvariantConfig,
+        SectionOverlapCountInvariantConfig, SectionParagraphOverlapInvariantConfig,
     };
     use crate::types::{
         BookmarkData, BookmarkSection, BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation,
@@ -833,6 +938,164 @@ mod tests {
         assert!(
             report.section_overlap_violations.is_empty(),
             "adjacent (touching, non-overlapping) section must be kept"
+        );
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CR-69 — geometry-only overlap-COUNT demote invariant tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Build root → 1 candidate Section (at `sec`) + N other nodes (each
+    /// `(node_type, page, x, y, w, h)`). Returns (graph, section_id).
+    fn make_overlap_count_graph(
+        sec: (u32, f32, f32, f32, f32),
+        others: &[(&str, u32, f32, f32, f32, f32)],
+    ) -> (DocumentGraph, NodeId) {
+        let root_id = Uuid::new_v4();
+        let section_id = Uuid::new_v4();
+        let mut graph = DocumentGraph::new_with_root(root_id);
+
+        let mut root = DocumentNode::new_with_id(root_id, "Document", "root".into());
+        root.location.semantic.depth = 0;
+        root.children.push(section_id);
+
+        let bbox = |p: u32, x: f32, y: f32, w: f32, h: f32| PhysicalLocation {
+            page: p,
+            bounding_box: BoundingBox { x, y, width: w, height: h },
+        };
+
+        let mut section = DocumentNode::new_with_id(section_id, "Section", "candidate".into());
+        section.parent = Some(root_id);
+        section.location.semantic.depth = 1;
+        section.location.physical = Some(bbox(sec.0, sec.1, sec.2, sec.3, sec.4));
+        graph.nodes.insert(section_id, section);
+
+        for (i, o) in others.iter().enumerate() {
+            let id = Uuid::new_v4();
+            root.children.push(id);
+            let mut node = DocumentNode::new_with_id(id, o.0, format!("other{i}"));
+            node.parent = Some(root_id);
+            node.location.semantic.depth = 1;
+            node.location.physical = Some(bbox(o.1, o.2, o.3, o.4, o.5));
+            graph.nodes.insert(id, node);
+        }
+        graph.nodes.insert(root_id, root);
+        (graph, section_id)
+    }
+
+    fn overlap_count_config(count_threshold: u32, min_overlap_frac: f32) -> GraphSanityConfig {
+        GraphSanityConfig {
+            enabled: true,
+            invariants: GraphSanityInvariants {
+                section_overlap_count: SectionOverlapCountInvariantConfig {
+                    check: true,
+                    correct: true,
+                    count_threshold,
+                    min_overlap_frac,
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    /// CR-69 Test 1 — a Section overlapping 3 same-page nodes of mixed type
+    /// (the figure-cluster case) → demoted to Paragraph at count_threshold 3.
+    #[test]
+    fn test_cr69_demotes_section_in_cluster() {
+        let (mut graph, section_id) = make_overlap_count_graph(
+            (1, 0.0, 0.0, 100.0, 100.0),
+            &[
+                ("Paragraph", 1, 0.0, 0.0, 50.0, 50.0),
+                ("Figure", 1, 50.0, 0.0, 50.0, 50.0),
+                ("Section", 1, 0.0, 50.0, 50.0, 50.0),
+            ],
+        );
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0));
+        let v: Vec<_> = report
+            .section_overlap_count_violations
+            .iter()
+            .filter(|v| v.node_id == section_id)
+            .collect();
+        assert_eq!(v.len(), 1, "clustered section must be flagged once");
+        assert_eq!(v[0].overlap_count, 3);
+        assert_eq!(graph.nodes[&section_id].node_type, "Paragraph");
+    }
+
+    /// CR-69 Test 2 — only 2 overlapping nodes (e.g. an over-merged-paragraph
+    /// victim) → count 2 < 3 → kept as Section.
+    #[test]
+    fn test_cr69_keeps_section_with_two_overlaps() {
+        let (mut graph, section_id) = make_overlap_count_graph(
+            (1, 0.0, 0.0, 100.0, 100.0),
+            &[
+                ("Paragraph", 1, 0.0, 0.0, 100.0, 100.0),
+                ("Paragraph", 1, 0.0, 0.0, 30.0, 30.0),
+            ],
+        );
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0));
+        assert!(
+            report.section_overlap_count_violations.is_empty(),
+            "two overlaps is below the count threshold"
+        );
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    /// CR-69 Test 3 — an isolated real header overlapping nothing (others sit on
+    /// another page) → kept as Section.
+    #[test]
+    fn test_cr69_keeps_isolated_section() {
+        let (mut graph, section_id) = make_overlap_count_graph(
+            (1, 0.0, 0.0, 100.0, 20.0),
+            &[
+                ("Paragraph", 2, 0.0, 0.0, 100.0, 100.0),
+                ("Paragraph", 2, 0.0, 0.0, 100.0, 100.0),
+                ("Paragraph", 2, 0.0, 0.0, 100.0, 100.0),
+            ],
+        );
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0));
+        assert!(report.section_overlap_count_violations.is_empty());
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    /// CR-69 Test 4 — min_overlap_frac filters trivial touches: a Section
+    /// overlapping 3 nodes, but each by < min_overlap_frac of its own area →
+    /// not counted → kept. Section area = 10000; each node overlaps by 100
+    /// (1%), below the 0.10 floor.
+    #[test]
+    fn test_cr69_min_frac_filters_trivial_touches() {
+        let (mut graph, section_id) = make_overlap_count_graph(
+            (1, 0.0, 0.0, 100.0, 100.0),
+            &[
+                ("Paragraph", 1, 90.0, 90.0, 10.0, 10.0),
+                ("Paragraph", 1, 0.0, 90.0, 10.0, 10.0),
+                ("Paragraph", 1, 90.0, 0.0, 10.0, 10.0),
+            ],
+        );
+        let report = apply(&mut graph, &overlap_count_config(3, 0.10));
+        assert!(
+            report.section_overlap_count_violations.is_empty(),
+            "sub-threshold overlaps must not count"
+        );
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    /// CR-69 Test 5 — count_threshold 0 is an OFF guard: early-return, nothing
+    /// demoted even with a heavy cluster.
+    #[test]
+    fn test_cr69_count_threshold_zero_is_off() {
+        let (mut graph, section_id) = make_overlap_count_graph(
+            (1, 0.0, 0.0, 100.0, 100.0),
+            &[
+                ("Paragraph", 1, 0.0, 0.0, 50.0, 50.0),
+                ("Figure", 1, 50.0, 0.0, 50.0, 50.0),
+                ("Section", 1, 0.0, 50.0, 50.0, 50.0),
+            ],
+        );
+        let report = apply(&mut graph, &overlap_count_config(0, 0.0));
+        assert!(
+            report.section_overlap_count_violations.is_empty(),
+            "count_threshold 0 must early-return (OFF guard)"
         );
         assert_eq!(graph.nodes[&section_id].node_type, "Section");
     }
