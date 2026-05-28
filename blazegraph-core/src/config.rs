@@ -1020,6 +1020,32 @@ impl Default for SectionHeightInvariantConfig {
     }
 }
 
+/// CR-68 — Per-invariant config for Section/Paragraph overlap-demote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionParagraphOverlapInvariantConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Demote a Section if its bbox 2D-area overlaps a same-page Paragraph
+    /// by more than this fraction of the Section's OWN area.
+    /// 0.0 = OFF sentinel (early-return, no cost).
+    pub threshold: f32,
+    /// Never demote a Section whose normalized text matches a bookmark-outline
+    /// title. Precision helper, NOT the safety mechanism (half the corpus has
+    /// no outline).
+    pub bookmark_bypass: bool,
+}
+
+impl Default for SectionParagraphOverlapInvariantConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            threshold: 0.20,
+            bookmark_bypass: true,
+        }
+    }
+}
+
 /// Set of invariants the graph sanity pipe enforces.
 /// Future invariants (childless pruning, repetition filter, etc.) will appear
 /// here as additional fields.
@@ -1034,6 +1060,10 @@ pub struct GraphSanityInvariants {
     /// demoting Sections whose bbox.height exceeds title.height × tolerance.
     #[serde(default)]
     pub section_height_bounded_by_title: SectionHeightInvariantConfig,
+
+    /// CR-68 — Section demoted when its bbox overlaps a same-page Paragraph.
+    #[serde(default)]
+    pub section_paragraph_overlap: SectionParagraphOverlapInvariantConfig,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).

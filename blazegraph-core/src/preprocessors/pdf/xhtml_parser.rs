@@ -550,7 +550,7 @@ static SECTION_NUMBER_PREFIX_REGEX: LazyLock<Regex> =
 /// emissions like `"3.1. Title"` with outline entries written as
 /// `"3.1 Title"`, restoring the bookmark-match bypass for elements that
 /// fail the `isolated_in_leaf` XY-cut gate.
-fn normalize_for_match(s: &str) -> String {
+pub(crate) fn normalize_for_match(s: &str) -> String {
     let nfkc: String = s.nfkc().collect();
     let folded = nfkc.split_whitespace().collect::<Vec<_>>().join(" ");
     SECTION_NUMBER_PREFIX_REGEX

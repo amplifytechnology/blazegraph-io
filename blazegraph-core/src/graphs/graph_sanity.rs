@@ -15,8 +15,11 @@
 //! Future invariants (childless pruning, repetition filter, empty-paragraph
 //! pruning, duplicate collapse) plug into the same check + correct pattern.
 
-use crate::config::{GraphSanityConfig, SectionHeightInvariantConfig};
-use crate::types::{DocumentGraph, DocumentNode, NodeId};
+use crate::config::{
+    GraphSanityConfig, SectionHeightInvariantConfig, SectionParagraphOverlapInvariantConfig,
+};
+use crate::preprocessors::pdf::xhtml_parser::normalize_for_match;
+use crate::types::{BoundingBox, DocumentGraph, DocumentNode, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Per-node record of a depth invariant violation.
@@ -38,6 +41,15 @@ pub struct SectionHeightViolation {
     pub corrected: bool,
 }
 
+/// CR-68 — Per-node record of a Section/Paragraph overlap-demote violation.
+#[derive(Debug, Clone)]
+pub struct SectionOverlapViolation {
+    pub node_id: NodeId,
+    pub overlap_fraction: f32,
+    pub threshold: f32,
+    pub corrected: bool,
+}
+
 /// Diagnostic output from a sanity-pipe run. Always populated when the pipe
 /// runs; consumers decide what to do with it (log, attach to output, etc.).
 #[derive(Debug, Default, Clone)]
@@ -45,6 +57,7 @@ pub struct SanityReport {
     pub depth_violations: Vec<DepthViolation>,
     pub orphan_nodes: Vec<NodeId>,
     pub section_height_violations: Vec<SectionHeightViolation>,
+    pub section_overlap_violations: Vec<SectionOverlapViolation>,
 }
 
 impl SanityReport {
@@ -52,6 +65,7 @@ impl SanityReport {
         self.depth_violations.is_empty()
             && self.orphan_nodes.is_empty()
             && self.section_height_violations.is_empty()
+            && self.section_overlap_violations.is_empty()
     }
 }
 
@@ -76,11 +90,16 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         check_and_correct_section_height(graph, sh, &mut report);
     }
 
+    let so = &config.invariants.section_paragraph_overlap;
+    if so.check || so.correct {
+        check_and_correct_section_overlap(graph, so, &mut report);
+    }
+
     // Future invariants: childless_sections, repetition_filter, etc. plug in here.
 
     if !report.is_clean() {
         println!(
-            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes, {} section-height violations{}",
+            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes, {} section-height violations{}, {} section-overlap violations{}",
             report.depth_violations.len(),
             if dc.correct && !report.depth_violations.is_empty() {
                 " (corrected)"
@@ -90,6 +109,12 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
             report.orphan_nodes.len(),
             report.section_height_violations.len(),
             if sh.correct && !report.section_height_violations.is_empty() {
+                " (demoted to Paragraph)"
+            } else {
+                ""
+            },
+            report.section_overlap_violations.len(),
+            if so.correct && !report.section_overlap_violations.is_empty() {
                 " (demoted to Paragraph)"
             } else {
                 ""
@@ -233,13 +258,122 @@ fn find_title_height(graph: &DocumentGraph) -> Option<f32> {
         .map(|p| p.bounding_box.height)
 }
 
+/// CR-68 — Section demoted when its bbox 2D-area-overlaps a same-page
+/// Paragraph by more than `threshold` (fraction of the Section's own area).
+///
+/// Figure callouts misclassified as Sections sit inside figure regions that
+/// also hold Paragraph content, so they overlap heavily; real section headers
+/// occupy their own visual space (~0% overlap). Composes after CR-65's
+/// height-bound: height removes the big-font callouts, overlap catches the
+/// residual at-body-size ones. Demote is node_type-only (topology preserved,
+/// so depth_consistency still holds).
+///
+/// `threshold == 0.0` is the OFF sentinel — early-return, no cost.
+/// `bookmark_bypass`: never demote a Section whose normalized text matches a
+/// bookmark-outline title (reuses CR-67's normalize_for_match). Precision
+/// helper, NOT the safety mechanism (half the corpus has no outline).
+fn check_and_correct_section_overlap(
+    graph: &mut DocumentGraph,
+    cfg: &SectionParagraphOverlapInvariantConfig,
+    report: &mut SanityReport,
+) {
+    if cfg.threshold <= 0.0 {
+        return; // OFF sentinel
+    }
+
+    // Same-page Paragraph bboxes (page, bbox).
+    let paragraphs: Vec<(u32, BoundingBox)> = graph
+        .nodes
+        .values()
+        .filter(|n| n.node_type == "Paragraph")
+        .filter_map(|n| {
+            n.location
+                .physical
+                .as_ref()
+                .map(|p| (p.page, p.bounding_box.clone()))
+        })
+        .collect();
+
+    // Normalized bookmark titles for the bypass (only if enabled + present).
+    let bookmark_titles: Option<HashSet<String>> = if cfg.bookmark_bypass {
+        graph.document_info.bookmark_data.as_ref().map(|bd| {
+            bd.sections
+                .iter()
+                .map(|s| normalize_for_match(&s.title))
+                .collect()
+        })
+    } else {
+        None
+    };
+
+    // Pass 1 — find violators (immutable borrow).
+    let mut violators: Vec<(NodeId, f32)> = Vec::new();
+    for (id, n) in graph.nodes.iter() {
+        if n.node_type != "Section" {
+            continue;
+        }
+        let phys = match n.location.physical.as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+        let s = &phys.bounding_box;
+        let section_area = s.width * s.height;
+        if section_area <= 0.0 {
+            continue;
+        }
+        // Bookmark-bypass: protect titles that match the outline.
+        if let Some(titles) = &bookmark_titles {
+            if titles.contains(&normalize_for_match(&n.content.text)) {
+                continue;
+            }
+        }
+        // Max overlap fraction vs same-page paragraphs.
+        let max_overlap = paragraphs
+            .iter()
+            .filter(|(page, _)| *page == phys.page)
+            .map(|(_, p)| {
+                let ix = (s.x + s.width).min(p.x + p.width) - s.x.max(p.x);
+                let iy = (s.y + s.height).min(p.y + p.height) - s.y.max(p.y);
+                if ix <= 0.0 || iy <= 0.0 {
+                    0.0
+                } else {
+                    (ix * iy) / section_area
+                }
+            })
+            .fold(0.0_f32, f32::max);
+        if max_overlap > cfg.threshold {
+            violators.push((*id, max_overlap));
+        }
+    }
+
+    // Pass 2 — record + (optionally) demote.
+    for (node_id, overlap_fraction) in violators {
+        report
+            .section_overlap_violations
+            .push(SectionOverlapViolation {
+                node_id,
+                overlap_fraction,
+                threshold: cfg.threshold,
+                corrected: cfg.correct,
+            });
+        if cfg.correct {
+            if let Some(node) = graph.nodes.get_mut(&node_id) {
+                node.node_type = "Paragraph".to_string();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
         GraphSanityConfig, GraphSanityInvariants, InvariantToggle, SectionHeightInvariantConfig,
+        SectionParagraphOverlapInvariantConfig,
     };
-    use crate::types::{BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation};
+    use crate::types::{
+        BookmarkData, BookmarkSection, BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation,
+    };
     use uuid::Uuid;
 
     /// Build a minimal graph: root → child(at depth `child_depth`).
@@ -536,5 +670,170 @@ mod tests {
             "text content must be preserved"
         );
         assert_eq!(graph.nodes[&child_id].node_type, "Paragraph");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CR-68 — Section/Paragraph overlap-demote invariant tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Build a graph: root → (section Section, paragraph Paragraph). The caller
+    /// controls each node's (page, x, y, width, height) and the section's text.
+    /// Both sit at depth 1; the section is the title candidate (its own height,
+    /// so CR-65 no-ops on it). Returns (graph, root_id, section_id, paragraph_id).
+    #[allow(clippy::too_many_arguments)]
+    fn make_section_paragraph_graph(
+        section_text: &str,
+        sec: (u32, f32, f32, f32, f32),
+        para: (u32, f32, f32, f32, f32),
+    ) -> (DocumentGraph, NodeId, NodeId, NodeId) {
+        let root_id = Uuid::new_v4();
+        let section_id = Uuid::new_v4();
+        let paragraph_id = Uuid::new_v4();
+        let mut graph = DocumentGraph::new_with_root(root_id);
+
+        let mut root = DocumentNode::new_with_id(root_id, "Document", "root".into());
+        root.children.push(section_id);
+        root.children.push(paragraph_id);
+        root.location.semantic.depth = 0;
+        graph.nodes.insert(root_id, root);
+
+        let bbox = |b: (u32, f32, f32, f32, f32)| PhysicalLocation {
+            page: b.0,
+            bounding_box: BoundingBox {
+                x: b.1,
+                y: b.2,
+                width: b.3,
+                height: b.4,
+            },
+        };
+
+        let mut section = DocumentNode::new_with_id(section_id, "Section", section_text.into());
+        section.parent = Some(root_id);
+        section.location.semantic.depth = 1;
+        section.text_order = Some(0);
+        section.location.physical = Some(bbox(sec));
+        graph.nodes.insert(section_id, section);
+
+        let mut paragraph = DocumentNode::new_with_id(paragraph_id, "Paragraph", "body".into());
+        paragraph.parent = Some(root_id);
+        paragraph.location.semantic.depth = 1;
+        paragraph.text_order = Some(1);
+        paragraph.location.physical = Some(bbox(para));
+        graph.nodes.insert(paragraph_id, paragraph);
+
+        (graph, root_id, section_id, paragraph_id)
+    }
+
+    /// Config that enables the CR-68 overlap invariant at the given threshold,
+    /// leaving the other invariants at their defaults.
+    fn overlap_config(threshold: f32, bookmark_bypass: bool) -> GraphSanityConfig {
+        GraphSanityConfig {
+            enabled: true,
+            invariants: GraphSanityInvariants {
+                section_paragraph_overlap: SectionParagraphOverlapInvariantConfig {
+                    check: true,
+                    correct: true,
+                    threshold,
+                    bookmark_bypass,
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    /// CR-68 Test 1 — Section overlapping a same-page Paragraph by > 0.20 of the
+    /// section's own area, no bookmark data → demoted to Paragraph.
+    /// Section bbox (0,0,100,100) area=10000; paragraph (0,0,100,50) overlaps
+    /// 100×50=5000 → 0.50 > 0.20 → demote.
+    #[test]
+    fn test_cr68_demotes_section_overlapping_paragraph() {
+        let (mut graph, _, section_id, _) = make_section_paragraph_graph(
+            "Figure callout",
+            (1, 0.0, 0.0, 100.0, 100.0),
+            (1, 0.0, 0.0, 100.0, 50.0),
+        );
+        let report = apply(&mut graph, &overlap_config(0.20, true));
+        assert_eq!(report.section_overlap_violations.len(), 1);
+        assert_eq!(report.section_overlap_violations[0].node_id, section_id);
+        assert!(report.section_overlap_violations[0].corrected);
+        assert_eq!(graph.nodes[&section_id].node_type, "Paragraph");
+    }
+
+    /// CR-68 Test 2 — same overlap geometry, but bookmark_data contains a title
+    /// matching the section's text and bookmark_bypass is on → kept as Section.
+    #[test]
+    fn test_cr68_bookmark_bypass_protects_matching_section() {
+        let (mut graph, _, section_id, _) = make_section_paragraph_graph(
+            "3.1. Approach 1",
+            (1, 0.0, 0.0, 100.0, 100.0),
+            (1, 0.0, 0.0, 100.0, 50.0),
+        );
+        // Outline writes it as "3.1 Approach 1"; normalize_for_match aligns them.
+        graph.document_info.bookmark_data = Some(BookmarkData {
+            sections: vec![BookmarkSection {
+                title: "3.1 Approach 1".into(),
+                order: 0,
+                level: 1,
+            }],
+        });
+        let report = apply(&mut graph, &overlap_config(0.20, true));
+        assert!(
+            report.section_overlap_violations.is_empty(),
+            "bookmark-matching section must be protected"
+        );
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    /// CR-68 Test 3 — overlap < 0.20 → kept as Section.
+    /// Paragraph (0,0,100,10) overlaps section (0,0,100,100) by 1000/10000=0.10.
+    #[test]
+    fn test_cr68_keeps_section_below_threshold() {
+        let (mut graph, _, section_id, _) = make_section_paragraph_graph(
+            "Real header",
+            (1, 0.0, 0.0, 100.0, 100.0),
+            (1, 0.0, 0.0, 100.0, 10.0),
+        );
+        let report = apply(&mut graph, &overlap_config(0.20, true));
+        assert!(
+            report.section_overlap_violations.is_empty(),
+            "overlap below threshold must not flag"
+        );
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    /// CR-68 Test 4 — threshold 0.0 is the OFF sentinel: early-return, no
+    /// violations, node unchanged even with overlapping geometry.
+    #[test]
+    fn test_cr68_threshold_zero_is_off_sentinel() {
+        let (mut graph, _, section_id, _) = make_section_paragraph_graph(
+            "Figure callout",
+            (1, 0.0, 0.0, 100.0, 100.0),
+            (1, 0.0, 0.0, 100.0, 50.0),
+        );
+        let report = apply(&mut graph, &overlap_config(0.0, true));
+        assert!(
+            report.section_overlap_violations.is_empty(),
+            "threshold 0.0 must early-return (OFF sentinel)"
+        );
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    /// CR-68 Test 5 — a real section sitting directly above a paragraph (boxes
+    /// touch but do not overlap) → kept as Section. The RFC tight-packing case.
+    /// Section (0,0,100,20) occupies y∈[0,20]; paragraph (0,20,100,80) occupies
+    /// y∈[20,100] → iy = 20 - 20 = 0 → 0% overlap.
+    #[test]
+    fn test_cr68_keeps_real_section_adjacent_to_paragraph() {
+        let (mut graph, _, section_id, _) = make_section_paragraph_graph(
+            "1. Introduction",
+            (1, 0.0, 0.0, 100.0, 20.0),
+            (1, 0.0, 20.0, 100.0, 80.0),
+        );
+        let report = apply(&mut graph, &overlap_config(0.20, true));
+        assert!(
+            report.section_overlap_violations.is_empty(),
+            "adjacent (touching, non-overlapping) section must be kept"
+        );
+        assert_eq!(graph.nodes[&section_id].node_type, "Section");
     }
 }
