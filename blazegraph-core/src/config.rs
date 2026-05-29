@@ -1114,6 +1114,30 @@ impl Default for TopologyRebalanceConfig {
     }
 }
 
+/// CR-72 — Per-invariant config for numbering-scheme-restart nesting.
+///
+/// Detects a numbering scheme that restarts into a *subordinate* scheme
+/// (letters `A.`, `B.`… or roman `I.`, `II.`…) after an established decimal run,
+/// introduced by an unnumbered container heading (the canonical case being an
+/// `Appendix` block). When fired, the subordinate run nests UNDER the container
+/// instead of sitting as level-1 siblings. Runs inside `rebalance_topology` —
+/// it shapes the level signal the stack replay consumes. When `correct` is
+/// false, the rebalance behaves exactly as it does without this rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NumberingRestartConfig {
+    pub check: bool,
+    pub correct: bool,
+}
+
+impl Default for NumberingRestartConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+        }
+    }
+}
+
 /// Set of invariants the graph sanity pipe enforces.
 /// Future invariants (childless pruning, repetition filter, etc.) will appear
 /// here as additional fields.
@@ -1145,6 +1169,12 @@ pub struct GraphSanityInvariants {
     /// output) when enabled.
     #[serde(default)]
     pub topology_rebalance: TopologyRebalanceConfig,
+
+    /// CR-72 — Nest a subordinate-scheme restart (letter/roman run) under the
+    /// unnumbered container heading that introduces it (appendix grouping).
+    /// Runs as part of the topology rebalance.
+    #[serde(default)]
+    pub numbering_restart: NumberingRestartConfig,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).

@@ -16,8 +16,9 @@
 //! pruning, duplicate collapse) plug into the same check + correct pattern.
 
 use crate::config::{
-    GraphSanityConfig, SectionHeightInvariantConfig, SectionOverlapCountInvariantConfig,
-    SectionParagraphOverlapInvariantConfig, TopologyRebalanceConfig,
+    GraphSanityConfig, NumberingRestartConfig, SectionHeightInvariantConfig,
+    SectionOverlapCountInvariantConfig, SectionParagraphOverlapInvariantConfig,
+    TopologyRebalanceConfig,
 };
 use crate::preprocessors::pdf::xhtml_parser::normalize_for_match;
 use crate::types::{BoundingBox, DocumentGraph, DocumentNode, NodeId};
@@ -72,6 +73,10 @@ pub struct TopologyRebalanceReport {
     /// Demoted (non-Section) nodes that had children before the rebuild and
     /// are leaves after it (spurious levels collapsed).
     pub spurious_levels_collapsed: usize,
+    /// CR-72 — Subordinate-scheme sections (letters/roman) nested under a
+    /// numbering-restart container instead of staying at level-1. Counts the
+    /// subordinate elements re-parented into the sticky container region.
+    pub restart_nested: usize,
     /// Whether corrections were written back to the graph.
     pub corrected: bool,
 }
@@ -139,8 +144,9 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
     // CR-70 — topology rebalance runs LAST, after all node_type demotions have
     // settled. It rebuilds parent/child/depth from the surviving node set.
     let tr = &config.invariants.topology_rebalance;
+    let nr = &config.invariants.numbering_restart;
     if tr.check || tr.correct {
-        rebalance_topology(graph, tr, &mut report);
+        rebalance_topology(graph, tr, nr, &mut report);
     }
 
     // Future invariants: childless_sections, repetition_filter, etc. plug in here.
@@ -151,10 +157,11 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
             .as_ref()
             .map(|r| {
                 format!(
-                    ", topology rebalance: {} re-parented, {} depths changed, {} spurious levels collapsed{}",
+                    ", topology rebalance: {} re-parented, {} depths changed, {} spurious levels collapsed, {} restart-nested{}",
                     r.reparented,
                     r.depths_changed,
                     r.spurious_levels_collapsed,
+                    r.restart_nested,
                     if r.corrected { " (applied)" } else { "" },
                 )
             })
@@ -610,6 +617,354 @@ fn numbering_level(text: &str) -> Option<u32> {
     Some(dots + 1)
 }
 
+/// CR-72 — A leading numbering prefix's *scheme* and the ordinal value of its
+/// FIRST (outermost) component. `numbering_level` stays the decimal-depth
+/// source; this classifies which alphabet the prefix belongs to so the restart
+/// detector can tell a subordinate run (`A.`, `B.`…) from a primary one (`3.`).
+///
+/// - `Decimal(depth)` — digit-led (`3.` → depth 1, `3.1.` → depth 2). The
+///   `ordinal` is the leading integer (`3.` → 3); `depth` mirrors
+///   `numbering_level`.
+/// - `Letter(ord)` — a single A–Z letter followed by `.` or `)` (`A.` → 1,
+///   `B.` → 2). Multi-letter prefixes (`AB.`) are NOT letters (avoids matching
+///   acronyms / words).
+/// - `Roman(ord)` — a roman-numeral run followed by `.` or `)` (`I.` → 1,
+///   `IV.` → 4). Checked AFTER letter so single `I`/`V`/`X` stay letters; a
+///   multi-glyph roman (`II.`, `IV.`) is unambiguous.
+/// - `NoneScheme` — anything else (unnumbered headings, prose).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    Decimal { depth: u32, ordinal: u32 },
+    Letter { ordinal: u32 },
+    Roman { ordinal: u32 },
+    NoneScheme,
+}
+
+/// The ordinal value of a subordinate scheme (letter/roman), if this scheme is
+/// subordinate; `None` for decimal/none. Used by the restart detector to check
+/// run consecutiveness (A→B→C, each ordinal = previous + 1).
+fn subordinate_ordinal(scheme: Scheme) -> Option<u32> {
+    match scheme {
+        Scheme::Letter { ordinal } | Scheme::Roman { ordinal } => Some(ordinal),
+        _ => None,
+    }
+}
+
+/// Parse a roman-numeral run (uppercase) into its value, or `None` if it isn't
+/// a well-formed roman numeral. Standard subtractive notation up to a few
+/// thousand — far more than any appendix run needs.
+fn roman_value(s: &str) -> Option<u32> {
+    if s.is_empty() {
+        return None;
+    }
+    let val = |c: char| -> Option<u32> {
+        Some(match c {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => return None,
+        })
+    };
+    let mut total: u32 = 0;
+    let mut prev: u32 = 0;
+    for c in s.chars() {
+        let v = val(c)?;
+        if v > prev && prev != 0 {
+            // Subtractive step: the previously-added `prev` was actually a
+            // prefix (e.g. IV = 5 - 2*1). Correct the running total.
+            total += v - 2 * prev;
+        } else {
+            total += v;
+        }
+        prev = v;
+    }
+    Some(total)
+}
+
+/// Classify a leading numbering prefix into its scheme (see `Scheme`).
+fn numbering_scheme(text: &str) -> Scheme {
+    // Decimal takes priority and reuses the validated `numbering_level` logic
+    // for depth; extract the leading integer for the ordinal.
+    if let Some(depth) = numbering_level(text) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i] == b'*' {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let ordinal = text[start..i].parse::<u32>().unwrap_or(0);
+        return Scheme::Decimal { depth, ordinal };
+    }
+
+    // Strip leading whitespace + emphasis markers (mirror numbering_level).
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i] == b'*' {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Capture a run of uppercase ASCII letters.
+    let start = i;
+    while i < bytes.len() && bytes[i].is_ascii_uppercase() {
+        i += 1;
+    }
+    let token = &text[start..i];
+    if token.is_empty() {
+        return Scheme::NoneScheme;
+    }
+    // The token must be terminated by `.` or `)` (optionally trailing space).
+    // A bare leading word ("Appendix") is NOT a labelled item.
+    let terminated = bytes
+        .get(i)
+        .map(|b| *b == b'.' || *b == b')')
+        .unwrap_or(false);
+    if !terminated {
+        return Scheme::NoneScheme;
+    }
+
+    // Single letter → Letter (A–Z). This deliberately keeps single I/V/X/etc.
+    // as letters; only multi-glyph romans are treated as roman.
+    if token.len() == 1 {
+        let c = token.as_bytes()[0];
+        return Scheme::Letter {
+            ordinal: (c - b'A' + 1) as u32,
+        };
+    }
+
+    // Multi-glyph: only a well-formed roman numeral qualifies (II., IV.…).
+    // Anything else (acronyms like "FLOPS.") is not a numbering prefix.
+    if let Some(v) = roman_value(token) {
+        return Scheme::Roman { ordinal: v };
+    }
+    Scheme::NoneScheme
+}
+
+/// CR-72 — Sub-depth of a subordinate-scheme prefix relative to its container:
+/// the leading letter/roman contributes depth 1, and each trailing
+/// `.<digits>` component adds one more (`A.` → 1, `D.2` → 2, `H.2.1` → 3). A
+/// letter section's decimal subsections nest under their letter parent. Returns
+/// `1` when the prefix is not subordinate (decimal/none) — only meaningful for
+/// region members the detector has already classified as subordinate.
+fn subordinate_sub_depth(text: &str) -> u32 {
+    let scheme = numbering_scheme(text);
+    if subordinate_ordinal(scheme).is_none() {
+        return 1;
+    }
+    // Walk past leading whitespace / `*` / the uppercase token, then count
+    // `.<digit>` tail components.
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i] == b'*' {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_uppercase() {
+        i += 1;
+    }
+    // i now points at the terminator (`.` or `)`). Count decimal tail
+    // components: each `.<digit>` adds depth.
+    let mut depth = 1u32;
+    while i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+        depth += 1;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    depth
+}
+
+/// CR-72 — A detected numbering-scheme restart: the unnumbered container that
+/// introduces a subordinate run, and per-section level overrides that nest the
+/// region under it. `region` maps each region member's id to its overridden
+/// level (`container_level + sub_depth`); the container itself keeps its base
+/// level (so the level signal naturally pops it on return to the primary scheme).
+struct RestartRegion {
+    container_id: NodeId,
+    /// Level override for each region member (subordinate sections AND the
+    /// interspersed unnumbered FP sections that get absorbed). Keyed by id.
+    overrides: HashMap<NodeId, u32>,
+    /// Count of subordinate-scheme sections nested (for the report).
+    nested_count: usize,
+}
+
+/// CR-72 — Detect a numbering-scheme restart in the ordered surviving Sections.
+///
+/// Walks Sections in `text_order`. Fires when, after an established primary
+/// (decimal) run, an unnumbered container Section is IMMEDIATELY followed (in
+/// surviving-Section order, ignoring nothing — the container must be the
+/// section right before the first subordinate element) by a subordinate run
+/// (letters or roman) of length ≥ 2 that is consecutive by ordinal
+/// (A→B→C…, each = previous + 1), allowing interspersed unnumbered Sections
+/// (figure-callout FPs) between the subordinate elements.
+///
+/// Directional: only primary→subordinate fires. A subordinate→primary
+/// transition (the main body resuming) ends the region and does NOT nest the
+/// decimals. Returns the first valid region found, or `None`.
+fn detect_numbering_restart(
+    ordered_section_ids: &[NodeId],
+    schemes: &HashMap<NodeId, Scheme>,
+    texts: &HashMap<NodeId, String>,
+    base_levels: &HashMap<NodeId, u32>,
+) -> Option<RestartRegion> {
+    let mut seen_decimal = false;
+    // Track the most recent unnumbered (NoneScheme) container candidate.
+    let mut last_unnumbered: Option<NodeId> = None;
+
+    let n = ordered_section_ids.len();
+    let mut idx = 0;
+    while idx < n {
+        let id = ordered_section_ids[idx];
+        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::NoneScheme);
+        match scheme {
+            Scheme::Decimal { .. } => {
+                seen_decimal = true;
+                last_unnumbered = None;
+            }
+            Scheme::NoneScheme => {
+                last_unnumbered = Some(id);
+            }
+            Scheme::Letter { ordinal } | Scheme::Roman { ordinal } => {
+                // A subordinate element. It can only START a region if a
+                // decimal run is established AND an unnumbered container sits
+                // immediately before it.
+                if seen_decimal {
+                    if let Some(container_id) = last_unnumbered {
+                        if let Some(region) = try_build_region(
+                            ordered_section_ids,
+                            idx,
+                            ordinal,
+                            container_id,
+                            schemes,
+                            texts,
+                            base_levels,
+                        ) {
+                            return Some(region);
+                        }
+                    }
+                }
+                // Not a valid region start: this subordinate breaks the
+                // "container immediately before" chain — clear the container
+                // candidate (the next subordinate would need a fresh one).
+                last_unnumbered = None;
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// CR-72 — Try to build a region beginning at `start_idx` (the first
+/// subordinate element, ordinal `first_ord`) under `container_id`. The run must
+/// reach length ≥ 2, consecutive by ordinal, allowing interspersed unnumbered
+/// Sections. Returns the region if valid, else `None`.
+fn try_build_region(
+    ordered_section_ids: &[NodeId],
+    start_idx: usize,
+    first_ord: u32,
+    container_id: NodeId,
+    schemes: &HashMap<NodeId, Scheme>,
+    texts: &HashMap<NodeId, String>,
+    base_levels: &HashMap<NodeId, u32>,
+) -> Option<RestartRegion> {
+    let container_level = base_levels.get(&container_id).copied().unwrap_or(1);
+    let mut overrides: HashMap<NodeId, u32> = HashMap::new();
+    let mut nested_count = 0usize;
+    // Members collected provisionally; only committed if the run reaches ≥ 2.
+    let mut provisional: Vec<(NodeId, u32)> = Vec::new();
+    let mut expected_ord = first_ord;
+    let mut run_len = 0usize;
+
+    let n = ordered_section_ids.len();
+    let mut idx = start_idx;
+    while idx < n {
+        let id = ordered_section_ids[idx];
+        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::NoneScheme);
+        match scheme {
+            Scheme::Decimal { .. } => {
+                // A bare decimal prefix is the primary scheme resuming → the
+                // region ends here (do NOT absorb). A letter's decimal
+                // subsection (e.g. "D.2") is NOT a bare decimal — it parses as
+                // `Letter` with a decimal tail and is handled in that arm.
+                break;
+            }
+            Scheme::Letter { ordinal } | Scheme::Roman { ordinal } => {
+                let text = texts.get(&id).map(|s| s.as_str()).unwrap_or("");
+                let sub_depth = subordinate_sub_depth(text);
+                if sub_depth > 1 {
+                    // A letter's decimal subsection (e.g. "D.2" → Letter{4}
+                    // with a `.2` tail). It nests under its letter parent at
+                    // `container_level + sub_depth`; it never advances the
+                    // top-level run counter and never breaks it.
+                    provisional.push((id, container_level + sub_depth));
+                    nested_count += 1;
+                    idx += 1;
+                } else if ordinal == expected_ord {
+                    // The next consecutive top-level letter/roman → extend run.
+                    provisional.push((id, container_level + 1));
+                    nested_count += 1;
+                    run_len += 1;
+                    expected_ord += 1;
+                    idx += 1;
+                } else {
+                    // A top-level subordinate element out of sequence
+                    // (non-consecutive) — the run is broken; region ends here.
+                    break;
+                }
+            }
+            Scheme::NoneScheme => {
+                // Interspersed unnumbered Section absorbed into the region. Its
+                // level is `container_level + its own size-fallback level`, so a
+                // figure-callout FP (large font → fallback level 1) sits at
+                // `container + 1` (sibling of the letters), while a genuine
+                // unnumbered subsection (subsection-sized → fallback level 2)
+                // nests one level deeper, under the open letter section — rather
+                // than being flattened to `container + 1` and yanked out of its
+                // letter parent. Either way it does NOT pop the container.
+                let base = base_levels.get(&id).copied().unwrap_or(1);
+                provisional.push((id, container_level + base));
+                idx += 1;
+            }
+        }
+    }
+
+    if run_len < 2 {
+        return None;
+    }
+    for (id, lvl) in provisional {
+        overrides.insert(id, lvl);
+    }
+    Some(RestartRegion {
+        container_id,
+        overrides,
+        nested_count,
+    })
+}
+
 /// A surviving Section's level signal: numbering depth if present, else the
 /// calibrated font-size-rank fallback. Mirrors the prototype's
 /// `make_level_of(source="numbering")` (`num or fb`).
@@ -753,6 +1108,7 @@ fn first_number_offset(
 fn rebalance_topology(
     graph: &mut DocumentGraph,
     cfg: &TopologyRebalanceConfig,
+    nr: &NumberingRestartConfig,
     report: &mut SanityReport,
 ) {
     let root_id = graph.document_info.root_id;
@@ -787,6 +1143,48 @@ fn rebalance_topology(
         numbering,
         size_fallback,
     };
+
+    // ── CR-72 — numbering-scheme-restart detection (pre-pass). ──
+    //
+    // Detect a subordinate-scheme run (letters/roman) that restarts after an
+    // established decimal run, introduced by an unnumbered container heading,
+    // and produce per-section LEVEL OVERRIDES that nest the region under the
+    // container. The override map then feeds the existing stack replay: a
+    // subordinate section at `container_level + sub_depth` nests under the
+    // container (and a letter's decimal subsections nest under the letter);
+    // interspersed unnumbered FP sections get `container_level + 1` so they
+    // attach inside the container without popping it. The container keeps its
+    // own base level, so a return to the primary scheme at base level pops it.
+    //
+    // Gated on `nr.correct`: when false the map stays empty and the replay is
+    // byte-for-byte identical to CR-70's. `check`-only records the would-be
+    // count in the report (below) but applies nothing.
+    let mut level_overrides: HashMap<NodeId, u32> = HashMap::new();
+    let mut restart_region: Option<RestartRegion> = None;
+    if nr.check || nr.correct {
+        // Section-only ordered ids + scheme/text/base-level lookups.
+        let mut ordered_section_ids: Vec<NodeId> = Vec::new();
+        let mut schemes: HashMap<NodeId, Scheme> = HashMap::new();
+        let mut texts: HashMap<NodeId, String> = HashMap::new();
+        let mut base_levels: HashMap<NodeId, u32> = HashMap::new();
+        for id in &order {
+            let n = &graph.nodes[id];
+            if n.node_type != "Section" {
+                continue;
+            }
+            ordered_section_ids.push(*id);
+            schemes.insert(*id, numbering_scheme(&n.content.text));
+            texts.insert(*id, n.content.text.clone());
+            base_levels.insert(*id, levels.level_of(id));
+        }
+        restart_region =
+            detect_numbering_restart(&ordered_section_ids, &schemes, &texts, &base_levels);
+    }
+    if nr.correct {
+        if let Some(region) = &restart_region {
+            level_overrides = region.overrides.clone();
+        }
+    }
 
     // Snapshot which nodes open a level (surviving Sections).
     let snapshot: Vec<RebalanceNode> = order
@@ -823,7 +1221,13 @@ fn rebalance_topology(
 
     for node in &snapshot {
         if node.is_open_section {
-            let l = levels.level_of(&node.id);
+            // CR-72 — a restart-region member uses its overridden level
+            // (container_level + sub_depth); everyone else uses the CR-70
+            // numbering/size signal. Empty override map ⇒ identical to CR-70.
+            let l = level_overrides
+                .get(&node.id)
+                .copied()
+                .unwrap_or_else(|| levels.level_of(&node.id));
             while stack.len() > 1 && stack.last().unwrap().level >= l {
                 stack.pop();
             }
@@ -859,6 +1263,12 @@ fn rebalance_topology(
         corrected: cfg.correct,
         ..Default::default()
     };
+    // CR-72 — report the subordinate sections nested under a restart container.
+    // Recorded whenever the detector ran (check or correct); it reflects what
+    // the rule would (or did) nest.
+    if let Some(region) = &restart_region {
+        rebalance_report.restart_nested = region.nested_count;
+    }
     for id in &order {
         let n = &graph.nodes[id];
         if new_parent.get(id).copied() != n.parent {
@@ -913,9 +1323,9 @@ fn rebalance_topology(
 mod tests {
     use super::*;
     use crate::config::{
-        GraphSanityConfig, GraphSanityInvariants, InvariantToggle, SectionHeightInvariantConfig,
-        SectionOverlapCountInvariantConfig, SectionParagraphOverlapInvariantConfig,
-        TopologyRebalanceConfig,
+        GraphSanityConfig, GraphSanityInvariants, InvariantToggle, NumberingRestartConfig,
+        SectionHeightInvariantConfig, SectionOverlapCountInvariantConfig,
+        SectionParagraphOverlapInvariantConfig, TopologyRebalanceConfig,
     };
     use crate::types::{
         BookmarkData, BookmarkSection, BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation,
@@ -1664,6 +2074,10 @@ mod tests {
                     max_section_depth,
                     max_total_depth,
                 },
+                numbering_restart: NumberingRestartConfig {
+                    check: true,
+                    correct: true,
+                },
             },
         }
     }
@@ -1884,5 +2298,294 @@ mod tests {
         assert_eq!(font_stem(Some("DejaVuSans")), "dejavusans");
         assert_eq!(font_stem(None), "?");
         assert_eq!(font_stem(Some("")), "?");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CR-72 — numbering-scheme-restart nesting tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// CR-72 helper unit — `numbering_scheme` classifies decimal / letter /
+    /// roman / none with the correct ordinal.
+    #[test]
+    fn test_cr72_numbering_scheme_classification() {
+        assert_eq!(
+            numbering_scheme("3. Title"),
+            Scheme::Decimal { depth: 1, ordinal: 3 }
+        );
+        assert_eq!(
+            numbering_scheme("3.1. Sub"),
+            Scheme::Decimal { depth: 2, ordinal: 3 }
+        );
+        assert_eq!(numbering_scheme("A. Appendix item"), Scheme::Letter { ordinal: 1 });
+        assert_eq!(numbering_scheme("B. Next"), Scheme::Letter { ordinal: 2 });
+        assert_eq!(numbering_scheme("J. Tenth"), Scheme::Letter { ordinal: 10 });
+        assert_eq!(numbering_scheme("A) paren form"), Scheme::Letter { ordinal: 1 });
+        // Single I/V/X stay letters (ambiguous-by-design); multi-glyph romans
+        // are roman.
+        assert_eq!(numbering_scheme("I. one"), Scheme::Letter { ordinal: 9 });
+        assert_eq!(numbering_scheme("II. two"), Scheme::Roman { ordinal: 2 });
+        assert_eq!(numbering_scheme("IV. four"), Scheme::Roman { ordinal: 4 });
+        // Unnumbered / prose / acronyms.
+        assert_eq!(numbering_scheme("Appendix"), Scheme::NoneScheme);
+        assert_eq!(numbering_scheme("References"), Scheme::NoneScheme);
+        assert_eq!(numbering_scheme("FLOPS. ratio"), Scheme::NoneScheme);
+        assert_eq!(numbering_scheme("Abstract"), Scheme::NoneScheme);
+        // A bare leading word (no `.`/`)` terminator) is not a labelled item.
+        assert_eq!(numbering_scheme("Appendix A"), Scheme::NoneScheme);
+    }
+
+    /// CR-72 helper unit — `subordinate_sub_depth` counts the decimal tail.
+    #[test]
+    fn test_cr72_subordinate_sub_depth() {
+        assert_eq!(subordinate_sub_depth("A. top"), 1);
+        assert_eq!(subordinate_sub_depth("D.2 sub"), 2);
+        assert_eq!(subordinate_sub_depth("H.4 sub"), 2);
+        assert_eq!(subordinate_sub_depth("H.2.1 deeper"), 3);
+        // Non-subordinate prefixes are not the caller's concern → 1.
+        assert_eq!(subordinate_sub_depth("3. decimal"), 1);
+    }
+
+    /// Build the section-only inputs and run the detector directly on an
+    /// ordered list of `(text)` Section stand-ins. Returns the region (if any)
+    /// plus the ids in order, so tests can assert membership.
+    fn run_detector(texts: &[&str]) -> (Option<RestartRegion>, Vec<NodeId>) {
+        let ids: Vec<NodeId> = texts.iter().map(|_| Uuid::new_v4()).collect();
+        let mut schemes = HashMap::new();
+        let mut text_map = HashMap::new();
+        let mut base_levels = HashMap::new();
+        for (i, t) in texts.iter().enumerate() {
+            schemes.insert(ids[i], numbering_scheme(t));
+            text_map.insert(ids[i], t.to_string());
+            // All sections share base level 1 (the alphafold case: appendix
+            // letters share the decimal-level-1 font/size).
+            base_levels.insert(ids[i], 1u32);
+        }
+        let region = detect_numbering_restart(&ids, &schemes, &text_map, &base_levels);
+        (region, ids)
+    }
+
+    /// CR-72 detector — fires on `[1., 2., ∅Appendix, A., B.]`; A and B are
+    /// region members (nested), Appendix is the container.
+    #[test]
+    fn test_cr72_detector_fires_on_appendix_letter_run() {
+        let (region, ids) = run_detector(&["1. Intro", "2. Methods", "Appendix", "A. Data", "B. Code"]);
+        let region = region.expect("restart must fire on a clean appendix letter run");
+        assert_eq!(region.container_id, ids[2], "Appendix is the container");
+        assert_eq!(region.nested_count, 2, "A and B nested");
+        assert_eq!(region.overrides.get(&ids[3]).copied(), Some(2), "A → level 2");
+        assert_eq!(region.overrides.get(&ids[4]).copied(), Some(2), "B → level 2");
+        assert!(!region.overrides.contains_key(&ids[2]), "container is not overridden");
+    }
+
+    /// CR-72 detector — does NOT fire on a pure-decimal document.
+    #[test]
+    fn test_cr72_detector_no_fire_pure_decimal() {
+        let (region, _ids) = run_detector(&["1. A", "2. B", "3. C"]);
+        assert!(region.is_none(), "pure-decimal must not fire");
+    }
+
+    /// CR-72 detector — does NOT fire on subordinate→primary (`[A., B., 1.]`):
+    /// the letters precede any established decimal run, so there is no
+    /// primary→subordinate restart.
+    #[test]
+    fn test_cr72_detector_no_fire_subordinate_then_primary() {
+        let (region, _ids) = run_detector(&["A. First", "B. Second", "1. Body"]);
+        assert!(
+            region.is_none(),
+            "subordinate-then-primary is the body resuming, must not fire"
+        );
+    }
+
+    /// CR-72 detector — does NOT fire on a stray single letter
+    /// `[1., ∅X, C, 2.]` (run length 1, broken by the resuming decimal).
+    #[test]
+    fn test_cr72_detector_no_fire_stray_single_letter() {
+        let (region, _ids) = run_detector(&["1. Intro", "X heading", "C. lone", "2. More"]);
+        assert!(region.is_none(), "a stray single letter must not fire");
+    }
+
+    /// CR-72 detector — does NOT fire on a length-1 subordinate run even with a
+    /// valid container (`[1., ∅Appendix, A., 2.]`).
+    #[test]
+    fn test_cr72_detector_no_fire_length_one_run() {
+        let (region, _ids) = run_detector(&["1. Intro", "Appendix", "A. Only", "2. Body"]);
+        assert!(region.is_none(), "a length-1 subordinate run must not fire");
+    }
+
+    /// CR-72 detector — interleaved unnumbered Section inside the region is
+    /// absorbed (region-absorb): `[1., Appendix, A., ∅FigFP, B.]` → FigFP and
+    /// A,B all become region members under the container.
+    #[test]
+    fn test_cr72_detector_absorbs_interleaved_unnumbered() {
+        let (region, ids) =
+            run_detector(&["1. Intro", "Appendix", "A. Data", "FigFP callout", "B. Code"]);
+        let region = region.expect("restart fires with an interleaved FP in the run");
+        assert_eq!(region.container_id, ids[1]);
+        // A, FigFP, B all overridden to nest under the container.
+        assert_eq!(region.overrides.get(&ids[2]).copied(), Some(2), "A nested");
+        assert_eq!(region.overrides.get(&ids[3]).copied(), Some(2), "FigFP absorbed");
+        assert_eq!(region.overrides.get(&ids[4]).copied(), Some(2), "B nested");
+        assert_eq!(region.nested_count, 2, "only A and B count as subordinate");
+    }
+
+    /// CR-72 detector — a letter's decimal subsection (`D.2`) nests one level
+    /// deeper than its letter parent.
+    #[test]
+    fn test_cr72_detector_letter_subsection_nests_deeper() {
+        let (region, ids) =
+            run_detector(&["1. Intro", "Appendix", "A. Data", "B. Code", "B.2 Detail"]);
+        let region = region.expect("restart fires");
+        assert_eq!(region.overrides.get(&ids[2]).copied(), Some(2), "A → level 2");
+        assert_eq!(region.overrides.get(&ids[3]).copied(), Some(2), "B → level 2");
+        assert_eq!(
+            region.overrides.get(&ids[4]).copied(),
+            Some(3),
+            "B.2 → level 3 (one deeper than its letter parent)"
+        );
+    }
+
+    /// CR-72 integration — full rebalance over `[title∅, 1., 2., ∅Appendix,
+    /// A., B.]`: A and B become children of Appendix (depth 2), not level-1
+    /// siblings.
+    #[test]
+    fn test_cr72_rebalance_nests_letters_under_appendix() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+        ];
+        let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
+        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+
+        // 1., 2., Appendix are level-1 siblings under root.
+        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 1);
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1, "Appendix stays level 1");
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id));
+        // A and B nest UNDER Appendix at depth 2.
+        assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 2, "A → depth 2");
+        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[2]), "A parented to Appendix");
+        assert_eq!(graph.nodes[&ids[4]].location.semantic.depth, 2, "B → depth 2");
+        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[2]), "B parented to Appendix");
+        // Appendix now has A and B as children (text_order).
+        assert_eq!(graph.nodes[&ids[2]].children, vec![ids[3], ids[4]]);
+        // Report records the nesting.
+        let tr = report.topology_rebalance.expect("report present");
+        assert_eq!(tr.restart_nested, 2, "two subordinate sections nested");
+    }
+
+    /// CR-72 integration — region-absorb: `[1., Appendix, A., ∅FigFP, B.]` →
+    /// FigFP and A,B all under Appendix (the interleaved FP does NOT pop the
+    /// container).
+    #[test]
+    fn test_cr72_rebalance_region_absorbs_interleaved_fp() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "FLOPS", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+        ];
+        let (mut graph, _root, ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        // Appendix is the container; A, FigFP(FLOPS), B all sit under it.
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 1, "Appendix level 1");
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(ids[1]), "A under Appendix");
+        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[1]), "interleaved FP under Appendix");
+        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[1]), "B under Appendix");
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 2);
+        assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 2);
+        assert_eq!(graph.nodes[&ids[4]].location.semantic.depth, 2);
+    }
+
+    /// CR-72 integration — an unnumbered region member's nesting tracks its
+    /// size-fallback level, not a flat `container + 1`. A genuine subsection
+    /// (smaller font → fallback level 2) nests UNDER its open letter section,
+    /// while a figure-callout FP (larger font → fallback level 1) stays at
+    /// `container + 1`. Guards the refinement to the region-absorb rule:
+    /// `Model Details` must not be yanked out of its letter parent up to a
+    /// direct child of `Appendix`.
+    #[test]
+    fn test_cr72_rebalance_unnumbered_subsection_nests_under_letter() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "A. Model Card", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Model Details", font_family: None, font_size: Some(10.0), depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "B. Trained Models", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "FLOPS", font_family: None, font_size: Some(20.0), depth: 9, parent_idx: None },
+        ];
+        let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        // Appendix is the level-1 container.
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1);
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id));
+        // Letters A, B nest directly under Appendix at depth 2.
+        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[2]), "A under Appendix");
+        assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 2);
+        assert_eq!(graph.nodes[&ids[5]].parent, Some(ids[2]), "B under Appendix");
+        assert_eq!(graph.nodes[&ids[5]].location.semantic.depth, 2);
+        // Genuine subsection (smaller font) nests UNDER its open letter A at depth 3 —
+        // NOT flattened to a direct Appendix child.
+        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[3]), "Model Details under letter A");
+        assert_eq!(graph.nodes[&ids[4]].location.semantic.depth, 3);
+        // Figure-callout FP (larger font) stays at container + 1 (direct Appendix child).
+        assert_eq!(graph.nodes[&ids[6]].parent, Some(ids[2]), "FLOPS under Appendix");
+        assert_eq!(graph.nodes[&ids[6]].location.semantic.depth, 2);
+    }
+
+    /// CR-72 integration — when `numbering_restart.correct` is false the
+    /// rebalance behaves EXACTLY as CR-70 (letters fall to the size fallback →
+    /// level-1 siblings of Appendix, NOT children).
+    #[test]
+    fn test_cr72_disabled_is_cr70_behavior() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+        ];
+        let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
+        let mut cfg = rebalance_only_config(3, 4);
+        cfg.invariants.numbering_restart = NumberingRestartConfig {
+            check: false,
+            correct: false,
+        };
+        apply(&mut graph, &cfg);
+
+        // Without the rule, A and B fall to the size fallback (level 1) and sit
+        // as level-1 siblings of Appendix under root.
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1, "A stays level 1");
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id), "A sibling of Appendix");
+        assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 1, "B stays level 1");
+        assert_eq!(graph.nodes[&ids[3]].parent, Some(root_id), "B sibling of Appendix");
+    }
+
+    /// CR-72 integration — idempotency: a second rebalance over the already
+    /// restart-nested graph re-parents nothing and changes no depth.
+    #[test]
+    fn test_cr72_idempotent_second_run_is_noop() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+        ];
+        let (mut graph, _root, _ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+        let tr = report
+            .topology_rebalance
+            .as_ref()
+            .expect("rebalance report present");
+        assert_eq!(tr.reparented, 0, "second run must re-parent nothing");
+        assert_eq!(tr.depths_changed, 0, "second run must change no depth");
     }
 }
