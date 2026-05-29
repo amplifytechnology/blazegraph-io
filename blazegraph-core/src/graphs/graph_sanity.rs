@@ -17,7 +17,7 @@
 
 use crate::config::{
     GraphSanityConfig, SectionHeightInvariantConfig, SectionOverlapCountInvariantConfig,
-    SectionParagraphOverlapInvariantConfig,
+    SectionParagraphOverlapInvariantConfig, TopologyRebalanceConfig,
 };
 use crate::preprocessors::pdf::xhtml_parser::normalize_for_match;
 use crate::types::{BoundingBox, DocumentGraph, DocumentNode, NodeId};
@@ -60,6 +60,22 @@ pub struct SectionOverlapCountViolation {
     pub corrected: bool,
 }
 
+/// CR-70 — Aggregate record of one topology-rebalance run. Unlike the per-node
+/// demotion violations, the rebalance is a whole-tree rebuild, so the report
+/// carries counts rather than one record per node.
+#[derive(Debug, Clone, Default)]
+pub struct TopologyRebalanceReport {
+    /// Nodes whose `parent` pointer changed.
+    pub reparented: usize,
+    /// Nodes whose `location.semantic.depth` changed.
+    pub depths_changed: usize,
+    /// Demoted (non-Section) nodes that had children before the rebuild and
+    /// are leaves after it (spurious levels collapsed).
+    pub spurious_levels_collapsed: usize,
+    /// Whether corrections were written back to the graph.
+    pub corrected: bool,
+}
+
 /// Diagnostic output from a sanity-pipe run. Always populated when the pipe
 /// runs; consumers decide what to do with it (log, attach to output, etc.).
 #[derive(Debug, Default, Clone)]
@@ -69,6 +85,9 @@ pub struct SanityReport {
     pub section_height_violations: Vec<SectionHeightViolation>,
     pub section_overlap_violations: Vec<SectionOverlapViolation>,
     pub section_overlap_count_violations: Vec<SectionOverlapCountViolation>,
+    /// CR-70 — present when the topology-rebalance step ran. `None` when the
+    /// step is disabled in config.
+    pub topology_rebalance: Option<TopologyRebalanceReport>,
 }
 
 impl SanityReport {
@@ -78,6 +97,11 @@ impl SanityReport {
             && self.section_height_violations.is_empty()
             && self.section_overlap_violations.is_empty()
             && self.section_overlap_count_violations.is_empty()
+            && self
+                .topology_rebalance
+                .as_ref()
+                .map(|r| r.reparented == 0 && r.depths_changed == 0)
+                .unwrap_or(true)
     }
 }
 
@@ -112,11 +136,31 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         check_and_correct_section_overlap_count(graph, soc, &mut report);
     }
 
+    // CR-70 — topology rebalance runs LAST, after all node_type demotions have
+    // settled. It rebuilds parent/child/depth from the surviving node set.
+    let tr = &config.invariants.topology_rebalance;
+    if tr.check || tr.correct {
+        rebalance_topology(graph, tr, &mut report);
+    }
+
     // Future invariants: childless_sections, repetition_filter, etc. plug in here.
 
     if !report.is_clean() {
+        let rebalance_summary = report
+            .topology_rebalance
+            .as_ref()
+            .map(|r| {
+                format!(
+                    ", topology rebalance: {} re-parented, {} depths changed, {} spurious levels collapsed{}",
+                    r.reparented,
+                    r.depths_changed,
+                    r.spurious_levels_collapsed,
+                    if r.corrected { " (applied)" } else { "" },
+                )
+            })
+            .unwrap_or_default();
         println!(
-            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes, {} section-height violations{}, {} section-overlap violations{}, {} section-overlap-count violations{}",
+            "🩺 GraphSanity: {} depth violations{}, {} orphan nodes, {} section-height violations{}, {} section-overlap violations{}, {} section-overlap-count violations{}{}",
             report.depth_violations.len(),
             if dc.correct && !report.depth_violations.is_empty() {
                 " (corrected)"
@@ -142,6 +186,7 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
             } else {
                 ""
             },
+            rebalance_summary,
         );
     }
 
@@ -469,17 +514,428 @@ fn check_and_correct_section_overlap_count(
     }
 }
 
+// ─── CR-70 — Topology rebalance ───────────────────────────────────────────────
+
+/// Reduce a font-family name to its typeface stem so weight/style variants of
+/// the same face collapse together. Ported from the validated prototype
+/// (`scripts/sb_rebalance_experiment.py::font_stem`).
+///
+/// `'ABCDEF+XCharter-BoldItalic'` → `'xcharter'`; `'TimesNewRomanPSMT'` →
+/// `'timesnewroman'`; `'DejaVuSans'` → `'dejavusans'`.
+///
+/// Strategy: drop the subset prefix (`ABCDEF+`), take everything before the
+/// first hyphen (the hyphen reliably separates the face from its weight, incl.
+/// abbreviations like `-Regu`/`-Medi`), then peel any glued foundry/weight tags
+/// (`PSMT`, `Bold`, `Italic`, …) repeatedly. Returns `"?"` for an empty/missing
+/// family.
+fn font_stem(fam: Option<&str>) -> String {
+    let fam = match fam {
+        Some(f) if !f.is_empty() => f,
+        _ => return "?".to_string(),
+    };
+    // Drop subset prefix `ABCDEF+`, then take everything before the first hyphen.
+    let after_plus = fam.rsplit('+').next().unwrap_or(fam);
+    let before_hyphen = after_plus.split('-').next().unwrap_or(after_plus);
+    // Peel glued weight/style/foundry suffixes (case-insensitive), repeatedly.
+    const GLUED_SUFFIXES: &[&str] = &[
+        "psmt", "bold", "italic", "oblique", "regular", "medium", "light", "semibold", "black",
+        "ps", "mt",
+    ];
+    let mut s = before_hyphen.to_string();
+    loop {
+        let lower = s.to_lowercase();
+        let mut peeled = false;
+        for suf in GLUED_SUFFIXES {
+            if lower.ends_with(suf) && lower.len() > suf.len() {
+                s.truncate(s.len() - suf.len());
+                peeled = true;
+                break;
+            }
+        }
+        if !peeled {
+            break;
+        }
+    }
+    let out = s.to_lowercase();
+    if out.is_empty() {
+        fam.to_lowercase()
+    } else {
+        out
+    }
+}
+
+/// Numbering depth from a leading section-number prefix: `"3."` → 1, `"3.1."` →
+/// 2, `"3.1.1."` → 3. Ported from the prototype's `numbering_level` / `NUM_RE`
+/// (`^\s*\**\s*(\d+(?:\.\d+)*)`): count the dot-components of the matched number
+/// and add one. Returns `None` when the text does not start with a number.
+fn numbering_level(text: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    // Optional leading whitespace.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Optional run of `*` (markdown emphasis markers).
+    while i < bytes.len() && bytes[i] == b'*' {
+        i += 1;
+    }
+    // Optional whitespace after the `*` run.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Must start with a digit.
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return None;
+    }
+    // Capture `\d+(?:\.\d+)*` and count the dot-components.
+    let mut dots = 0u32;
+    let mut last_was_digit = false;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            i += 1;
+            last_was_digit = true;
+        } else if bytes[i] == b'.' && last_was_digit {
+            // Lookahead: a `.` only extends the number if followed by a digit.
+            if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                dots += 1;
+                i += 1;
+                last_was_digit = false;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Some(dots + 1)
+}
+
+/// A surviving Section's level signal: numbering depth if present, else the
+/// calibrated font-size-rank fallback. Mirrors the prototype's
+/// `make_level_of(source="numbering")` (`num or fb`).
+struct LevelInputs {
+    numbering: HashMap<NodeId, Option<u32>>,
+    size_fallback: HashMap<NodeId, u32>,
+}
+
+impl LevelInputs {
+    fn level_of(&self, id: &NodeId) -> u32 {
+        match self.numbering.get(id).copied().flatten() {
+            Some(n) => n,
+            None => self.size_fallback.get(id).copied().unwrap_or(1),
+        }
+    }
+}
+
+/// Lightweight view of a node used by the rebalance pass — extracted once so
+/// the stack replay can run over an immutable snapshot before mutating the
+/// graph. Mirrors the fields the prototype's `collect` pulls.
+struct RebalanceNode {
+    id: NodeId,
+    is_open_section: bool,
+}
+
+/// Level for UNNUMBERED sections, calibrated against the numbered ones. Ported
+/// from the prototype's `compute_size_fallback`.
+///
+/// The numbered sections (reliable levels) define a size→level map within the
+/// main (plurality-stem) font family; an unnumbered section's level is
+/// `1 + (count of distinct numbered main-family sizes strictly larger than it)`.
+/// A heading larger than any numbered size → level 1; one matching the level-2
+/// numbered size → level 2. Falls back to ranking ALL main-family section sizes
+/// when the doc has no numbered sections.
+///
+/// `sections` is `(id, stem, size, is_numbered)` in any order (the plurality and
+/// size-set computations are order-stable on insertion for tie-breaking).
+fn compute_size_fallback(sections: &[(NodeId, String, Option<f32>, bool)]) -> HashMap<NodeId, u32> {
+    // Plurality stem among sections (ties broken by first-seen order, matching
+    // Python's `max(dict, key=dict.get)` on an insertion-ordered dict).
+    let mut stem_counts: Vec<(String, usize)> = Vec::new();
+    for (_, stem, _, _) in sections {
+        if let Some(entry) = stem_counts.iter_mut().find(|(s, _)| s == stem) {
+            entry.1 += 1;
+        } else {
+            stem_counts.push((stem.clone(), 1));
+        }
+    }
+    let main = stem_counts
+        .iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(s, _)| s.clone())
+        .unwrap_or_else(|| "?".to_string());
+
+    // Distinct numbered main-family sizes, descending.
+    let mut numbered_sizes: Vec<f32> = collect_distinct_sizes(sections, &main, true);
+    if numbered_sizes.is_empty() {
+        // Wholly-unnumbered doc — rank all main-family section sizes.
+        numbered_sizes = collect_distinct_sizes(sections, &main, false);
+    }
+
+    let mut fb = HashMap::new();
+    for (id, _, size, _) in sections {
+        let level = match size {
+            None => (numbered_sizes.len() as u32).max(1),
+            Some(sz) => 1 + numbered_sizes.iter().filter(|ns| **ns > *sz).count() as u32,
+        };
+        fb.insert(*id, level);
+    }
+    fb
+}
+
+/// Distinct font sizes among main-family sections, descending. When
+/// `numbered_only`, restrict to the numbered ones. Uses the f32 bit pattern as
+/// the dedup key (sizes come straight off the wire — exact equality, no
+/// tolerance, matching the Python `set` semantics).
+fn collect_distinct_sizes(
+    sections: &[(NodeId, String, Option<f32>, bool)],
+    main: &str,
+    numbered_only: bool,
+) -> Vec<f32> {
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut sizes: Vec<f32> = Vec::new();
+    for (_, stem, size, is_numbered) in sections {
+        if stem != main {
+            continue;
+        }
+        if numbered_only && !*is_numbered {
+            continue;
+        }
+        if let Some(sz) = size {
+            if seen.insert(sz.to_bits()) {
+                sizes.push(*sz);
+            }
+        }
+    }
+    sizes.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    sizes
+}
+
+/// Per-doc offset that aligns numbering to the outline's convention: the
+/// bookmark level of the first numbered section minus its numbering depth.
+/// Ported from the prototype's `first_number_offset`. RFC outlines insert the
+/// title as level-1 (offset +1); academic outlines are aligned (offset 0).
+///
+/// In the live rebalance the depth is derived from stack POSITION, so the
+/// offset is implicit in the front-matter that pushes onto the stack before the
+/// first numbered section — this helper is retained for parity with the
+/// prototype's scoring path and for callers that want the explicit offset.
+#[allow(dead_code)]
+fn first_number_offset(
+    ordered_sections: &[NodeId],
+    matched: &HashMap<NodeId, u32>,
+    numbering: &HashMap<NodeId, Option<u32>>,
+) -> i64 {
+    for id in ordered_sections {
+        if let (Some(&bm), Some(&Some(num))) = (matched.get(id), numbering.get(id)) {
+            return bm as i64 - num as i64;
+        }
+    }
+    0
+}
+
+/// CR-70 — rebuild parent/child/depth topology over the surviving nodes.
+///
+/// Replays the stack-based outline build (the same algorithm
+/// `builder.rs::find_parent` uses, ported from the validated prototype's
+/// `rebalance`) over the post-demotion node set in `text_order`:
+///
+/// - A surviving Section opens a level: compute its level `L` (numbering depth,
+///   else calibrated font-size rank), pop the stack while `stack_top.L >= L`,
+///   set `depth = min(stack_position, max_section_depth)`, parent = stack top,
+///   then push.
+/// - Every other node (content, or a node demoted to a non-Section type) is a
+///   leaf attached to the current open section at
+///   `depth = min(section_depth + 1, max_total_depth)`.
+///
+/// Then rewrite each node's `parent`, `children` (ordered by `text_order`), and
+/// `location.semantic.depth`. The Document root stays at depth 0 and parents the
+/// top-level nodes. `check`-only mode records the report but writes nothing.
+fn rebalance_topology(
+    graph: &mut DocumentGraph,
+    cfg: &TopologyRebalanceConfig,
+    report: &mut SanityReport,
+) {
+    let root_id = graph.document_info.root_id;
+
+    // ── Snapshot the surviving non-Document nodes in text_order. ──
+    let mut ordered: Vec<(u32, NodeId)> = graph
+        .nodes
+        .iter()
+        .filter(|(id, n)| **id != root_id && n.node_type != "Document")
+        .map(|(id, n)| (n.text_order.unwrap_or(u32::MAX), *id))
+        .collect();
+    // Stable sort by text_order; ties keep a deterministic order by id.
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let order: Vec<NodeId> = ordered.into_iter().map(|(_, id)| id).collect();
+
+    // ── Per-section level inputs (numbering + calibrated size fallback). ──
+    let mut numbering: HashMap<NodeId, Option<u32>> = HashMap::new();
+    let mut section_fields: Vec<(NodeId, String, Option<f32>, bool)> = Vec::new();
+    for id in &order {
+        let n = &graph.nodes[id];
+        if n.node_type != "Section" {
+            continue;
+        }
+        let num = numbering_level(&n.content.text);
+        numbering.insert(*id, num);
+        let stem = font_stem(n.style_info.as_ref().and_then(|s| s.font_family.as_deref()));
+        let size = n.style_info.as_ref().and_then(|s| s.font_size);
+        section_fields.push((*id, stem, size, num.is_some()));
+    }
+    let size_fallback = compute_size_fallback(&section_fields);
+    let levels = LevelInputs {
+        numbering,
+        size_fallback,
+    };
+
+    // Snapshot which nodes open a level (surviving Sections).
+    let snapshot: Vec<RebalanceNode> = order
+        .iter()
+        .map(|id| RebalanceNode {
+            id: *id,
+            is_open_section: graph.nodes[id].node_type == "Section",
+        })
+        .collect();
+
+    // ── Stack replay: depth from position, capped; parent = nearest ancestor
+    //    one level shallower. ──
+    //
+    // Depth derivation matches the validated prototype exactly
+    // (`d = min(len(stack), section_cap)`). The prototype scores depths only; the
+    // parent pointer is this port's addition. We parent a section to the topmost
+    // stack frame strictly shallower than its assigned depth (rather than the
+    // bare stack top) so that capping keeps `parent.depth + 1 == child.depth`:
+    // when the cap forces several deeply-nested sections to the same depth, they
+    // become siblings under the nearest ancestor at `cap - 1` (the CR's
+    // "level-cap siblings"), not a degenerate same-depth child chain.
+    struct Frame {
+        level: u32,
+        depth: u32,
+        id: NodeId,
+    }
+    let mut stack: Vec<Frame> = vec![Frame {
+        level: 0,
+        depth: 0,
+        id: root_id,
+    }];
+    let mut new_parent: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut new_depth: HashMap<NodeId, u32> = HashMap::new();
+
+    for node in &snapshot {
+        if node.is_open_section {
+            let l = levels.level_of(&node.id);
+            while stack.len() > 1 && stack.last().unwrap().level >= l {
+                stack.pop();
+            }
+            // depth = stack position (len before push), capped at max_section_depth.
+            let depth = (stack.len() as u32).min(cfg.max_section_depth);
+            // Parent = topmost frame strictly shallower than `depth` (== the
+            // bare stack top in the uncapped case; the ancestor at `depth - 1`
+            // when the cap collapsed adjacent frames to equal depth).
+            let parent = stack
+                .iter()
+                .rev()
+                .find(|f| f.depth < depth)
+                .map(|f| f.id)
+                .unwrap_or(root_id);
+            new_parent.insert(node.id, parent);
+            new_depth.insert(node.id, depth);
+            stack.push(Frame {
+                level: l,
+                depth,
+                id: node.id,
+            });
+        } else {
+            let top = stack.last().unwrap();
+            let depth = (top.depth + 1).min(cfg.max_total_depth);
+            new_parent.insert(node.id, top.id);
+            new_depth.insert(node.id, depth);
+        }
+    }
+
+    // ── Diagnose: count re-parents, depth changes, and collapsed spurious
+    //    levels (non-Section nodes that had children and become leaves). ──
+    let mut rebalance_report = TopologyRebalanceReport {
+        corrected: cfg.correct,
+        ..Default::default()
+    };
+    for id in &order {
+        let n = &graph.nodes[id];
+        if new_parent.get(id).copied() != n.parent {
+            rebalance_report.reparented += 1;
+        }
+        if new_depth.get(id).copied().unwrap_or(n.location.semantic.depth)
+            != n.location.semantic.depth
+        {
+            rebalance_report.depths_changed += 1;
+        }
+        if n.node_type != "Section" && !n.children.is_empty() {
+            rebalance_report.spurious_levels_collapsed += 1;
+        }
+    }
+
+    if !cfg.correct {
+        report.topology_rebalance = Some(rebalance_report);
+        return;
+    }
+
+    // ── Apply: rewrite parent + depth, then rebuild children (text_order). ──
+    for id in &order {
+        if let Some(node) = graph.nodes.get_mut(id) {
+            node.parent = new_parent.get(id).copied();
+            if let Some(&d) = new_depth.get(id) {
+                node.location.semantic.depth = d;
+            }
+        }
+    }
+
+    // Children: ordered by text_order via `order` (already text_order-sorted).
+    let mut children: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for id in &order {
+        if let Some(parent) = new_parent.get(id) {
+            children.entry(*parent).or_default().push(*id);
+        }
+    }
+    // Reset every node's children, then assign the rebuilt lists. The root is
+    // included so its top-level children are refreshed too.
+    let all_ids: Vec<NodeId> = graph.nodes.keys().copied().collect();
+    for id in all_ids {
+        let new_children = children.remove(&id).unwrap_or_default();
+        if let Some(node) = graph.nodes.get_mut(&id) {
+            node.children = new_children;
+        }
+    }
+
+    report.topology_rebalance = Some(rebalance_report);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
         GraphSanityConfig, GraphSanityInvariants, InvariantToggle, SectionHeightInvariantConfig,
         SectionOverlapCountInvariantConfig, SectionParagraphOverlapInvariantConfig,
+        TopologyRebalanceConfig,
     };
     use crate::types::{
         BookmarkData, BookmarkSection, BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation,
+        StyleMetadata,
     };
     use uuid::Uuid;
+
+    /// CR-70 is default-ON, so the pre-CR-70 (CR-28/65/68/69) tests — written
+    /// to exercise one demotion/depth invariant in isolation — must explicitly
+    /// disable the rebalance, which would otherwise rewrite depth/parent and
+    /// change those tests' (pre-rebalance) expectations. The rebalance itself
+    /// is covered by its own CR-70 tests below.
+    fn topology_off() -> TopologyRebalanceConfig {
+        TopologyRebalanceConfig {
+            check: false,
+            correct: false,
+            max_section_depth: 3,
+            max_total_depth: 4,
+        }
+    }
 
     /// Build a minimal graph: root → child(at depth `child_depth`).
     /// `child_depth` may be wrong on purpose to simulate stack-pollution.
@@ -509,6 +965,7 @@ mod tests {
                     check: true,
                     correct: true,
                 },
+                topology_rebalance: topology_off(),
                 ..Default::default()
             },
         }
@@ -546,6 +1003,7 @@ mod tests {
                     check: true,
                     correct: false,
                 },
+                topology_rebalance: topology_off(),
                 ..Default::default()
             },
         };
@@ -750,6 +1208,7 @@ mod tests {
                     correct: false,
                     tolerance: 2.0,
                 },
+                topology_rebalance: topology_off(),
                 ..Default::default()
             },
         };
@@ -841,6 +1300,7 @@ mod tests {
                     threshold,
                     bookmark_bypass,
                 },
+                topology_rebalance: topology_off(),
                 ..Default::default()
             },
         }
@@ -994,6 +1454,7 @@ mod tests {
                     count_threshold,
                     min_overlap_frac,
                 },
+                topology_rebalance: topology_off(),
                 ..Default::default()
             },
         }
@@ -1098,5 +1559,330 @@ mod tests {
             "count_threshold 0 must early-return (OFF guard)"
         );
         assert_eq!(graph.nodes[&section_id].node_type, "Section");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CR-70 — topology-rebalance tests
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Spec for one node fed to `make_rebalance_graph`:
+    /// `(node_type, text, font_family, font_size, initial_depth, initial_parent_idx)`.
+    /// `initial_parent_idx` is an index into the node list (0-based, in the
+    /// order given); `None` parents to root. The initial depth/parent/children
+    /// may be deliberately stale — that is what the rebalance rebuilds.
+    struct NodeSpec {
+        node_type: &'static str,
+        text: &'static str,
+        font_family: Option<&'static str>,
+        font_size: Option<f32>,
+        depth: u32,
+        parent_idx: Option<usize>,
+    }
+
+    /// Build a graph from an ordered list of `NodeSpec`s. `text_order` is the
+    /// list position; initial `parent`/`children`/`depth` come from each spec
+    /// so we can simulate post-demotion stale topology. Returns the graph plus
+    /// the node ids in list order.
+    fn make_rebalance_graph(specs: &[NodeSpec]) -> (DocumentGraph, NodeId, Vec<NodeId>) {
+        let root_id = Uuid::new_v4();
+        let mut graph = DocumentGraph::new_with_root(root_id);
+        let ids: Vec<NodeId> = specs.iter().map(|_| Uuid::new_v4()).collect();
+
+        let mut root = DocumentNode::new_with_id(root_id, "Document", "root".into());
+        root.location.semantic.depth = 0;
+
+        for (i, spec) in specs.iter().enumerate() {
+            let id = ids[i];
+            let mut node = DocumentNode::new_with_id(id, spec.node_type, spec.text.into());
+            node.text_order = Some(i as u32);
+            node.location.semantic.depth = spec.depth;
+            match spec.parent_idx {
+                Some(p) => {
+                    node.parent = Some(ids[p]);
+                }
+                None => {
+                    node.parent = Some(root_id);
+                    root.children.push(id);
+                }
+            }
+            if spec.font_family.is_some() || spec.font_size.is_some() {
+                node.style_info = Some(StyleMetadata {
+                    font_class: String::new(),
+                    font_size: spec.font_size,
+                    is_bold: false,
+                    is_italic: false,
+                    font_family: spec.font_family.map(|s| s.to_string()),
+                    foreground_color: None,
+                    background_color: None,
+                });
+            }
+            graph.nodes.insert(id, node);
+        }
+        // Wire up children for non-root parents from the parent_idx links.
+        for (i, spec) in specs.iter().enumerate() {
+            if let Some(p) = spec.parent_idx {
+                let child = ids[i];
+                if let Some(parent) = graph.nodes.get_mut(&ids[p]) {
+                    parent.children.push(child);
+                }
+            }
+        }
+        graph.nodes.insert(root_id, root);
+        (graph, root_id, ids)
+    }
+
+    /// Config enabling ONLY the rebalance (every demotion off) at the given
+    /// caps. Isolates the topology rebuild from the node_type demotions.
+    fn rebalance_only_config(max_section_depth: u32, max_total_depth: u32) -> GraphSanityConfig {
+        GraphSanityConfig {
+            enabled: true,
+            invariants: GraphSanityInvariants {
+                depth_consistency: InvariantToggle {
+                    check: false,
+                    correct: false,
+                },
+                section_height_bounded_by_title: SectionHeightInvariantConfig {
+                    check: false,
+                    correct: false,
+                    tolerance: 2.0,
+                },
+                section_paragraph_overlap: SectionParagraphOverlapInvariantConfig {
+                    check: false,
+                    correct: false,
+                    threshold: 0.0,
+                    bookmark_bypass: false,
+                },
+                section_overlap_count: SectionOverlapCountInvariantConfig {
+                    check: false,
+                    correct: false,
+                    count_threshold: 3,
+                    min_overlap_frac: 0.0,
+                },
+                topology_rebalance: TopologyRebalanceConfig {
+                    check: true,
+                    correct: true,
+                    max_section_depth,
+                    max_total_depth,
+                },
+            },
+        }
+    }
+
+    /// CR-70 Test 1 — numbered-hierarchy rebuild. Sections "1.", "1.1", "2."
+    /// (with stale depths) rebuild to depths 1, 2, 1 with correct parents.
+    #[test]
+    fn test_cr70_numbered_hierarchy_rebuild() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
+        ];
+        let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1, "1. Introduction → depth 1");
+        assert_eq!(graph.nodes[&ids[0]].parent, Some(root_id));
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2, "1.1 Background → depth 2");
+        assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]), "1.1 parented to 1.");
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1, "2. Methods → depth 1");
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id));
+        // Children rebuilt: 1. has 1.1 as its only child; 2. is a leaf.
+        assert_eq!(graph.nodes[&ids[0]].children, vec![ids[1]]);
+        assert!(graph.nodes[&ids[2]].children.is_empty());
+    }
+
+    /// CR-70 Test 2 — gap-collapse. Numbering levels 1 then 3 (a skipped level)
+    /// collapse to consecutive stack-position depths 1, 2.
+    #[test]
+    fn test_cr70_gap_collapse() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Top", font_family: None, font_size: None, depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1.1 Deep", font_family: None, font_size: None, depth: 3, parent_idx: None },
+        ];
+        let (mut graph, _root, ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
+        assert_eq!(
+            graph.nodes[&ids[1]].location.semantic.depth, 2,
+            "numbering level 3 collapses to stack-position depth 2 (no gap)"
+        );
+        assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]));
+    }
+
+    /// CR-70 Test 3 — cap. A 1/1.1/1.1.1/1.1.1.1 nest with max_section_depth 3
+    /// clamps the level-4 section to depth 3 as a sibling under the level-2
+    /// section, and content under it sits at the total cap (depth 4).
+    #[test]
+    fn test_cr70_cap_flattens_deep_nest() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. A", font_family: None, font_size: None, depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1 B", font_family: None, font_size: None, depth: 2, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1.1 C", font_family: None, font_size: None, depth: 3, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1.1.1 D", font_family: None, font_size: None, depth: 4, parent_idx: None },
+            NodeSpec { node_type: "Paragraph", text: "body under D", font_family: None, font_size: None, depth: 5, parent_idx: None },
+        ];
+        let (mut graph, _root, ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 3);
+        assert_eq!(
+            graph.nodes[&ids[3]].location.semantic.depth, 3,
+            "level-4 section clamped to max_section_depth (3)"
+        );
+        assert_eq!(
+            graph.nodes[&ids[3]].parent, Some(ids[1]),
+            "capped section is a level-3 sibling under the level-2 ancestor"
+        );
+        assert_eq!(
+            graph.nodes[&ids[4]].location.semantic.depth, 4,
+            "content under a cap-level section sits at the total cap (4)"
+        );
+        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[3]));
+        // No depth exceeds the total cap.
+        assert!(graph.nodes.values().all(|n| n.location.semantic.depth <= 4));
+    }
+
+    /// CR-70 Test 4 — a demoted Section (now a Paragraph with stale children)
+    /// re-parents its children to the enclosing section and becomes a leaf.
+    #[test]
+    fn test_cr70_demoted_section_reparents_children_and_becomes_leaf() {
+        // node 1 was a Section, demoted to Paragraph upstream; it still carries
+        // node 2 as a stale child at the spurious extra depth.
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Paragraph", text: "Figure 2 (demoted)", font_family: None, font_size: None, depth: 2, parent_idx: Some(0) },
+            NodeSpec { node_type: "Paragraph", text: "figure body text", font_family: None, font_size: None, depth: 3, parent_idx: Some(1) },
+        ];
+        let (mut graph, _root, ids) = make_rebalance_graph(&specs);
+        // Precondition: the demoted node has a child (the stale spurious level).
+        assert!(!graph.nodes[&ids[1]].children.is_empty());
+
+        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+
+        // The demoted node is now a leaf...
+        assert!(
+            graph.nodes[&ids[1]].children.is_empty(),
+            "demoted Paragraph must become a leaf"
+        );
+        // ...and its former child re-attaches to the enclosing section.
+        assert_eq!(
+            graph.nodes[&ids[2]].parent, Some(ids[0]),
+            "orphaned child re-parents to the enclosing section"
+        );
+        assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]));
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 2);
+        // The collapse is reported.
+        let tr = report.topology_rebalance.unwrap();
+        assert!(tr.spurious_levels_collapsed >= 1);
+    }
+
+    /// CR-70 Test 5 — font-size-rank fallback for an unnumbered section.
+    /// Numbered sections (12pt L1, 10pt L2) calibrate the size→level map; an
+    /// unnumbered "Appendix" at 14pt (larger than any numbered size) → level 1.
+    #[test]
+    fn test_cr70_font_size_rank_fallback_unnumbered() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: Some("ABCDEF+XCharter-Bold"), font_size: Some(12.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: Some("ABCDEF+XCharter-Bold"), font_size: Some(10.0), depth: 2, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Appendix", font_family: Some("ABCDEF+XCharter-Bold"), font_size: Some(14.0), depth: 9, parent_idx: None },
+        ];
+        let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
+        assert_eq!(
+            graph.nodes[&ids[2]].location.semantic.depth, 1,
+            "unnumbered Appendix at 14pt (> all numbered sizes) → level 1"
+        );
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id));
+    }
+
+    /// CR-70 Test 6 — idempotency. A second rebalance over an already-rebalanced
+    /// graph re-parents nothing and changes no depth.
+    #[test]
+    fn test_cr70_idempotent_second_run_is_noop() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Paragraph", text: "body", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
+        ];
+        let (mut graph, _root, _ids) = make_rebalance_graph(&specs);
+        apply(&mut graph, &rebalance_only_config(3, 4));
+
+        // Second run: no topology changes.
+        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+        {
+            let tr = report
+                .topology_rebalance
+                .as_ref()
+                .expect("rebalance report present");
+            assert_eq!(tr.reparented, 0, "second run must re-parent nothing");
+            assert_eq!(tr.depths_changed, 0, "second run must change no depth");
+            assert_eq!(tr.spurious_levels_collapsed, 0, "no spurious levels remain");
+        }
+        assert!(
+            report.is_clean(),
+            "idempotent second run leaves the report clean"
+        );
+    }
+
+    /// CR-70 Test 7 — check-only mode records the report but writes nothing.
+    #[test]
+    fn test_cr70_check_only_does_not_mutate() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: None, depth: 9, parent_idx: None },
+        ];
+        let (mut graph, _root, ids) = make_rebalance_graph(&specs);
+        let cfg = GraphSanityConfig {
+            enabled: true,
+            invariants: GraphSanityInvariants {
+                depth_consistency: InvariantToggle { check: false, correct: false },
+                topology_rebalance: TopologyRebalanceConfig {
+                    check: true,
+                    correct: false,
+                    max_section_depth: 3,
+                    max_total_depth: 4,
+                },
+                ..Default::default()
+            },
+        };
+        let report = apply(&mut graph, &cfg);
+        let tr = report.topology_rebalance.expect("report present in check mode");
+        assert!(!tr.corrected, "check-only must report corrected = false");
+        assert!(tr.depths_changed >= 1, "check-only still diagnoses pending changes");
+        // The stale depth (9) is preserved because nothing was written.
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 9);
+    }
+
+    // ── CR-70 helper unit tests (new numbering / font-stem logic) ──
+
+    #[test]
+    fn test_cr70_numbering_level() {
+        assert_eq!(numbering_level("3. Title"), Some(1));
+        assert_eq!(numbering_level("3.1. Sub"), Some(2));
+        assert_eq!(numbering_level("3.1.1 Deep"), Some(3));
+        assert_eq!(numbering_level("  **2.4** bolded"), Some(2));
+        assert_eq!(numbering_level("Abstract"), None);
+        assert_eq!(numbering_level("Appendix A"), None);
+        // A trailing dot not followed by a digit does not extend the number.
+        assert_eq!(numbering_level("4. Results"), Some(1));
+    }
+
+    #[test]
+    fn test_cr70_font_stem() {
+        assert_eq!(font_stem(Some("ABCDEF+XCharter-BoldItalic")), "xcharter");
+        assert_eq!(font_stem(Some("TimesNewRomanPSMT")), "timesnewroman");
+        assert_eq!(font_stem(Some("TimesNewRomanPS-BoldMT")), "timesnewroman");
+        assert_eq!(font_stem(Some("NimbusRomNo9L-Regu")), "nimbusromno9l");
+        assert_eq!(font_stem(Some("DejaVuSans")), "dejavusans");
+        assert_eq!(font_stem(None), "?");
+        assert_eq!(font_stem(Some("")), "?");
     }
 }

@@ -1081,6 +1081,39 @@ impl Default for SectionOverlapCountInvariantConfig {
     }
 }
 
+/// CR-70 — Per-invariant config for the topology-rebalance step.
+///
+/// Runs LAST in the sanity pipe (after all node_type demotions). Rebuilds the
+/// parent/child/depth topology by replaying the stack-based outline build over
+/// the surviving nodes in `text_order`, deriving section depth from stack
+/// position (collapsing gaps left by demoted levels) and capping it. Demoted
+/// sections are treated as content — they no longer open a level, and their
+/// orphaned children re-attach to the enclosing section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyRebalanceConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Maximum depth a Section may occupy. A section whose natural stack depth
+    /// exceeds this is clamped here and parented to the nearest ancestor at
+    /// `max_section_depth - 1` — deep nesting flattens into cap-level siblings
+    /// ("3 is the rest").
+    pub max_section_depth: u32,
+    /// Maximum depth any node may occupy. Content under a cap-level section
+    /// sits at `max_total_depth`.
+    pub max_total_depth: u32,
+}
+
+impl Default for TopologyRebalanceConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            max_section_depth: 3,
+            max_total_depth: 4,
+        }
+    }
+}
+
 /// Set of invariants the graph sanity pipe enforces.
 /// Future invariants (childless pruning, repetition filter, etc.) will appear
 /// here as additional fields.
@@ -1105,6 +1138,13 @@ pub struct GraphSanityInvariants {
     /// same-page nodes of any type (geometry-only figure-cluster detector).
     #[serde(default)]
     pub section_overlap_count: SectionOverlapCountInvariantConfig,
+
+    /// CR-70 — Rebuild parent/child/depth topology over the surviving nodes
+    /// after all demotions settle (numbering-anchored capped stack rebuild).
+    /// Sequenced LAST. Subsumes `depth_consistency` (depth becomes a rebalance
+    /// output) when enabled.
+    #[serde(default)]
+    pub topology_rebalance: TopologyRebalanceConfig,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).
