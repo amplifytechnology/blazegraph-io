@@ -21,7 +21,7 @@ use crate::config::{
     TopologyRebalanceConfig,
 };
 use crate::preprocessors::pdf::xhtml_parser::normalize_for_match;
-use crate::types::{BoundingBox, DocumentGraph, DocumentNode, NodeId};
+use crate::types::{BoundingBox, DocumentGraph, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Per-node record of a depth invariant violation.
@@ -93,6 +93,10 @@ pub struct SanityReport {
     /// CR-70 — present when the topology-rebalance step ran. `None` when the
     /// step is disabled in config.
     pub topology_rebalance: Option<TopologyRebalanceReport>,
+    /// CR-71A — present when the section-prune step ran (the evidence-first
+    /// flagged-set summary). `None` when the prune step is disabled in config.
+    /// A no-op in CR-71A — `pruned` is always 0.
+    pub section_prune: Option<crate::graphs::prune::SectionPruneSummary>,
 }
 
 impl SanityReport {
@@ -141,6 +145,35 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         check_and_correct_section_overlap_count(graph, soc, &mut report);
     }
 
+    // ── CR-71A — evidence-first flag detectors → verdicts → prune. ──
+    //
+    // The flag detectors are read-only on the graph: they reuse the CR-65/68/69
+    // geometric predicates (shared with the parked-off demoters above) and write
+    // `NodeFlags` into a transient `SectionEvidence` sidecar — never mutating
+    // `node_type`. The verdict aggregation derives the document-level
+    // `main_font` / `bad_fonts`. The prune step (the only mutator slot before
+    // the CR-70 rebalance) consumes the sidecar; in CR-71A its body is a no-op —
+    // it writes the flagged-set summary into `report.section_prune` and (debug)
+    // the evidence artifact. The sidecar is dropped at the end of `apply()`.
+    let det = &config.invariants.section_detectors;
+    let sp = &config.invariants.section_prune;
+    if det.height_flag || det.overlap_flag || det.count_flag || sp.enabled {
+        let mut evidence = crate::graphs::detectors::SectionEvidence::default();
+        if det.height_flag {
+            crate::graphs::detectors::flag_section_height(graph, &mut evidence, sh);
+        }
+        if det.overlap_flag {
+            crate::graphs::detectors::flag_section_overlap(graph, &mut evidence, so);
+        }
+        if det.count_flag {
+            crate::graphs::detectors::flag_section_overlap_count(graph, &mut evidence, soc);
+        }
+        evidence.aggregate_verdicts(graph);
+        if sp.enabled {
+            crate::graphs::prune::prune_sections(graph, &evidence, &mut report, sp);
+        }
+    }
+
     // CR-70 — topology rebalance runs LAST, after all node_type demotions have
     // settled. It rebuilds parent/child/depth from the surviving node set.
     let tr = &config.invariants.topology_rebalance;
@@ -150,6 +183,28 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
     }
 
     // Future invariants: childless_sections, repetition_filter, etc. plug in here.
+
+    // CR-71A — the prune step is observational (no-op), so it never makes the
+    // report "unclean". Surface its flagged-set summary separately when it ran.
+    if let Some(sp_summary) = &report.section_prune {
+        let bad = if sp_summary.bad_fonts.is_empty() {
+            "-".to_string()
+        } else {
+            sp_summary.bad_fonts.join(",")
+        };
+        println!(
+            "🧾 CR-71A SectionPrune: {} flagged, {} pruned{}, main_font={}, bad_fonts={}",
+            sp_summary.flagged,
+            sp_summary.pruned,
+            if sp_summary.prune_on_detection {
+                " (prune_on_detection=on; no-op in CR-71A)"
+            } else {
+                ""
+            },
+            sp_summary.main_font.as_deref().unwrap_or("?"),
+            bad,
+        );
+    }
 
     if !report.is_clean() {
         let rebalance_summary = report
@@ -280,7 +335,8 @@ fn check_and_correct_section_height(
     cfg: &SectionHeightInvariantConfig,
     report: &mut SanityReport,
 ) {
-    let title_height = match find_title_height(graph) {
+    // CR-71A — title-height geometry shared with the flag detector.
+    let title_height = match super::detectors::find_title_height(graph) {
         Some(h) => h,
         None => return,
     };
@@ -313,24 +369,6 @@ fn check_and_correct_section_height(
             }
         }
     }
-}
-
-/// CR-65 — Document title = first depth-1 Section in source order with a
-/// physical bounding box. Returns its bbox.height, or None if no such node
-/// exists (e.g., MD channel, short doc with no depth-1 sections).
-fn find_title_height(graph: &DocumentGraph) -> Option<f32> {
-    let mut candidates: Vec<&DocumentNode> = graph
-        .nodes
-        .values()
-        .filter(|n| n.node_type == "Section")
-        .filter(|n| n.location.semantic.depth == 1)
-        .filter(|n| n.location.physical.is_some())
-        .collect();
-    candidates.sort_by_key(|n| n.text_order.unwrap_or(u32::MAX));
-    candidates
-        .first()
-        .and_then(|n| n.location.physical.as_ref())
-        .map(|p| p.bounding_box.height)
 }
 
 /// CR-68 — Section demoted when its bbox 2D-area-overlaps a same-page
@@ -381,7 +419,9 @@ fn check_and_correct_section_overlap(
         None
     };
 
-    // Pass 1 — find violators (immutable borrow).
+    // Pass 1 — find violators (immutable borrow). The overlap geometry is the
+    // CR-71A shared helper, so this parked-off fn and the flag detector compute
+    // identical fractions.
     let mut violators: Vec<(NodeId, f32)> = Vec::new();
     for (id, n) in graph.nodes.iter() {
         if n.node_type != "Section" {
@@ -391,31 +431,17 @@ fn check_and_correct_section_overlap(
             Some(p) => p,
             None => continue,
         };
-        let s = &phys.bounding_box;
-        let section_area = s.width * s.height;
-        if section_area <= 0.0 {
-            continue;
-        }
         // Bookmark-bypass: protect titles that match the outline.
         if let Some(titles) = &bookmark_titles {
             if titles.contains(&normalize_for_match(&n.content.text)) {
                 continue;
             }
         }
-        // Max overlap fraction vs same-page paragraphs.
-        let max_overlap = paragraphs
-            .iter()
-            .filter(|(page, _)| *page == phys.page)
-            .map(|(_, p)| {
-                let ix = (s.x + s.width).min(p.x + p.width) - s.x.max(p.x);
-                let iy = (s.y + s.height).min(p.y + p.height) - s.y.max(p.y);
-                if ix <= 0.0 || iy <= 0.0 {
-                    0.0
-                } else {
-                    (ix * iy) / section_area
-                }
-            })
-            .fold(0.0_f32, f32::max);
+        let max_overlap = super::detectors::max_paragraph_overlap_fraction(
+            phys.page,
+            &phys.bounding_box,
+            &paragraphs,
+        );
         if max_overlap > cfg.threshold {
             violators.push((*id, max_overlap));
         }
@@ -474,7 +500,8 @@ fn check_and_correct_section_overlap_count(
         })
         .collect();
 
-    // Pass 1 — find violators (immutable borrow).
+    // Pass 1 — find violators (immutable borrow). Overlap-count geometry is the
+    // CR-71A shared helper, so this parked-off fn and the flag detector agree.
     let mut violators: Vec<(NodeId, u32)> = Vec::new();
     for (id, n) in graph.nodes.iter() {
         if n.node_type != "Section" {
@@ -484,20 +511,13 @@ fn check_and_correct_section_overlap_count(
             Some(p) => p,
             None => continue,
         };
-        let s = &phys.bounding_box;
-        let section_area = s.width * s.height;
-        if section_area <= 0.0 {
-            continue;
-        }
-        let count = nodes
-            .iter()
-            .filter(|(other_id, page, _)| *other_id != *id && *page == phys.page)
-            .filter(|(_, _, b)| {
-                let ix = (s.x + s.width).min(b.x + b.width) - s.x.max(b.x);
-                let iy = (s.y + s.height).min(b.y + b.height) - s.y.max(b.y);
-                ix > 0.0 && iy > 0.0 && (ix * iy) / section_area > cfg.min_overlap_frac
-            })
-            .count() as u32;
+        let count = super::detectors::same_page_overlap_count(
+            *id,
+            phys.page,
+            &phys.bounding_box,
+            &nodes,
+            cfg.min_overlap_frac,
+        );
         if count >= cfg.count_threshold {
             violators.push((*id, count));
         }
@@ -535,7 +555,7 @@ fn check_and_correct_section_overlap_count(
 /// abbreviations like `-Regu`/`-Medi`), then peel any glued foundry/weight tags
 /// (`PSMT`, `Bold`, `Italic`, …) repeatedly. Returns `"?"` for an empty/missing
 /// family.
-fn font_stem(fam: Option<&str>) -> String {
+pub(crate) fn font_stem(fam: Option<&str>) -> String {
     let fam = match fam {
         Some(f) if !f.is_empty() => f,
         _ => return "?".to_string(),
@@ -1324,8 +1344,8 @@ mod tests {
     use super::*;
     use crate::config::{
         GraphSanityConfig, GraphSanityInvariants, InvariantToggle, NumberingRestartConfig,
-        SectionHeightInvariantConfig, SectionOverlapCountInvariantConfig,
-        SectionParagraphOverlapInvariantConfig, TopologyRebalanceConfig,
+        SectionDetectorsConfig, SectionHeightInvariantConfig, SectionOverlapCountInvariantConfig,
+        SectionParagraphOverlapInvariantConfig, SectionPruneConfig, TopologyRebalanceConfig,
     };
     use crate::types::{
         BookmarkData, BookmarkSection, BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation,
@@ -2078,6 +2098,7 @@ mod tests {
                     check: true,
                     correct: true,
                 },
+                ..Default::default()
             },
         }
     }
@@ -2587,5 +2608,100 @@ mod tests {
             .expect("rebalance report present");
         assert_eq!(tr.reparented, 0, "second run must re-parent nothing");
         assert_eq!(tr.depths_changed, 0, "second run must change no depth");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CR-71A — evidence-first detectors + no-op prune, integrated via apply()
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// CR-71A — the experiment config (old CR-65/68/69 demoters OFF, new
+    /// detectors ON, `prune_on_detection = false`) runs the full flag → verdict
+    /// → no-op-prune path through `apply()` and leaves every node_type intact
+    /// (the accepted regression: no section-detection demotions). The prune
+    /// summary surfaces the flagged set + verdict.
+    #[test]
+    fn test_cr71a_experiment_config_flags_without_demoting() {
+        // A title-sized section + a tall foreign-font figure callout that the
+        // height detector flags; the topology rebalance stays off so we read the
+        // node_types directly.
+        let root_id = Uuid::new_v4();
+        let title_id = Uuid::new_v4();
+        let flops_id = Uuid::new_v4();
+        let mut graph = DocumentGraph::new_with_root(root_id);
+        let mut root = DocumentNode::new_with_id(root_id, "Document", "root".into());
+        root.location.semantic.depth = 0;
+        root.children.push(title_id);
+        root.children.push(flops_id);
+
+        let bbox = |y: f32, h: f32| PhysicalLocation {
+            page: 1,
+            bounding_box: BoundingBox { x: 0.0, y, width: 100.0, height: h },
+        };
+        let style = |fam: &str| StyleMetadata {
+            font_class: String::new(),
+            font_size: None,
+            is_bold: false,
+            is_italic: false,
+            font_family: Some(fam.to_string()),
+            foreground_color: None,
+            background_color: None,
+        };
+
+        let mut title = DocumentNode::new_with_id(title_id, "Section", "Document Title".into());
+        title.parent = Some(root_id);
+        title.text_order = Some(0);
+        title.location.semantic.depth = 1;
+        title.location.physical = Some(bbox(0.0, 18.0));
+        title.style_info = Some(style("TimesNewRomanPSMT"));
+        graph.nodes.insert(title_id, title);
+
+        let mut flops = DocumentNode::new_with_id(flops_id, "Section", "FLOPS".into());
+        flops.parent = Some(root_id);
+        flops.text_order = Some(1);
+        flops.location.semantic.depth = 1;
+        flops.location.physical = Some(bbox(40.0, 60.0)); // 60 > 18*2 → height flag
+        flops.style_info = Some(style("DejaVuSans"));
+        graph.nodes.insert(flops_id, flops);
+        graph.nodes.insert(root_id, root);
+
+        let cfg = GraphSanityConfig {
+            enabled: true,
+            invariants: GraphSanityInvariants {
+                // Old demoters parked OFF.
+                section_height_bounded_by_title: SectionHeightInvariantConfig { check: false, correct: false, tolerance: 2.0 },
+                section_paragraph_overlap: SectionParagraphOverlapInvariantConfig { check: false, correct: false, threshold: 0.0, bookmark_bypass: false },
+                section_overlap_count: SectionOverlapCountInvariantConfig { check: false, correct: false, count_threshold: 3, min_overlap_frac: 0.0 },
+                // New detectors ON.
+                section_detectors: SectionDetectorsConfig { height_flag: true, overlap_flag: false, count_flag: true },
+                // Prune enabled, mutate switch OFF.
+                section_prune: SectionPruneConfig { enabled: true, prune_on_detection: false, emit_evidence_artifact: false },
+                // Rebalance off to isolate the node_type assertion.
+                topology_rebalance: topology_off(),
+                ..Default::default()
+            },
+        };
+
+        let report = apply(&mut graph, &cfg);
+
+        // Accepted regression: NOTHING demoted — both stay Section.
+        assert_eq!(graph.nodes[&title_id].node_type, "Section");
+        assert_eq!(graph.nodes[&flops_id].node_type, "Section");
+
+        // The flagged-set summary surfaces FLOPS as the lone flagged section,
+        // with the document-level verdict (main=timesnewroman, bad=dejavusans).
+        let s = report.section_prune.expect("CR-71A prune summary present");
+        assert_eq!(s.flagged, 1);
+        assert_eq!(s.pruned, 0);
+        assert_eq!(s.main_font.as_deref(), Some("timesnewroman"));
+        assert_eq!(s.bad_fonts, vec!["dejavusans".to_string()]);
+    }
+
+    /// CR-71A — detectors/prune default OFF: a plain default config never
+    /// constructs a prune summary (the live path is unchanged).
+    #[test]
+    fn test_cr71a_default_config_does_not_run_prune() {
+        let (mut graph, _, _) = make_two_node_graph(1);
+        let report = apply(&mut graph, &full_correct_config());
+        assert!(report.section_prune.is_none(), "prune step off by default");
     }
 }

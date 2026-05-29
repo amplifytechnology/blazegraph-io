@@ -1081,6 +1081,57 @@ impl Default for SectionOverlapCountInvariantConfig {
     }
 }
 
+/// CR-71A — Per-document config for the flag-only section detectors.
+///
+/// The evidence-first redesign folds CR-65 / CR-68 / CR-69 from demote-in-place
+/// invariants into read-only **detectors** that write `NodeFlags` into the
+/// transient `SectionEvidence` sidecar (never mutating `node_type`). Each
+/// boolean toggles whether the corresponding geometric predicate runs; the
+/// *thresholds* the predicates read are reused verbatim from the existing
+/// `Section*InvariantConfig` structs (the detectors ignore those structs'
+/// `.correct` — a flagger has nothing to correct). Off by default so the live
+/// pipeline keeps the parked-off CR-65/68/69 baseline until the experiment
+/// config (old demoters off, these on, `prune_on_detection = false`) flips it.
+/// All detectors default OFF (a derived `Default`): the live path keeps the
+/// CR-65/68/69 demote-in-place baseline. The CR-71A experiment config turns
+/// these on (with the old demoters off) to observe the flagged set without
+/// mutating the graph.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SectionDetectorsConfig {
+    /// Run the CR-65 height-bounded-by-title predicate as a flag detector.
+    pub height_flag: bool,
+    /// Run the CR-68 section/paragraph overlap-fraction predicate as a flag
+    /// detector.
+    pub overlap_flag: bool,
+    /// Run the CR-69 same-page overlap-count predicate as a flag detector.
+    pub count_flag: bool,
+}
+
+/// CR-71A — Config for the single section-prune step (the only graph mutator
+/// before the CR-70 rebalance).
+///
+/// In CR-71A the prune step is a **literal no-op**: even with
+/// `prune_on_detection = true` it does nothing to the graph — it only writes a
+/// flagged-set summary into `SanityReport.section_prune` and, when
+/// `emit_evidence_artifact` is set, dumps the per-doc `<doc>.evidence.json`
+/// debug artifact. The mutating body is CR-71B (designed after observing the
+/// flagged set), gated behind the same `prune_on_detection` master switch.
+/// All fields default to `false` (a derived `Default`): the live path does not
+/// run the prune step, the master mutate switch is off, and the debug artifact
+/// is not emitted.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SectionPruneConfig {
+    /// Master gate for the prune step running at all.
+    pub enabled: bool,
+    /// The master mutate switch. `false` (default) = flag + log + artifact, the
+    /// graph is left byte-identical; `true` = the CR-71B prune body acts (a
+    /// no-op in CR-71A regardless).
+    pub prune_on_detection: bool,
+    /// Debug: write the per-doc `<doc>.evidence.json` artifact (the input to the
+    /// CR-71B Python pruning prototype). Default false — not on in normal runs.
+    pub emit_evidence_artifact: bool,
+}
+
 /// CR-70 — Per-invariant config for the topology-rebalance step.
 ///
 /// Runs LAST in the sanity pipe (after all node_type demotions). Rebuilds the
@@ -1175,6 +1226,19 @@ pub struct GraphSanityInvariants {
     /// Runs as part of the topology rebalance.
     #[serde(default)]
     pub numbering_restart: NumberingRestartConfig,
+
+    /// CR-71A — Flag-only section detectors (CR-65/68/69 predicates, read-only).
+    /// They write evidence into the transient sidecar; they never mutate the
+    /// graph. Off by default (the live path keeps the parked-off demoters).
+    #[serde(default)]
+    pub section_detectors: SectionDetectorsConfig,
+
+    /// CR-71A — The single section-prune step (the only graph mutator before the
+    /// CR-70 rebalance). A literal no-op in CR-71A; writes the flagged-set
+    /// summary into `SanityReport.section_prune` and (debug) the evidence
+    /// artifact.
+    #[serde(default)]
+    pub section_prune: SectionPruneConfig,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).

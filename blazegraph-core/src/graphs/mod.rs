@@ -1,8 +1,10 @@
 pub mod analytics;
 pub mod builder;
+pub mod detectors;
 pub mod graph;
 pub mod graph_sanity;
 pub mod node_id;
+pub mod prune;
 pub mod serialization;
 // Re-export for easy access
 pub use analytics::GraphAnalytics;
