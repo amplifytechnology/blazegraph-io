@@ -1,17 +1,14 @@
-//! CR-71A — The single section-prune step (the only graph mutator before the
+//! CR-71 — The single section-prune step (the only graph mutator before the
 //! CR-70 topology rebalance).
 //!
-//! In CR-71A the prune step is a **literal no-op**: even when its master switch
-//! `prune_on_detection` is on, it does nothing to the graph. Its job is purely
-//! *observation* — it writes a flagged-set summary into `SanityReport` (for the
-//! existing diagnostic print) and, when `emit_evidence_artifact` is set, dumps
-//! the per-doc `<doc>.evidence.json` debug artifact that feeds the CR-71B Python
-//! pruning prototype.
+//! CR-71A landed the plumbing with a no-op body; **CR-71B v1** fills it with the
+//! `geo + font >= 2` policy (see `prune_sections`): when `prune_on_detection` is
+//! on, a flagged section whose font is in the document's `bad_fonts` verdict is
+//! demoted to Paragraph; otherwise the step is observation-only. When
+//! `emit_evidence_artifact` is set it also dumps the per-doc `<doc>.evidence.json`
+//! handle that fed the prototype (`scripts/sb_cr71_prune_prototype.py`).
 //!
-//! The mutating body (expand the flagged set to *similar* sections, protect real
-//! headers, demote) is CR-71B, designed after the flagged set is observed. It
-//! will slot into this same `prune_sections` interface behind the same
-//! `prune_on_detection` gate. **Do not add pruning logic here in CR-71A.**
+//! The CR-70 rebalance, which runs next, rebuilds topology over the survivors.
 
 use crate::config::SectionPruneConfig;
 use crate::graphs::detectors::SectionEvidence;
@@ -26,7 +23,8 @@ use std::collections::BTreeMap;
 pub struct SectionPruneSummary {
     /// Sections that at least one detector flagged.
     pub flagged: usize,
-    /// Sections demoted by the prune body. **Always 0 in CR-71A** (no-op).
+    /// Sections demoted by the prune body (geo + font >= 2). 0 when
+    /// `prune_on_detection` is off (observation-only).
     pub pruned: usize,
     /// Document-level main-font verdict (plurality section font stem).
     pub main_font: Option<String>,
@@ -37,16 +35,24 @@ pub struct SectionPruneSummary {
     pub prune_on_detection: bool,
 }
 
-/// CR-71A — the prune step. Slotted into `graph_sanity::apply()` between the
-/// (parked-off) demote block and `rebalance_topology` — the only mutator slot.
+/// CR-71 — the prune step. Slotted into `graph_sanity::apply()` between the
+/// (parked-off) demote block and `rebalance_topology` — the only graph mutator
+/// in the evidence-first path. The CR-70 rebalance (next step) rebuilds
+/// parent/child/depth over whatever Sections survive.
 ///
-/// CR-71A body: **no graph mutation**. Records the flagged-set summary into
-/// `report.section_prune` and (when `cfg.emit_evidence_artifact`) writes the
-/// evidence artifact. The `&mut DocumentGraph` is the locked final signature
-/// (CR-71B mutates through it); CR-71A leaves it untouched — hence the
-/// `needless_pass_by_ref_mut` allow (the `&mut` is the deliberate CR-71B
-/// interface, not dead in the long run).
-#[allow(clippy::needless_pass_by_ref_mut)]
+/// CR-71B v1 policy — **geo + font >= 2**: a Section is demoted iff it carries a
+/// geometric flag (it has a `per_node` entry — height/overlap/count fired) AND
+/// its font stem is in the document's `bad_fonts` verdict (colored by the
+/// confirmed-bad font cluster). The two confirmations — a direct geometric
+/// signal plus bad-font-cluster membership — are what make the sweep safe: a
+/// real header in an odd font (one signal) survives. Demotion is node_type-only.
+///
+/// Reach note (Sb6 prototype finding): with the current three geometric
+/// detectors this fires only where geometry corroborates a bad font — alphafold's
+/// figure callouts, corpus-wide. Broadening to non-geometric figure FPs
+/// (attention/word2vec font-outliers) needs an added direct signal — deferred to
+/// a follow-up CR (the "more detectors is a lever" finding). Gated by
+/// `cfg.prune_on_detection`.
 pub fn prune_sections(
     graph: &mut DocumentGraph,
     evidence: &SectionEvidence,
@@ -55,34 +61,44 @@ pub fn prune_sections(
 ) {
     let mut bad_fonts: Vec<String> = evidence.bad_fonts.iter().cloned().collect();
     bad_fonts.sort();
+    let flagged = evidence.per_node.values().filter(|f| f.any()).count();
 
-    let summary = SectionPruneSummary {
-        flagged: evidence.per_node.values().filter(|f| f.any()).count(),
-        // CR-71A is a no-op — nothing is demoted regardless of the gate.
-        pruned: 0,
-        main_font: evidence.main_font.clone(),
-        bad_fonts,
-        prune_on_detection: cfg.prune_on_detection,
-    };
-
-    if cfg.prune_on_detection {
-        // CR-71B prune body slots in here, mutating `graph`. CR-71A: no-op.
-        //
-        // The `&mut DocumentGraph` is deliberately left untouched so that, with
-        // the experiment config (old demoters off, detectors on,
-        // prune_on_detection = true), the graph the CR-70 rebalance sees is
-        // byte-identical to the no-detection path — the accepted CR-71A
-        // regression. DO NOT add demotion/pruning logic here in CR-71A.
-    }
-
-    // Debug artifact (default off; never part of bgraph).
+    // Debug artifact reflects the observed flagged set (emitted pre-demotion —
+    // node_type isn't part of it). Default off; never part of bgraph.
     if cfg.emit_evidence_artifact {
         if let Err(e) = emit_evidence_artifact(graph, evidence) {
-            eprintln!("⚠️  CR-71A: failed to write evidence artifact: {e}");
+            eprintln!("⚠️  CR-71: failed to write evidence artifact: {e}");
         }
     }
 
-    report.section_prune = Some(summary);
+    // geo + font >= 2: per_node holds only flagged sections (>= 1 geometric
+    // flag), so the gate reduces to "this flagged section's font is confirmed
+    // bad". node_type-only demote; rebalance_topology rebuilds the tree.
+    let mut pruned = 0;
+    if cfg.prune_on_detection {
+        let to_demote: Vec<NodeId> = evidence
+            .per_node
+            .iter()
+            .filter(|(_, f)| f.any() && evidence.bad_fonts.contains(&f.font_stem))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in to_demote {
+            if let Some(n) = graph.nodes.get_mut(&id) {
+                if n.node_type == "Section" {
+                    n.node_type = "Paragraph".to_string();
+                    pruned += 1;
+                }
+            }
+        }
+    }
+
+    report.section_prune = Some(SectionPruneSummary {
+        flagged,
+        pruned,
+        main_font: evidence.main_font.clone(),
+        bad_fonts,
+        prune_on_detection: cfg.prune_on_detection,
+    });
 }
 
 /// One flagged section's row in the evidence artifact — a lean **handle** into
@@ -336,21 +352,28 @@ mod tests {
         assert_eq!(s.bad_fonts, vec!["dejavusans".to_string()]);
     }
 
-    /// CR-71A — `prune_on_detection = true` is STILL a no-op in CR-71A: graph
-    /// stays byte-identical, pruned == 0.
+    /// CR-71B v1 — `prune_on_detection = true` demotes a flagged section whose
+    /// font is confirmed bad (geo + font >= 2), leaving main-font sections alone.
     #[test]
-    fn test_prune_on_detection_true_still_noop() {
-        let (mut graph, ids) =
-            build_sections(&[("1. Intro", Some("Times")), ("FLOPS", Some("DejaVuSans"))]);
-        let before = serde_json::to_string(&graph).unwrap();
+    fn test_prune_on_detection_demotes_geo_plus_font() {
+        let (mut graph, ids) = build_sections(&[
+            ("1. Intro", Some("Times")),
+            ("FLOPS", Some("DejaVuSans")),
+            ("2. Body", Some("Times")),
+        ]);
+        // Flag the DejaVuSans figure callout (the geometric signal).
         let evidence = flagged_evidence(&graph, &[ids[1]]);
+        assert!(evidence.bad_fonts.contains("dejavusans"), "dejavusans confirmed bad");
         let mut report = SanityReport::default();
         let cfg = SectionPruneConfig { enabled: true, prune_on_detection: true, emit_evidence_artifact: false };
 
         prune_sections(&mut graph, &evidence, &mut report, &cfg);
 
-        assert_eq!(before, serde_json::to_string(&graph).unwrap(), "CR-71A prune body is a no-op even with the gate on");
-        assert_eq!(report.section_prune.unwrap().pruned, 0);
+        // geo + font >= 2 demotes FLOPS; the main-font Times headers stay.
+        assert_eq!(graph.nodes[&ids[1]].node_type, "Paragraph", "FLOPS (geo + bad font) demoted");
+        assert_eq!(graph.nodes[&ids[0]].node_type, "Section", "main-font header kept");
+        assert_eq!(graph.nodes[&ids[2]].node_type, "Section", "main-font header kept");
+        assert_eq!(report.section_prune.unwrap().pruned, 1);
     }
 
     /// CR-71A — the evidence artifact contains every flagged section with its

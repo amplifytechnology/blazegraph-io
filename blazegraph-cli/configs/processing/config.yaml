@@ -14,16 +14,48 @@ graph_sanity:
       check: true
       correct: true
 
-    # CR-65 — Section bbox.height bounded by document title's bbox.height.
-    # Catches figure-cluster bloat that survives NodeTypeClustering by
-    # demoting Sections whose bbox.height exceeds title.height × tolerance.
-    # Title = first depth-1 Section in source order with a physical bbox.
-    # Default tolerance 2.0 is permissive — leaves FP refinement to downstream
-    # rules; saves single-line big-font headers like "Appendix" (~1.4× title).
+    # CR-71 — evidence-first section detection (landed Sb6). The old per-invariant
+    # demoters (CR-65 height / CR-68 overlap / CR-69 count) are parked OFF
+    # (check/correct false); their geometric predicates are now read by the
+    # flag-only `section_detectors`, whose thresholds still live on these structs.
+    # `section_prune` does the single demotion (geo + font >= 2), then the CR-70
+    # rebalance rebuilds topology.
+
+    # CR-65 predicate threshold (read by the height detector). tolerance 2.0.
     section_height_bounded_by_title:
-      check: true
-      correct: true
+      check: false
+      correct: false
       tolerance: 2.0
+
+    # CR-69 predicate thresholds (read by the count detector).
+    section_overlap_count:
+      check: false
+      correct: false
+      count_threshold: 3
+      min_overlap_frac: 0.0
+
+    # CR-68 predicate threshold (read by the overlap detector). 0.20 is the live
+    # overlap signal — figure callouts with a high covering-paragraph overlap.
+    section_paragraph_overlap:
+      check: false
+      correct: false
+      threshold: 0.20
+      bookmark_bypass: false
+
+    # CR-71 flag-only detectors: reuse the predicates above, write evidence, never
+    # mutate node_type. The verdict (main_font / bad_fonts) is derived from these.
+    section_detectors:
+      height_flag: true
+      overlap_flag: true
+      count_flag: true
+
+    # CR-71 prune (the only demoter in the evidence-first path): demote a flagged
+    # section whose font is in bad_fonts (geo + font >= 2). emit_evidence_artifact
+    # is a debug-only dump, off in production.
+    section_prune:
+      enabled: true
+      prune_on_detection: true
+      emit_evidence_artifact: false
 
 # Pipeline configuration - defines which rules to run and in what order
 # NEW APPROACH: Section detection FIRST, then spatial clustering

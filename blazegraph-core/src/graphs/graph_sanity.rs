@@ -145,16 +145,17 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         check_and_correct_section_overlap_count(graph, soc, &mut report);
     }
 
-    // ── CR-71A — evidence-first flag detectors → verdicts → prune. ──
+    // ── CR-71 — evidence-first flag detectors → verdicts → prune. ──
     //
     // The flag detectors are read-only on the graph: they reuse the CR-65/68/69
     // geometric predicates (shared with the parked-off demoters above) and write
     // `NodeFlags` into a transient `SectionEvidence` sidecar — never mutating
     // `node_type`. The verdict aggregation derives the document-level
     // `main_font` / `bad_fonts`. The prune step (the only mutator slot before
-    // the CR-70 rebalance) consumes the sidecar; in CR-71A its body is a no-op —
-    // it writes the flagged-set summary into `report.section_prune` and (debug)
-    // the evidence artifact. The sidecar is dropped at the end of `apply()`.
+    // the CR-70 rebalance) consumes the sidecar: with `prune_on_detection` on it
+    // demotes flagged sections whose font is bad (geo + font >= 2); otherwise it
+    // is observation-only. It writes the summary into `report.section_prune` and
+    // (debug) the evidence artifact. The sidecar is dropped at end of `apply()`.
     let det = &config.invariants.section_detectors;
     let sp = &config.invariants.section_prune;
     if det.height_flag || det.overlap_flag || det.count_flag || sp.enabled {
@@ -184,8 +185,7 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
 
     // Future invariants: childless_sections, repetition_filter, etc. plug in here.
 
-    // CR-71A — the prune step is observational (no-op), so it never makes the
-    // report "unclean". Surface its flagged-set summary separately when it ran.
+    // CR-71 — surface the prune step's flagged-set summary when it ran.
     if let Some(sp_summary) = &report.section_prune {
         let bad = if sp_summary.bad_fonts.is_empty() {
             "-".to_string()
@@ -193,13 +193,13 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
             sp_summary.bad_fonts.join(",")
         };
         println!(
-            "🧾 CR-71A SectionPrune: {} flagged, {} pruned{}, main_font={}, bad_fonts={}",
+            "🧾 CR-71 SectionPrune: {} flagged, {} pruned{}, main_font={}, bad_fonts={}",
             sp_summary.flagged,
             sp_summary.pruned,
             if sp_summary.prune_on_detection {
-                " (prune_on_detection=on; no-op in CR-71A)"
-            } else {
                 ""
+            } else {
+                " (observe-only)"
             },
             sp_summary.main_font.as_deref().unwrap_or("?"),
             bad,
