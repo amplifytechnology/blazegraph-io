@@ -2002,6 +2002,21 @@ mod tests {
         assert!(!rule.apply_pattern_refinement(true, 0, "Figure 3: Architecture"));
     }
 
+    /// CR-73 follow-up — tightened caption exclusion. `^Table\s+[A-Z0-9]`
+    /// requires a label token after "Table", so real captions ("Table 1:",
+    /// "Table B-1:") demote while "Table of Contents" (lowercase "of", a genuine
+    /// outline heading and a bookmark TP on RFCs) survives.
+    #[test]
+    fn caption_exclusion_spares_table_of_contents() {
+        let elements = vec![make_inclusion_element("Table of Contents", 100.0, 80.0)];
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test(&elements, vec![], vec!["^Table\\s+[A-Z0-9]"]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(!rule.apply_pattern_refinement(true, 0, "Table 1: Results"), "numbered caption demoted");
+        assert!(!rule.apply_pattern_refinement(true, 0, "Table B-1: Summary"), "lettered caption demoted");
+        assert!(rule.apply_pattern_refinement(true, 0, "Table of Contents"), "TOC heading survives");
+    }
+
     /// CR-26 Test 5 — Length cap rejects long body wrap-lines.
     /// Body wrap-line begins with `Article` and is structurally isolated (single
     /// span, no same-Y neighbours), but its length exceeds `inclusion_max_length`.

@@ -1304,7 +1304,10 @@ impl Default for SectionDetectionV2Config {
                 },
             ],
             inclusion_max_length: 30,
-            exclusion_patterns: vec![r"^Figure\s".to_string(), r"^Table\s".to_string()],
+            exclusion_patterns: vec![
+                r"^Figure\s+[A-Z0-9]".to_string(),
+                r"^Table\s+[A-Z0-9]".to_string(),
+            ],
             tiebreaker_keywords: vec![
                 TiebreakerKeyword {
                     name: "part".into(),

@@ -142,9 +142,13 @@ section_detection_v2:
   inclusion_max_length: 20
 
   # Exclusion patterns: demote a promoted candidate (applied before inclusion).
+  # The caption patterns require a label token ([A-Z0-9]) after Figure/Table so
+  # real captions ("Figure 6:", "Table 1:", "Table B-1:") demote while a genuine
+  # heading like "Table of Contents" (lowercase "of") survives — it is itself an
+  # outline entry on RFCs (a bookmark TP), and the captions are FP anchors.
   exclusion_patterns:
-    - "^Figure\\s"
-    - "^Table\\s"
+    - "^Figure\\s+[A-Z0-9]"
+    - "^Table\\s+[A-Z0-9]"
     - "^\\d+\\.?\\d*$" # bare numbers / decimals like "0.1", "4.92"
     - "^[\\d\\s\\.]+$" # rows of numbers (table data)
 
