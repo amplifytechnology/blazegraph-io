@@ -1162,6 +1162,16 @@ pub struct TopologyRebalanceConfig {
     /// Maximum depth any node may occupy. Content under a cap-level section
     /// sits at `max_total_depth`.
     pub max_total_depth: u32,
+    /// Sb8 — nest the document body under its title. Among the would-be level-1
+    /// sections, the content tier is the most-common font size; any section
+    /// larger than it is a structural top node (the title, plus a large-font
+    /// `Appendix` heading). Top nodes stay level-1 siblings; every content
+    /// section drops one level under the preceding top node — so the title owns
+    /// the body and an `Appendix` owns its run, summarisable independently.
+    /// Pure topology, reusing the stack replay. The caps are +1 vs the pre-Sb8
+    /// 3/4 to absorb the new title level so deep `X.Y.Z` stays distinct.
+    #[serde(default = "default_true")]
+    pub document_title_nesting: bool,
 }
 
 impl Default for TopologyRebalanceConfig {
@@ -1169,8 +1179,9 @@ impl Default for TopologyRebalanceConfig {
         Self {
             check: true,
             correct: true,
-            max_section_depth: 3,
-            max_total_depth: 4,
+            max_section_depth: 4,
+            max_total_depth: 5,
+            document_title_nesting: true,
         }
     }
 }

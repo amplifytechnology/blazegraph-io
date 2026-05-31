@@ -1206,6 +1206,70 @@ fn rebalance_topology(
         }
     }
 
+    // ── Document-title nesting (Sb8). ──
+    //
+    // Among the would-be level-1 sections, the content tier is the *most common*
+    // font size; any section LARGER than it is a structural top node (the title,
+    // and a large-font `Appendix` heading — these become level-1 siblings so the
+    // main body and the appendix summarise apart). Every content section drops
+    // one level under the preceding top node. NB: a plain "largest font" rule
+    // fails on academic papers whose `Appendix` is set larger than the title
+    // (alphafold: title 17, Appendix 24, body 12) — the title would be demoted.
+    //
+    // Implemented as a +1 offset on the level signal feeding the SAME stack
+    // replay — pure topology, no touch to detection / bookmarks. `font_size` is
+    // read off the section node (not bbox, which conflates a multi-line title
+    // with a larger font). The caps (4/5) absorb the added level so deep `X.Y.Z`
+    // stays distinct.
+    let mut title_tier: HashSet<NodeId> = HashSet::new();
+    if cfg.document_title_nesting {
+        let mut l1: Vec<(NodeId, f32)> = Vec::new();
+        for id in &order {
+            let n = &graph.nodes[id];
+            if n.node_type != "Section" {
+                continue;
+            }
+            let base = level_overrides
+                .get(id)
+                .copied()
+                .unwrap_or_else(|| levels.level_of(id));
+            if base != 1 {
+                continue;
+            }
+            if let Some(fs) = n.style_info.as_ref().and_then(|s| s.font_size) {
+                l1.push((*id, fs));
+            }
+        }
+        if l1.len() >= 2 {
+            // Content tier = the most common level-1 size (ties → the smaller).
+            // Sizes come straight off the wire — exact equality, no epsilon.
+            let mut counts: Vec<(f32, usize)> = Vec::new();
+            for (_, fs) in &l1 {
+                match counts.iter_mut().find(|(s, _)| *s == *fs) {
+                    Some(c) => c.1 += 1,
+                    None => counts.push((*fs, 1)),
+                }
+            }
+            let max_count = counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
+            let content_font = counts
+                .iter()
+                .filter(|(_, c)| *c == max_count)
+                .map(|(s, _)| *s)
+                .fold(f32::MAX, f32::min);
+            // Top tier = level-1 sections strictly larger than the content font.
+            let tier: HashSet<NodeId> = l1
+                .iter()
+                .filter(|(_, fs)| *fs > content_font)
+                .map(|(id, _)| *id)
+                .collect();
+            // Only nest when a structural top stands above ≥1 content section.
+            if !tier.is_empty() && tier.len() < l1.len() {
+                title_tier = tier;
+            }
+        }
+    }
+    let title_active = !title_tier.is_empty();
+
     // Snapshot which nodes open a level (surviving Sections).
     let snapshot: Vec<RebalanceNode> = order
         .iter()
@@ -1244,10 +1308,21 @@ fn rebalance_topology(
             // CR-72 — a restart-region member uses its overridden level
             // (container_level + sub_depth); everyone else uses the CR-70
             // numbering/size signal. Empty override map ⇒ identical to CR-70.
-            let l = level_overrides
+            let base_l = level_overrides
                 .get(&node.id)
                 .copied()
                 .unwrap_or_else(|| levels.level_of(&node.id));
+            // Sb8 — document-title nesting: the title tier holds level 1, every
+            // other section drops one level so the body nests under the title.
+            let l = if title_active {
+                if title_tier.contains(&node.id) {
+                    1
+                } else {
+                    base_l + 1
+                }
+            } else {
+                base_l
+            };
             while stack.len() > 1 && stack.last().unwrap().level >= l {
                 stack.pop();
             }
@@ -1364,6 +1439,7 @@ mod tests {
             correct: false,
             max_section_depth: 3,
             max_total_depth: 4,
+            document_title_nesting: false,
         }
     }
 
@@ -2093,6 +2169,7 @@ mod tests {
                     correct: true,
                     max_section_depth,
                     max_total_depth,
+                    document_title_nesting: false,
                 },
                 numbering_restart: NumberingRestartConfig {
                     check: true,
@@ -2124,6 +2201,69 @@ mod tests {
         // Children rebuilt: 1. has 1.1 as its only child; 2. is a leaf.
         assert_eq!(graph.nodes[&ids[0]].children, vec![ids[1]]);
         assert!(graph.nodes[&ids[2]].children.is_empty());
+    }
+
+    /// Sb8 — document-title nesting. The largest-font level-1 section (the
+    /// title, font 22 vs the body's 19) becomes the root section; "1." / "2."
+    /// nest under it and "1.1" rides one level deeper — the +1 caps (4/5) keep
+    /// it distinct. Disabling the flag reverts to flat level-1 siblings.
+    #[test]
+    fn sb8_document_title_nesting_nests_body_under_title() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "OAuth 2.0 DPoP", font_family: None, font_size: Some(22.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: Some(19.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: Some(19.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "2. Concept", font_family: None, font_size: Some(19.0), depth: 1, parent_idx: None },
+        ];
+        let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
+        let mut cfg = rebalance_only_config(4, 5);
+        cfg.invariants.topology_rebalance.document_title_nesting = true;
+        apply(&mut graph, &cfg);
+
+        assert_eq!(graph.nodes[&ids[0]].parent, Some(root_id), "title is the root section");
+        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
+        assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]), "1. nests under the title");
+        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
+        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[0]), "2. nests under the title");
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(ids[1]), "1.1 stays under 1.");
+        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 3, "1.1 rides one level deeper, still distinct");
+
+        // Flag off → flat level-1 siblings (the pre-Sb8 shape).
+        let (mut g2, root2, ids2) = make_rebalance_graph(&specs);
+        apply(&mut g2, &rebalance_only_config(4, 5));
+        assert_eq!(g2.nodes[&ids2[0]].parent, Some(root2));
+        assert_eq!(g2.nodes[&ids2[1]].parent, Some(root2), "title-off: 1. stays at root");
+        assert_eq!(g2.nodes[&ids2[1]].location.semantic.depth, 1);
+    }
+
+    /// Sb8 — title nesting with a large-font Appendix (the alphafold shape:
+    /// title 17, body 12, Appendix 24). The content tier is the modal 12, so
+    /// BOTH the title and the Appendix sit above it → two top-level siblings,
+    /// the body under the title and the post-Appendix content under the
+    /// Appendix. A plain max-font rule would wrongly crown only the Appendix.
+    #[test]
+    fn sb8_document_title_nesting_appendix_becomes_sibling() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "Doc Title", font_family: None, font_size: Some(17.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "1. Intro", font_family: None, font_size: Some(12.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: Some(12.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: Some(24.0), depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "Supplementary Notes", font_family: None, font_size: Some(12.0), depth: 1, parent_idx: None },
+        ];
+        let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
+        let mut cfg = rebalance_only_config(4, 5);
+        cfg.invariants.topology_rebalance.document_title_nesting = true;
+        apply(&mut graph, &cfg);
+
+        // Two top-level siblings: the title and the Appendix.
+        assert_eq!(graph.nodes[&ids[0]].parent, Some(root_id), "title is a top node");
+        assert_eq!(graph.nodes[&ids[3]].parent, Some(root_id), "large-font Appendix is a top node");
+        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
+        assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 1);
+        // Body nests under the title; post-Appendix content under the Appendix.
+        assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]), "1. under title");
+        assert_eq!(graph.nodes[&ids[2]].parent, Some(ids[0]), "2. under title");
+        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[3]), "supplementary under Appendix");
     }
 
     /// CR-70 Test 2 — gap-collapse. Numbering levels 1 then 3 (a skipped level)
@@ -2284,6 +2424,7 @@ mod tests {
                     correct: false,
                     max_section_depth: 3,
                     max_total_depth: 4,
+                    document_title_nesting: false,
                 },
                 ..Default::default()
             },
