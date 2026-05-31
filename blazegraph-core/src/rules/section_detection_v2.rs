@@ -51,6 +51,34 @@ use crate::config::{ParsingConfig, SectionDetectionV2Config};
 use crate::types::*;
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Sb8 — leading multi-level numbering token ("3.5.2", "4.1"): at least one dot,
+/// so single-level list markers ("1.", "2.") never match. Used by
+/// `promote_numbered_line_seeds`.
+static NUMBERED_SEED_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)+)").unwrap());
+
+/// Minimum trailing-whitespace fraction (column right edge − line right edge,
+/// over column width) for a numbered line to seed a section. A real header
+/// occupies only part of the column and leaves whitespace to the right; a TOC
+/// entry (title + dotted leader + page number) or a body/table line fills the
+/// column. Measured corpus separation is wide: real headers leave ≥ 0.23 of
+/// the column trailing, TOC lines ≈ 0.01 — so 0.15 keeps every real header
+/// (incl. long deep ones) with margin while dropping full-width lines.
+const MIN_HEADER_TRAILING_RATIO: f32 = 0.15;
+
+/// Bold detection on a raw `FontClass`. CR-20: LaTeX PDFs encode bold in the
+/// font-family name ("…-Medi", "CMBX10") rather than CSS font-weight, so check
+/// both fields.
+fn font_is_bold(style: &FontClass) -> bool {
+    let weight = style.font_weight.to_lowercase();
+    if weight.contains("bold") {
+        return true;
+    }
+    let family = style.font_family.to_lowercase();
+    family.contains("bold") || family.contains("medi") || family.contains("bx")
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HierarchyContext (CR-27: stack-based with keyword tiebreaker)
@@ -393,12 +421,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
     /// Common patterns: "NimbusRomNo9L-Medi" (contains "medi"), "CMBX10" (contains "bx").
     /// We check both fields to catch both CSS-based and LaTeX-encoded bold.
     fn is_bold(element: &PdfTextElement) -> bool {
-        let weight = element.style_info.font_weight.to_lowercase();
-        if weight.contains("bold") {
-            return true;
-        }
-        let family = element.style_info.font_family.to_lowercase();
-        family.contains("bold") || family.contains("medi") || family.contains("bx")
+        font_is_bold(&element.style_info)
     }
 
     /// CR-41: Whether the XHTML parser matched this span's normalized text
@@ -921,6 +944,144 @@ impl<'a> SectionDetectionV2Rule<'a> {
             }
         }
     }
+
+    /// Sb8 — Numbered subsection seed promotion.
+    ///
+    /// Deep RFC-style subsection headers ("3.5.2. Reset Generation") are
+    /// typeset at *body* font size, distinguished only by bold weight, and
+    /// Tika splits the number into its own span. They fail the size tiers
+    /// (delta ≈ 0 → R3), R3's isolation gate (the one-line header shares an
+    /// XY-cut leaf with the body paragraph below it), and bookmark-match (the
+    /// number-only span doesn't equal the full outline title). Result: depth-3+
+    /// subsections detect at < 20% while depth-1/2 detect at ~100%.
+    ///
+    /// This seeds them off the one signal the leaf can't corrupt: a **bold,
+    /// line-leading multi-level-numbering segment** ("N.M[.K…]"). Every bold
+    /// segment on such a line is promoted to Section at the numbering depth;
+    /// `promote_section_fragments` + NodeTypeClustering then fuse the number and
+    /// title into one node. Anchoring on the visual line `(page, Y)` rather than
+    /// the leaf sidesteps the isolation failure by construction — the body
+    /// paragraph is a different Y-line and is never swept in.
+    ///
+    /// Guards keep it strictly additive and precise:
+    /// - fires only on a line with **no** existing Section (never disturbs a
+    ///   size/bookmark-detected header or its assigned depth);
+    /// - the leading segment must be **bold** — excludes TOC entries (normal
+    ///   weight) and inline cross-references (not line-leading);
+    /// - the line must carry an alphabetic title (a bare number is not a header).
+    fn promote_numbered_line_seeds(out: &mut [ParsedPdfElement]) {
+        use std::collections::HashMap;
+        const Y_TOL: f32 = 3.0;
+
+        // Group element indices by visual line: (page, quantized-Y), and learn
+        // each page's content box (left/right text edge) for the trailing-
+        // whitespace filter. Skip furniture (Header/Footer/Margin).
+        let mut lines: HashMap<(u32, i64), Vec<usize>> = HashMap::new();
+        let mut page_right: HashMap<u32, f32> = HashMap::new();
+        let mut page_left: HashMap<u32, f32> = HashMap::new();
+        for (i, el) in out.iter().enumerate() {
+            if matches!(
+                el.element_type,
+                ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
+            ) {
+                continue;
+            }
+            let Some(p) = el.placement.as_ref() else {
+                continue;
+            };
+            let right = p.bounding_box.x + p.bounding_box.width;
+            page_right
+                .entry(p.page_number)
+                .and_modify(|v| *v = v.max(right))
+                .or_insert(right);
+            page_left
+                .entry(p.page_number)
+                .and_modify(|v| *v = v.min(p.bounding_box.x))
+                .or_insert(p.bounding_box.x);
+            let ybucket = (p.bounding_box.y / Y_TOL).round() as i64;
+            lines.entry((p.page_number, ybucket)).or_default().push(i);
+        }
+
+        let mut to_promote: Vec<(usize, u32)> = Vec::new();
+        for idxs in lines.values() {
+            // Purely additive: never touch a line that already has a Section.
+            if idxs
+                .iter()
+                .any(|&i| out[i].element_type == ParsedElementType::Section)
+            {
+                continue;
+            }
+            // Leftmost segment on the line.
+            let Some(&lead) = idxs.iter().min_by(|&&a, &&b| {
+                let xa = out[a].placement.as_ref().map_or(f32::MAX, |p| p.bounding_box.x);
+                let xb = out[b].placement.as_ref().map_or(f32::MAX, |p| p.bounding_box.x);
+                xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal)
+            }) else {
+                continue;
+            };
+
+            // Leading segment must be bold and start with a multi-level number.
+            if !font_is_bold(&out[lead].style_info) {
+                continue;
+            }
+            let Some(m) = NUMBERED_SEED_REGEX.find(out[lead].text.trim_start()) else {
+                continue;
+            };
+            // Numbering depth = component count ("3.5.2" → 3). Provisional —
+            // CR-70 rebalance recomputes depth from numbering; this only needs
+            // to be consistent across the line so the fragments share a bucket
+            // in the `same_depth`-keyed Section clustering merge.
+            let level = m.as_str().matches('.').count() as u32 + 1;
+
+            // The line must carry a *bold* alphabetic title, not just a bare
+            // number. Only bold segments get promoted, so a bold number beside a
+            // non-bold title (NIST AI-RMF subcategory rows: bold "1.4:" + normal
+            // description) would otherwise leave a titleless "1.4:" section.
+            let has_bold_title = idxs.iter().any(|&i| {
+                font_is_bold(&out[i].style_info)
+                    && out[i].text.chars().filter(|c| c.is_alphabetic()).count() >= 2
+            });
+            if !has_bold_title {
+                continue;
+            }
+
+            // Geometric TOC/body filter: a real header leaves whitespace to the
+            // right of the column; a TOC entry (leader + page number) or a
+            // body/table line fills it. Require a minimum trailing-whitespace
+            // fraction of the column width.
+            let page = out[lead].placement.as_ref().map_or(0, |p| p.page_number);
+            let line_right = idxs
+                .iter()
+                .map(|&i| {
+                    out[i]
+                        .placement
+                        .as_ref()
+                        .map_or(f32::MIN, |p| p.bounding_box.x + p.bounding_box.width)
+                })
+                .fold(f32::MIN, f32::max);
+            let (Some(&right), Some(&left)) = (page_right.get(&page), page_left.get(&page)) else {
+                continue;
+            };
+            let width = right - left;
+            if width <= 0.0 || (right - line_right) / width < MIN_HEADER_TRAILING_RATIO {
+                continue;
+            }
+
+            // Promote every bold segment on the line (number + title fragments).
+            for &i in idxs {
+                if font_is_bold(&out[i].style_info) {
+                    to_promote.push((i, level));
+                }
+            }
+        }
+
+        for (i, level) in to_promote {
+            if out[i].element_type != ParsedElementType::Section {
+                out[i].element_type = ParsedElementType::Section;
+                out[i].hierarchy_level = level;
+            }
+        }
+    }
 }
 
 impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
@@ -975,6 +1136,13 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
                     ..element
                 });
             }
+        }
+
+        // Sb8 — seed deep numbered subsections (RFC X.Y.Z) before the fragment
+        // passes, so the same-line / source-adjacent promotion + clustering fuse
+        // the number and title that the size/isolation/bookmark gates all miss.
+        if self.config.section_detection_v2.numbered_seed_promotion {
+            Self::promote_numbered_line_seeds(&mut out);
         }
 
         // Same-Y same-(page, leaf) section promotion. Tika fragments a
@@ -2283,6 +2451,140 @@ mod tests {
             token_count: 1,
             links: vec![],
         }
+    }
+
+    /// Sb8 helper — a bold/normal text segment at explicit `(x, y, width)`.
+    fn seed_el_w(text: &str, x: f32, y: f32, bold: bool, width: f32) -> ParsedPdfElement {
+        ParsedPdfElement {
+            element_type: ParsedElementType::Paragraph,
+            text: text.to_string(),
+            hierarchy_level: 3,
+            position: 0,
+            style_info: FontClass {
+                class_name: "f13".to_string(),
+                font_family: if bold { "Noto-Serif-Bold" } else { "Noto-Serif" }.to_string(),
+                font_size: 13.0,
+                font_style: "normal".to_string(),
+                font_weight: if bold { "bold" } else { "normal" }.to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Some(Placement {
+                page_number: 1,
+                bounding_box: BoundingBox { x, y, width, height: 19.1 },
+                line_number: 0,
+                segment_number: 0,
+                rotation: 0,
+                paragraph_number: 0,
+                region_label: Some("1".to_string()),
+                page_width: 0.0,
+                page_height: 0.0,
+            }),
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            links: vec![],
+        }
+    }
+
+    /// Short header segment (default width) that leaves trailing whitespace —
+    /// paired with a full-width body element in tests so the trailing-ratio
+    /// filter sees the column edge.
+    fn seed_el(text: &str, x: f32, y: f32, bold: bool) -> ParsedPdfElement {
+        seed_el_w(text, x, y, bold, 20.0)
+    }
+
+    /// A full-width body line so the trailing-whitespace filter knows the
+    /// column's right edge (66 → 518). Real headers stop well short of it.
+    fn body_line() -> ParsedPdfElement {
+        seed_el_w("Body text spanning the full column width to the margin", 66.0, 40.0, false, 452.0)
+    }
+
+    /// Sb8 — the canonical RFC depth-3 miss. A bold "3.5.2. " number and a bold
+    /// "Reset Generation" title share a Y-line; the body sits 19pt below. The
+    /// seed promotes both header segments to Section (depth = numbering
+    /// component count) and leaves the body as Paragraph.
+    #[test]
+    fn sb8_numbered_seed_promotes_split_header() {
+        let mut out = vec![
+            body_line(),
+            seed_el("3.5.2. ", 66.0, 468.0, true),
+            seed_el("Reset Generation", 99.0, 468.0, true),
+            seed_el("A TCP user or application can issue a reset…", 66.0, 487.0, false),
+        ];
+
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+
+        assert_eq!(out[1].element_type, ParsedElementType::Section, "number segment seeds");
+        assert_eq!(out[2].element_type, ParsedElementType::Section, "title segment seeds");
+        assert_eq!(out[1].hierarchy_level, 3, "depth = numbering component count");
+        assert_eq!(out[2].hierarchy_level, 3);
+        assert_eq!(
+            out[3].element_type,
+            ParsedElementType::Paragraph,
+            "body on a different Y-line must not be swept in",
+        );
+    }
+
+    /// Sb8 — a TOC entry has the same text shape but NORMAL weight. The bold
+    /// gate must keep it from promoting.
+    #[test]
+    fn sb8_numbered_seed_skips_non_bold_toc() {
+        let mut out = vec![
+            seed_el("3.5.2", 90.0, 66.0, false),
+            seed_el("Reset Generation", 120.0, 66.0, false),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(out[0].element_type, ParsedElementType::Paragraph);
+        assert_eq!(out[1].element_type, ParsedElementType::Paragraph);
+    }
+
+    /// Sb8 — a bold number+colon with a NON-bold title (NIST AI-RMF subcategory
+    /// shape) must not seed: only bold segments promote, so a non-bold title
+    /// would leave a bare "1.4:" section.
+    #[test]
+    fn sb8_numbered_seed_requires_bold_title() {
+        let mut out = vec![
+            seed_el("1.4:", 66.0, 100.0, true),
+            seed_el("The risk management process and its outcomes", 90.0, 100.0, false),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(out[0].element_type, ParsedElementType::Paragraph);
+        assert_eq!(out[1].element_type, ParsedElementType::Paragraph);
+    }
+
+    /// Sb8 — a full-width numbered line (TOC entry or body/table line) is
+    /// filtered geometrically: it fills the column to the right margin, leaving
+    /// no trailing whitespace, unlike a real header. The NIST Privacy Framework
+    /// TOC ("1.0 Introduction ........ 5") is the canonical case.
+    #[test]
+    fn sb8_numbered_seed_skips_full_width_line() {
+        let mut out = vec![
+            body_line(), // column right edge = 518
+            seed_el_w("1.0 Privacy Framework Introduction ......... 5", 66.0, 100.0, true, 452.0),
+            seed_el("3.5.2.", 66.0, 200.0, true),
+            seed_el("Reset Generation", 99.0, 200.0, true),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(
+            out[1].element_type,
+            ParsedElementType::Paragraph,
+            "full-width numbered line (TOC/body) leaves no trailing whitespace → filtered",
+        );
+        assert_eq!(out[2].element_type, ParsedElementType::Section, "short header kept");
+        assert_eq!(out[3].element_type, ParsedElementType::Section);
+    }
+
+    /// Sb8 — a single-level list marker ("1.") is not multi-level numbering and
+    /// must not seed (would over-promote numbered list items).
+    #[test]
+    fn sb8_numbered_seed_skips_single_level() {
+        let mut out = vec![
+            seed_el("1.", 66.0, 100.0, true),
+            seed_el("First do this thing", 80.0, 100.0, true),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(out[0].element_type, ParsedElementType::Paragraph);
+        assert_eq!(out[1].element_type, ParsedElementType::Paragraph);
     }
 
     /// CR-67 Part B — canonical RFC fragmentation. A `**1.1.**` Paragraph

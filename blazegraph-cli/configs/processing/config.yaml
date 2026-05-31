@@ -107,6 +107,14 @@ section_detection_v2:
   enforce_max_depth: true
   starting_section_level: 1
 
+  # Sb8 — seed deep numbered subsections. RFC X.Y.Z headers are typeset at body
+  # size + bold, with the number split into its own span, so they fail the size
+  # tiers (delta≈0 → R3), R3's isolation gate (header shares a leaf with the body
+  # paragraph), and bookmark-match (split number). This promotes a bold,
+  # line-leading multi-level-numbering segment ("3.5.2. Title") to a Section
+  # directly; the same-line / source-adjacent fragment passes fuse number+title.
+  numbered_seed_promotion: true
+
   # Inclusion patterns: promote a weak/rejected candidate to section when the regex
   # matches AND the per-pattern structural gates pass AND the text length is within
   # `inclusion_max_length`. Patterns require the keyword followed by an explicit

@@ -915,6 +915,16 @@ pub struct SectionDetectionV2Config {
     pub enforce_max_depth: bool,
     pub starting_section_level: u32,
 
+    /// Sb8 — promote a bold, line-leading multi-level-numbering segment
+    /// ("3.5.2. Title") to a Section regardless of font size or leaf isolation.
+    /// Recovers deep RFC subsections typeset at body size + bold weight, which
+    /// the size tiers (delta≈0 → R3), R3's isolation gate (the one-line header
+    /// shares a leaf with the body paragraph), and the split-number
+    /// bookmark-match all miss. The existing same-line / source-adjacent
+    /// fragment-promotion passes then fuse number + title into one node.
+    #[serde(default = "default_true")]
+    pub numbered_seed_promotion: bool,
+
     /// Regex patterns that promote a weak/rejected candidate to a section
     /// (escape hatch — e.g., "^\\d+\\.\\d+" for numbered subsections).
     /// Promotion additionally requires the per-pattern structural gates
@@ -1270,6 +1280,7 @@ impl Default for SectionDetectionV2Config {
             max_depth: 6,
             enforce_max_depth: true,
             starting_section_level: 1,
+            numbered_seed_promotion: true,
             inclusion_patterns: vec![
                 InclusionPattern {
                     pattern: r"^\d+\.".to_string(), // "1.", "2.", ...
