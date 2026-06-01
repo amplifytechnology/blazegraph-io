@@ -59,6 +59,14 @@ use std::sync::LazyLock;
 static NUMBERED_SEED_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)+)").unwrap());
 
+/// CR-77 (experiment) — line-leading single-level list/section marker:
+/// decimal (`1.`, `1.1.`) or a single letter (`A.`, `a.`) followed by a dot
+/// and whitespace. Unlike NUMBERED_SEED_REGEX this DOES match single-level
+/// markers — it's the structural-atom guard on the bookmark-only R3 path, not
+/// a standalone seed.
+static NUMBERED_PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\d+(?:\.\d+)*|[A-Za-z])\.\s").unwrap());
+
 /// Minimum trailing-whitespace fraction (column right edge − line right edge,
 /// over column width) for a numbered line to seed a section. A real header
 /// occupies only part of the column and leaves whitespace to the right; a TOC
@@ -670,7 +678,15 @@ impl<'a> SectionDetectionV2Rule<'a> {
         } else {
             // R3 (at-body band): bold required; isolation OR bookmark
             // match (CR-41) supplies the structural-atom signal.
+            //
+            // CR-77 (experiment): a non-bold numbered/lettered sub-item that
+            // bookmark-matches also promotes. On line-numbered / single-column
+            // drafts (FDA guidance) the XY-cut glues the header into the body
+            // leaf, so `isolated` is never true and the deep sub-items have no
+            // bold — but the outline names them and the line-leading marker is
+            // the standalone-atom signal that isolation would otherwise carry.
             bold && (isolated || bookmark_promoted)
+                || (bookmark_promoted && NUMBERED_PREFIX_RE.is_match(&element.text))
         }
     }
 
@@ -1649,6 +1665,66 @@ mod tests {
         let gutter = make_neighbour(0);
 
         let elements = vec![header, gutter];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    // ── CR-77 tests — numbered-prefix + bookmark promotes at body-size R3 ─────
+
+    /// CR-77: a non-bold, non-isolated, body-size sub-item that is BOTH
+    /// line-leading numbered AND bookmark-matched promotes — the FDA deep
+    /// sub-item case (isolation unavailable, no bold, but outline-named).
+    #[test]
+    fn test_cr77_numbered_bookmark_promotes_without_bold_or_isolation() {
+        let body = 12.0;
+        let mut header = make_leaf_element(10.0, 0.0, "1", false); // not bold
+        header.text = "1. Drug Target Identification".to_string();
+        header.style_info.font_size = body;
+        header.bookmark_match = Some(BookmarkSection {
+            title: "1. Drug Target Identification".to_string(),
+            order: 5,
+            level: 4,
+        });
+        // A second line in the same leaf → leaf is multi-line → not isolated.
+        let follow = make_leaf_element(10.0, 20.0, "1", false);
+        let elements = vec![header, follow];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-77 control — numbered but NOT bookmark-matched does not promote
+    /// (keys on the authoritative outline, not the marker alone).
+    #[test]
+    fn test_cr77_numbered_without_bookmark_does_not_promote() {
+        let body = 12.0;
+        let mut header = make_leaf_element(10.0, 0.0, "1", false);
+        header.text = "1. Drug Target Identification".to_string();
+        header.style_info.font_size = body;
+        let follow = make_leaf_element(10.0, 20.0, "1", false);
+        let elements = vec![header, follow];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-77 control — bookmark-matched but NOT numbered does not promote on the
+    /// CR-77 path: a non-bold, non-isolated unnumbered title still needs bold.
+    /// The marker is the guard against free-flow exact-match FPs.
+    #[test]
+    fn test_cr77_bookmark_without_number_does_not_promote() {
+        let body = 12.0;
+        let mut header = make_leaf_element(10.0, 0.0, "1", false);
+        header.text = "Drug Target Identification".to_string(); // no leading marker
+        header.style_info.font_size = body;
+        header.bookmark_match = Some(BookmarkSection {
+            title: "Drug Target Identification".to_string(),
+            order: 5,
+            level: 4,
+        });
+        let follow = make_leaf_element(10.0, 20.0, "1", false);
+        let elements = vec![header, follow];
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         let config = make_config(1.0, 4.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
