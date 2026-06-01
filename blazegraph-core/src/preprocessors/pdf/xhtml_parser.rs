@@ -550,12 +550,18 @@ static SECTION_NUMBER_PREFIX_REGEX: LazyLock<Regex> =
 /// emissions like `"3.1. Title"` with outline entries written as
 /// `"3.1 Title"`, restoring the bookmark-match bypass for elements that
 /// fail the `isolated_in_leaf` XY-cut gate.
+///
+/// CR-76 (A): case-folds the result so all-caps body headers match their
+/// title-case outline entries (`"1 INTRODUCTION"` → outline `"1 Introduction"`,
+/// the crispr-review top-level-header case). Applied symmetrically to both the
+/// bookmark title and the body text, so it only ever widens matching against
+/// the authoritative outline — never invents a match the outline doesn't name.
 pub(crate) fn normalize_for_match(s: &str) -> String {
     let nfkc: String = s.nfkc().collect();
     let folded = nfkc.split_whitespace().collect::<Vec<_>>().join(" ");
     SECTION_NUMBER_PREFIX_REGEX
         .replace(&folded, "$1 ")
-        .into_owned()
+        .to_lowercase()
 }
 
 /// Build a `PdfTextElement` from the current parse state and span attrs.
@@ -1219,24 +1225,40 @@ mod tests {
     /// rejects it.
     #[test]
     fn test_normalize_for_match_strips_section_numbering_trailing_dot() {
-        // Numeric multi-level prefix — the alphafold case.
+        // Numeric multi-level prefix — the alphafold case. (Output is
+        // case-folded as of CR-76.)
         assert_eq!(
             normalize_for_match("3.1. Approach 1: Fix model sizes"),
-            "3.1 Approach 1: Fix model sizes",
+            "3.1 approach 1: fix model sizes",
         );
         // Single-level numeric prefix.
         assert_eq!(
             normalize_for_match("5. Conclusion"),
-            "5 Conclusion",
+            "5 conclusion",
         );
         // Letter-then-optional-digit prefix (appendix style).
         assert_eq!(
             normalize_for_match("A. Appendix"),
-            "A Appendix",
+            "a appendix",
         );
         assert_eq!(
             normalize_for_match("B1. Detailed Notes"),
-            "B1 Detailed Notes",
+            "b1 detailed notes",
+        );
+    }
+
+    /// CR-76 (A): the match key is case-folded so an all-caps body header
+    /// matches its title-case outline entry. `"1 INTRODUCTION"` (crispr's
+    /// body rendering) must produce the same key as outline `"1 Introduction"`.
+    #[test]
+    fn test_normalize_for_match_case_folds_all_caps_header() {
+        assert_eq!(
+            normalize_for_match("1 INTRODUCTION"),
+            normalize_for_match("1 Introduction"),
+        );
+        assert_eq!(
+            normalize_for_match("7 CONCLUSION"),
+            normalize_for_match("7. Conclusion"),
         );
     }
 
@@ -1249,7 +1271,7 @@ mod tests {
         // Plain sentence — trailing period is not a section prefix.
         assert_eq!(
             normalize_for_match("This sentence ends in a period."),
-            "This sentence ends in a period.",
+            "this sentence ends in a period.",
         );
         // No whitespace after the prefix-shape dot → not a prefix
         // either (this is a numbered identifier, not a header).

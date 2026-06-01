@@ -71,13 +71,23 @@ const MIN_HEADER_TRAILING_RATIO: f32 = 0.15;
 /// Bold detection on a raw `FontClass`. CR-20: LaTeX PDFs encode bold in the
 /// font-family name ("…-Medi", "CMBX10") rather than CSS font-weight, so check
 /// both fields.
+///
+/// CR-75: the Linux Libertine/Biolinum families (the `libertine` LaTeX package,
+/// common in arXiv preprints) also report `font-weight: normal` for every cut
+/// and encode the weight purely in the family suffix — `…T` regular, `…TB`
+/// bold, `…TI` italic, `…TZ` display. The `TB` cut is the bold one, so a family
+/// ending in `tb` is bold. Without this, a whole Libertine-typeset paper has no
+/// bold signal at all and every body-size header fails the R3 gate.
 fn font_is_bold(style: &FontClass) -> bool {
     let weight = style.font_weight.to_lowercase();
     if weight.contains("bold") {
         return true;
     }
     let family = style.font_family.to_lowercase();
-    family.contains("bold") || family.contains("medi") || family.contains("bx")
+    family.contains("bold")
+        || family.contains("medi")
+        || family.contains("bx")
+        || family.ends_with("tb")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -613,7 +623,15 @@ impl<'a> SectionDetectionV2Rule<'a> {
         // versa) is body emphasis, not a structural element. Lifted above
         // the size/bold/isolation logic so it overrides R2's `bold OR
         // isolated` disjunct.
-        if self.has_same_y_bold_mismatch(element_idx) {
+        //
+        // CR-75: `bookmark_match` overrides this veto, consistent with CR-41
+        // (bookmark substitutes for isolation) and CR-43 (bookmark overrides
+        // the alpha-ratio gate) — the PDF outline naming a span as a section
+        // target is authoritative. Without the override, line-numbered drafts
+        // (e.g. FDA guidance) lose every header: the non-bold margin line-
+        // number shares the header's Y-line in the same leaf, so the genuine
+        // bold + bookmarked header reads as a same-Y bold mismatch and dies.
+        if !Self::has_bookmark_match(element) && self.has_same_y_bold_mismatch(element_idx) {
             return false;
         }
 
@@ -1596,6 +1614,46 @@ mod tests {
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
+    // ── CR-75 tests — bookmark bypasses the same-Y bold-mismatch veto ──────────
+
+    /// CR-75: a bold + bookmark-matched header sharing its Y-line in the same
+    /// leaf with a non-bold neighbour (the line-number gutter of a line-numbered
+    /// draft) still promotes. Without the bypass, `has_same_y_bold_mismatch`
+    /// hard-rejects it before R3 — the FDA-guidance failure mode.
+    #[test]
+    fn test_cr75_bookmark_bypasses_same_y_bold_mismatch() {
+        let body = 12.0;
+        // Body-size bold header (delta 0 → R3) with an authoritative bookmark.
+        let mut header = make_element(body, true, "body", 0);
+        header.bookmark_match = Some(BookmarkSection {
+            title: "Introduction".to_string(),
+            order: 0,
+            level: 1,
+        });
+        // Non-bold gutter line-number sharing the header's Y in the same leaf.
+        let gutter = make_neighbour(0);
+
+        let elements = vec![header, gutter];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-75 paired control — without `bookmark_match`, the same-Y bold-mismatch
+    /// veto still rejects. Confirms the bypass keys on the bookmark substrate,
+    /// preserving the original bold-in-paragraph guard.
+    #[test]
+    fn test_cr75_same_y_mismatch_still_rejects_without_bookmark() {
+        let body = 12.0;
+        let header = make_element(body, true, "body", 0); // bold, no bookmark
+        let gutter = make_neighbour(0);
+
+        let elements = vec![header, gutter];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
     // ── CR-20 tests — bold detection font-family fallback ─────────────────────
 
     /// Helper: build a PdfTextElement with explicit font_weight and font_family strings.
@@ -1653,6 +1711,29 @@ mod tests {
 
         let cmr = make_element_with_font(10.0, "normal", "CMR10", "body", 0);
         assert!(!SectionDetectionV2Rule::is_bold(&cmr));
+    }
+
+    /// CR-75 — Linux Libertine/Biolinum bold cut (`…TB`) detected as bold even
+    /// though Tika reports `font-weight: normal` for it (the crispr-review /
+    /// arXiv-libertine failure mode).
+    #[test]
+    fn test_cr75_libertine_biolinum_tb_is_bold() {
+        let biolinum = make_element_with_font(14.0, "normal", "LinBiolinumTB", "h1", 0);
+        assert!(SectionDetectionV2Rule::is_bold(&biolinum));
+
+        let libertine = make_element_with_font(9.0, "normal", "LinLibertineTB", "h2", 0);
+        assert!(SectionDetectionV2Rule::is_bold(&libertine));
+    }
+
+    /// CR-75 paired control — the regular (`…T`) and italic (`…TI`) cuts of the
+    /// same families are NOT bold, so the `TB` suffix rule stays surgical.
+    #[test]
+    fn test_cr75_libertine_regular_and_italic_not_bold() {
+        let regular = make_element_with_font(9.0, "normal", "LinLibertineT", "body", 0);
+        assert!(!SectionDetectionV2Rule::is_bold(&regular));
+
+        let italic = make_element_with_font(9.0, "normal", "LinLibertineTI", "body", 0);
+        assert!(!SectionDetectionV2Rule::is_bold(&italic));
     }
 
     // ── V3 leaf-based isolation tests ─────────────────────────────────────────
