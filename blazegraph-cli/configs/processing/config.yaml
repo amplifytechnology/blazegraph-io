@@ -57,6 +57,12 @@ graph_sanity:
       prune_on_detection: true
       emit_evidence_artifact: false
 
+    # CR-78 Phase B — confidence floor. Demote Sections whose detection-time
+    # confidence is below this (after the CR-71 prune, before the CR-70 rebalance).
+    # 0 = off (baseline). The per-doc precision lever for over-detected docs —
+    # set per-doc by the config picker, not as a global default.
+    min_confidence: 0
+
     # CR-70 topology rebalance (runs last). Sb8: document_title_nesting nests the
     # body under its title (largest-font level-1 section); the caps are 4/5 (was
     # 3/4) so the added title level keeps deep X.Y.Z sections distinct.

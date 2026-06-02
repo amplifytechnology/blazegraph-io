@@ -1260,6 +1260,18 @@ pub struct GraphSanityInvariants {
     /// artifact.
     #[serde(default)]
     pub section_prune: SectionPruneConfig,
+
+    /// CR-78 Phase B — confidence floor. Demote every Section whose detection-time
+    /// `confidence` (CR-78 size-spine + marker bonuses) is below this value, in the
+    /// mutator slot after the CR-71 prune and before the CR-70 rebalance (topology
+    /// rebuilt over survivors). `0` = off (default; baseline behavior). The per-doc
+    /// precision lever for over-detected docs — meant to be set per-doc by the
+    /// config picker, NOT as a global default: a global high floor erases the
+    /// low-confidence-but-real RFC/paper subsections (see the Sb LOGBOOK
+    /// confidence-landing analysis — TP vs FP separates only in the over-detecting
+    /// genres).
+    #[serde(default)]
+    pub min_confidence: u8,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).

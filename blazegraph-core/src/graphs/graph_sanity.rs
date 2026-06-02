@@ -175,6 +175,30 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         }
     }
 
+    // ── CR-78 Phase B — confidence floor filter. ──
+    // Demote every Section whose detection-time confidence (CR-78 size-spine +
+    // marker bonuses) is below `min_confidence`, in the same mutator slot as the
+    // CR-71 prune and before the CR-70 rebalance (which rebuilds parent/child/depth
+    // over the survivors). Default 0 = off (baseline). The per-doc precision lever
+    // for the over-detection genres: their FP noise sits at low confidence (R3
+    // body-size, no corroborating marker) while real headers carry the
+    // bookmark / numbered / large-font bonuses.
+    let min_conf = config.invariants.min_confidence;
+    if min_conf > 0 {
+        let mut demoted = 0usize;
+        for n in graph.nodes.values_mut() {
+            if n.node_type == "Section" && n.confidence < min_conf {
+                n.node_type = "Paragraph".to_string();
+                demoted += 1;
+            }
+        }
+        if demoted > 0 {
+            eprintln!(
+                "🎚️  CR-78 min_confidence={min_conf}: demoted {demoted} low-confidence sections"
+            );
+        }
+    }
+
     // CR-70 — topology rebalance runs LAST, after all node_type demotions have
     // settled. It rebuilds parent/child/depth from the surviving node set.
     let tr = &config.invariants.topology_rebalance;
@@ -2089,6 +2113,36 @@ mod tests {
     /// list position; initial `parent`/`children`/`depth` come from each spec
     /// so we can simulate post-demotion stale topology. Returns the graph plus
     /// the node ids in list order.
+    /// CR-78 Phase B — the `min_confidence` filter demotes Sections scoring below
+    /// the threshold (mutator slot before the CR-70 rebalance); default 0 is a
+    /// no-op. Confidence is assigned at detection (section_detection_v2); here we
+    /// stamp it directly to isolate the filter.
+    #[test]
+    fn cr78_min_confidence_demotes_below_threshold() {
+        let specs = [
+            NodeSpec { node_type: "Section", text: "high-conf header", font_family: None, font_size: None, depth: 1, parent_idx: None },
+            NodeSpec { node_type: "Section", text: "low-conf noise",   font_family: None, font_size: None, depth: 1, parent_idx: None },
+        ];
+
+        // Default (min_confidence = 0) is a no-op: both stay Sections.
+        let (mut g0, _r0, ids0) = make_rebalance_graph(&specs);
+        g0.nodes.get_mut(&ids0[0]).unwrap().confidence = 6;
+        g0.nodes.get_mut(&ids0[1]).unwrap().confidence = 3;
+        apply(&mut g0, &rebalance_only_config(3, 4));
+        assert_eq!(g0.nodes[&ids0[0]].node_type, "Section");
+        assert_eq!(g0.nodes[&ids0[1]].node_type, "Section", "min_confidence=0 must not demote");
+
+        // min_confidence = 4: the conf-3 section demotes, the conf-6 survives.
+        let (mut g1, _r1, ids1) = make_rebalance_graph(&specs);
+        g1.nodes.get_mut(&ids1[0]).unwrap().confidence = 6;
+        g1.nodes.get_mut(&ids1[1]).unwrap().confidence = 3;
+        let mut cfg = rebalance_only_config(3, 4);
+        cfg.invariants.min_confidence = 4;
+        apply(&mut g1, &cfg);
+        assert_eq!(g1.nodes[&ids1[0]].node_type, "Section", "conf 6 >= 4 survives");
+        assert_eq!(g1.nodes[&ids1[1]].node_type, "Paragraph", "conf 3 < 4 demoted");
+    }
+
     fn make_rebalance_graph(specs: &[NodeSpec]) -> (DocumentGraph, NodeId, Vec<NodeId>) {
         let root_id = Uuid::new_v4();
         let mut graph = DocumentGraph::new_with_root(root_id);
