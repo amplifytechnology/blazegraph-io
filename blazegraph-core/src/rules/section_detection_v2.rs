@@ -611,6 +611,13 @@ impl<'a> SectionDetectionV2Rule<'a> {
     ///
     /// Rotated elements are always rejected upfront (matches the Block 02
     /// statistical filter).
+    ///
+    /// CR-78 (Phase A): the admission decision (`bool`) is unchanged from the
+    /// pre-CR-78 logic — every gate, tier, and disjunct below is byte-for-byte
+    /// what shipped in Sb9. The boolean is the sole authority over promotion.
+    /// `classify` separately calls [`Self::compute_confidence`] for promoted
+    /// spans to derive the v2.4.0 `confidence` annotation; that score reads the
+    /// same signals but never gates admission (Phase A is annotation-only).
     fn classify_pass1(&self, element_idx: usize) -> bool {
         let element = &self.text_elements[element_idx];
 
@@ -690,6 +697,67 @@ impl<'a> SectionDetectionV2Rule<'a> {
         }
     }
 
+    /// CR-78 (Phase A) — confidence score for a promoted span.
+    ///
+    /// `confidence = size_spine + Σ marker_bonuses`, computed from the same
+    /// detection-time signals `classify_pass1` reads. This is a free-standing
+    /// annotation: it never gates admission (Phase A), it is only attached to
+    /// spans the boolean classifier already promoted.
+    ///
+    /// Size spine (the tier on `delta = font_size − body_size`):
+    /// - R1 (`font_size > region1_threshold`, i.e. `delta > margin`) → **3**
+    /// - R2 (`delta > tolerance`) → **2**
+    /// - R3 (`|delta| ≤ tolerance`) → **1**
+    ///
+    /// A span below body (`delta < −tolerance`) is a hard reject in
+    /// `classify_pass1` and never reaches here; we score it at the R3 floor (1)
+    /// defensively so callers from the post-detection promotion passes (which
+    /// may seed below-tier fragments) never see a 0 spine.
+    ///
+    /// Marker bonuses (CR-78 staircase; `numbered` outranks `bold`/`isolated`):
+    /// - `bookmark_match` **+3** · `numbered_prefix` **+2** · `isolated` **+1** · `bold` **+1**
+    ///
+    /// Range ~1–10. Point values are a defensible starting staircase, not yet
+    /// corpus-fit — the Phase-B sweep settles them (CR-78 calibration notes).
+    fn compute_confidence(&self, element_idx: usize) -> u8 {
+        let element = &self.text_elements[element_idx];
+
+        let cfg = &self.config.section_detection_v2;
+        let body_size = self.font_size_analysis.body_text_size;
+        let font_size = element.style_info.font_size;
+        let tolerance = cfg.font_size_tolerance;
+        let delta = font_size - body_size;
+
+        let region1_threshold = match cfg.structural_size_ratio {
+            Some(ratio) => body_size * ratio,
+            None => body_size + cfg.structural_size_margin,
+        };
+
+        // Size spine: same tier boundaries as `classify_pass1`.
+        let size_spine: u8 = if font_size > region1_threshold {
+            3 // R1
+        } else if delta > tolerance {
+            2 // R2
+        } else {
+            1 // R3 (and the below-body floor — see doc comment)
+        };
+
+        let mut confidence = size_spine;
+        if Self::has_bookmark_match(element) {
+            confidence += 3;
+        }
+        if NUMBERED_PREFIX_RE.is_match(&element.text) {
+            confidence += 2;
+        }
+        if self.is_isolated_in_leaf(element_idx) {
+            confidence += 1;
+        }
+        if Self::is_bold(element) {
+            confidence += 1;
+        }
+        confidence
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // Pass 2: Pattern refinement
     // ──────────────────────────────────────────────────────────────────────
@@ -764,12 +832,17 @@ impl<'a> SectionDetectionV2Rule<'a> {
     // Per-element classification
     // ──────────────────────────────────────────────────────────────────────
 
+    ///
+    /// CR-78 (Phase A): the third tuple element is the v2.4.0 `confidence`
+    /// annotation — non-zero only for spans classified as Section, `0` for any
+    /// non-Section element (no consumer reads it on non-Sections; emission
+    /// omits `0` so the wire stays byte-identical to pre-CR-78 for them).
     fn classify(
         &self,
         element_idx: usize,
         hierarchy_context: &mut HierarchyContext,
         current_element: &ParsedPdfElement,
-    ) -> (ParsedElementType, u32) {
+    ) -> (ParsedElementType, u32, u8) {
         // Header / Footer / Margin elements are pre-classified at the
         // PdfTextElement → ParsedPdfElement boundary from
         // `placement.region_label` (Block 07). Skip section detection on them
@@ -780,7 +853,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
             ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
         ) {
             let content_level = hierarchy_context.get_content_level();
-            return (current_element.element_type.clone(), content_level);
+            return (current_element.element_type.clone(), content_level, 0);
         }
 
         let element = &self.text_elements[element_idx];
@@ -799,10 +872,13 @@ impl<'a> SectionDetectionV2Rule<'a> {
                 keyword,
                 &self.config.section_detection_v2,
             );
-            (ParsedElementType::Section, level)
+            // CR-78: annotate the promoted span with its confidence. Computed
+            // here (not gating) from the same signals classify_pass1 reads.
+            let confidence = self.compute_confidence(element_idx);
+            (ParsedElementType::Section, level, confidence)
         } else {
             let content_level = hierarchy_context.get_content_level();
-            (current_element.element_type.clone(), content_level)
+            (current_element.element_type.clone(), content_level, 0)
         }
     }
 
@@ -822,16 +898,23 @@ impl<'a> SectionDetectionV2Rule<'a> {
     /// (e.g. an inline "Section N" cross-reference matched by the
     /// inclusion pattern), the surrounding fragments are body content and
     /// must not be promoted.
+    ///
+    /// CR-78 (Phase A): a fragment promoted here inherits the confidence of
+    /// the triggering Section on its line. Downstream NodeTypeClustering fuses
+    /// the fragments by taking the max confidence, so the fused node is at
+    /// least as confident as its strongest constituent. (Kept signal-free /
+    /// `&self`-free — the passes operate on the already-scored slice.)
     fn promote_same_line_section_fragments(out: &mut [ParsedPdfElement]) {
         use std::collections::HashMap;
 
         const Y_TOL: f32 = 3.0;
 
         // First: collect per-(page, leaf) the distinct Y-lines and the
-        // Section-bearing Y-line (if any) plus its hierarchy level.
+        // Section-bearing Y-line (if any) plus its hierarchy level and
+        // confidence (CR-78).
         struct LeafInfo {
             y_lines: Vec<f32>,
-            section_y: Option<(f32, u32)>,
+            section_y: Option<(f32, u32, u8)>,
         }
         let mut leaves: HashMap<(u32, String), LeafInfo> = HashMap::new();
 
@@ -852,7 +935,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
                 info.y_lines.push(y);
             }
             if el.element_type == ParsedElementType::Section && info.section_y.is_none() {
-                info.section_y = Some((y, el.hierarchy_level));
+                info.section_y = Some((y, el.hierarchy_level, el.confidence));
             }
         }
 
@@ -875,13 +958,16 @@ impl<'a> SectionDetectionV2Rule<'a> {
             if info.y_lines.len() != 1 {
                 continue;
             }
-            let Some((sy, level)) = info.section_y else {
+            let Some((sy, level, section_conf)) = info.section_y else {
                 continue;
             };
             let y = p.bounding_box.y;
             if (sy - y).abs() < Y_TOL {
                 el.element_type = ParsedElementType::Section;
                 el.hierarchy_level = level;
+                // CR-78: inherit the triggering Section's confidence (max with
+                // any score already on this fragment from a prior pass).
+                el.confidence = el.confidence.max(section_conf);
             }
         }
     }
@@ -918,11 +1004,13 @@ impl<'a> SectionDetectionV2Rule<'a> {
             .map(|(i, _)| i)
             .collect();
 
-        // Collect (neighbor_idx, hierarchy_level) to promote. Defer the
-        // mutation until after the scan so a section at index N can't
-        // promote its left neighbor and then have that newly-Section
+        // Collect (neighbor_idx, hierarchy_level, confidence) to promote.
+        // Defer the mutation until after the scan so a section at index N
+        // can't promote its left neighbor and then have that newly-Section
         // neighbor re-trigger promotion of index N-2 in the same pass.
-        let mut to_promote: Vec<(usize, u32)> = Vec::new();
+        // CR-78: carry the triggering Section's confidence so the promoted
+        // fragment inherits it (the fused node downstream takes the max).
+        let mut to_promote: Vec<(usize, u32, u8)> = Vec::new();
 
         for &si in &section_indices {
             let section = &elements[si];
@@ -932,6 +1020,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
             let s_class = &section.style_info.class_name;
             let s_height = s_place.bounding_box.height;
             let s_level = section.hierarchy_level;
+            let s_confidence = section.confidence;
 
             for &offset in &[-1i32, 1i32] {
                 let ni = match (si as i32).checked_add(offset) {
@@ -963,11 +1052,11 @@ impl<'a> SectionDetectionV2Rule<'a> {
                 if (n_height - s_height).abs() >= HEIGHT_TOL {
                     continue;
                 }
-                to_promote.push((ni, s_level));
+                to_promote.push((ni, s_level, s_confidence));
             }
         }
 
-        for (idx, level) in to_promote {
+        for (idx, level, confidence) in to_promote {
             // Re-check: a neighbor adjacent to two sections gets queued
             // twice; the first promotion makes the second a no-op. Also
             // honor the snapshot: don't overwrite a Section that was
@@ -975,6 +1064,9 @@ impl<'a> SectionDetectionV2Rule<'a> {
             if elements[idx].element_type != ParsedElementType::Section {
                 elements[idx].element_type = ParsedElementType::Section;
                 elements[idx].hierarchy_level = level;
+                // CR-78: inherit the triggering Section's confidence (max
+                // with any score already on this fragment).
+                elements[idx].confidence = elements[idx].confidence.max(confidence);
             }
         }
     }
@@ -1113,6 +1205,21 @@ impl<'a> SectionDetectionV2Rule<'a> {
             if out[i].element_type != ParsedElementType::Section {
                 out[i].element_type = ParsedElementType::Section;
                 out[i].hierarchy_level = level;
+                // CR-78: these are the body-size (R3) bold numbered seeds the
+                // size/isolation/bookmark gates all miss (CR-73/77 deep
+                // recall). Score from the signals visible on the slice: R3
+                // spine (1) + numbered_prefix (+2 on the leading fragment) +
+                // bold (+1, always true for promoted seeds). Mirrors
+                // `compute_confidence`'s R3 path without needing `&self`
+                // (body_size isn't on the slice; the pass's own premise is
+                // body-size typesetting → R3). Max-merged downstream so the
+                // numbered fragment lifts the fused node to its score.
+                let mut conf: u8 = 1; // R3 spine
+                if NUMBERED_PREFIX_RE.is_match(&out[i].text) {
+                    conf += 2;
+                }
+                conf += 1; // bold (gate above guarantees it)
+                out[i].confidence = out[i].confidence.max(conf);
             }
         }
     }
@@ -1144,6 +1251,9 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
                     bookmark_match: te.bookmark_match.clone(),
                     token_count: te.token_count,
                     links: vec![],
+                    // CR-78: bootstrapped elements start unscored; `classify`
+                    // assigns confidence to any it promotes to Section.
+                    confidence: 0,
                 })
                 .collect()
         } else {
@@ -1155,11 +1265,14 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
 
         for element in input_elements {
             if let Some(_te) = self.text_elements.get(element.position) {
-                let (new_type, new_level) =
+                let (new_type, new_level, confidence) =
                     self.classify(element.position, &mut hierarchy_context, &element);
                 out.push(ParsedPdfElement {
                     element_type: new_type,
                     hierarchy_level: new_level,
+                    // CR-78: confidence is the v2.4.0 annotation for promoted
+                    // Sections; 0 for everything classify() left non-Section.
+                    confidence,
                     ..element
                 });
             } else {
@@ -1377,6 +1490,27 @@ mod tests {
         rule.classify_pass1(0)
     }
 
+    /// CR-78 — build a `SectionDetectionV2Rule` and call `compute_confidence`
+    /// on index 0 (mirrors the `classify` helper above for the boolean path).
+    fn confidence(
+        elements: &[PdfTextElement],
+        font_analysis: &FontSizeAnalysis,
+        config: &ParsingConfig,
+    ) -> u8 {
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            elements,
+            config,
+            &document_analysis,
+            font_analysis,
+            &style_data,
+        );
+        rule.compute_confidence(0)
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /// Test 1 — Region 1: auto-promotes without any confirming signals.
@@ -1507,6 +1641,102 @@ mod tests {
         let font_analysis = make_font_analysis(body, vec![("body", 100)]);
         let config = make_config(1.0, 5.0, None);
         assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    // ── CR-78 (Phase A) — confidence scoring ─────────────────────────────────
+    //
+    // `confidence = size_spine (R1=3 / R2=2 / R3=1) + Σ marker_bonuses`
+    // (bookmark +3, numbered +2, isolated +1, bold +1). These mirror the
+    // boolean R1/R2/R3 cases above so the expected score is read straight off
+    // the staircase. The score is annotation-only: it never gates admission.
+
+    /// R1 size-only span (mirrors `test_region1_auto_promotes_without_signals`):
+    /// delta = 16 − 10 = 6 > margin → R1 spine = 3. Non-bold, isolated (alone
+    /// on its line), non-numbered text ("Introduction"), no bookmark.
+    /// 3 (R1) + 1 (isolated) = 4.
+    #[test]
+    fn test_cr78_confidence_r1_size_only_isolated() {
+        let body = 10.0;
+        let elements = vec![make_element(16.0, false, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 4);
+    }
+
+    /// R2 bold span (mirrors `test_region2_bold_alone_promotes`):
+    /// delta = 13 − 10 = 3 → tolerance(1) < 3 ≤ margin(5) → R2 spine = 2.
+    /// Bold (+1) + isolated (+1, alone on its line). 2 + 1 + 1 = 4.
+    #[test]
+    fn test_cr78_confidence_r2_bold_isolated() {
+        let body = 10.0;
+        let elements = vec![make_element(13.0, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 4);
+    }
+
+    /// R3 body-size bold isolated span (mirrors
+    /// `test_region3_isolated_and_bold_promotes`): |delta| = 0.5 ≤ tolerance
+    /// → R3 spine = 1. Bold (+1) + isolated (+1). 1 + 1 + 1 = 3.
+    #[test]
+    fn test_cr78_confidence_r3_bold_isolated() {
+        let body = 10.0;
+        let elements = vec![make_element(10.5, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 3);
+    }
+
+    /// R3 bookmarked + numbered span (the CR-73/77 deep-recall case the +2 / +3
+    /// bonuses protect): body-size → R3 spine = 1. Text "10.1. Idle Timeout"
+    /// matches `NUMBERED_PREFIX_RE` (+2), bookmark_match (+3), bold (+1),
+    /// isolated (+1, alone on its line). 1 + 2 + 3 + 1 + 1 = 8.
+    #[test]
+    fn test_cr78_confidence_r3_bookmark_numbered_bold_isolated() {
+        let body = 12.0;
+        let mut element = make_element(body, true, "body", 0);
+        element.text = "10.1. Idle Timeout".to_string();
+        element.bookmark_match = Some(BookmarkSection {
+            title: "10.1. Idle Timeout".to_string(),
+            order: 75,
+            level: 3,
+        });
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 8);
+    }
+
+    /// R1 with every marker: the staircase ceiling. delta = 20 − 10 = 10 > margin
+    /// → R1 spine = 3. Numbered text (+2), bookmark (+3), bold (+1), isolated
+    /// (+1). 3 + 2 + 3 + 1 + 1 = 10.
+    #[test]
+    fn test_cr78_confidence_r1_all_markers_ceiling() {
+        let body = 10.0;
+        let mut element = make_element(20.0, true, "body", 0);
+        element.text = "1. Introduction".to_string();
+        element.bookmark_match = Some(BookmarkSection {
+            title: "1. Introduction".to_string(),
+            order: 0,
+            level: 1,
+        });
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 10);
+    }
+
+    /// `structural_size_ratio` override path: R1 threshold is `body * ratio`
+    /// rather than `body + margin`. font 16, body 10, ratio 1.5 → threshold 15,
+    /// 16 > 15 → R1 spine = 3 (+1 isolated) = 4. Guards the confidence spine
+    /// against the same proportional-scale config the boolean path honors.
+    #[test]
+    fn test_cr78_confidence_r1_via_size_ratio() {
+        let body = 10.0;
+        let elements = vec![make_element(16.0, false, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, Some(1.5));
+        assert_eq!(confidence(&elements, &font_analysis, &config), 4);
     }
 
     /// CR-64 — Zero-width-bbox elements rejected at pass-1.
@@ -2622,6 +2852,7 @@ mod tests {
             bookmark_match: None,
             token_count: 1,
             links: vec![],
+            confidence: 0,
         }
     }
 
@@ -2655,6 +2886,7 @@ mod tests {
             bookmark_match: None,
             token_count: 1,
             links: vec![],
+            confidence: 0,
         }
     }
 

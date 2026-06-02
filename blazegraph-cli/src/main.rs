@@ -1016,6 +1016,7 @@ mod tests {
                     children: Vec::new(),
                     internal_refs: Vec::new(),
                     external_refs: Vec::new(),
+                    confidence: 0,
                 },
             );
         }
@@ -1042,6 +1043,7 @@ mod tests {
                 children: child_ids,
                 internal_refs: Vec::new(),
                 external_refs: Vec::new(),
+                confidence: 0,
             },
         );
         DocumentGraph {

@@ -326,6 +326,17 @@ fn merge_group(
         .flat_map(|el| el.links.iter().cloned())
         .collect();
 
+    // CR-78 (Phase A): the fused node's confidence is the max across the
+    // merged fragments — the merged Section is at least as confident as its
+    // strongest constituent (e.g. a "3.1" number fragment carrying
+    // R3+numbered fuses with its title fragment and the node keeps the higher
+    // score). Non-Section merges keep 0 (no fragment carries one).
+    let merged_confidence = sorted_elements
+        .iter()
+        .map(|el| el.confidence)
+        .max()
+        .unwrap_or(0);
+
     Some(ParsedPdfElement {
         element_type,
         text,
@@ -337,6 +348,7 @@ fn merge_group(
         bookmark_match,
         token_count: sum_tokens,
         links: merged_links,
+        confidence: merged_confidence,
     })
 }
 
@@ -558,6 +570,7 @@ mod tests {
             bookmark_match: None,
             token_count: 1,
             links: vec![],
+            confidence: 0,
         }
     }
 

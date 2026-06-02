@@ -323,6 +323,7 @@ mod tests {
                     children: Vec::new(),
                     internal_refs: vec![],
                     external_refs: vec![],
+                    confidence: 0,
                 },
             );
         }
@@ -350,6 +351,7 @@ mod tests {
                 children: child_ids,
                 internal_refs: vec![],
                 external_refs: vec![],
+                confidence: 0,
             },
         );
 

@@ -235,6 +235,13 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                 token_count: p.metadata.token_count,
                 internal_refs: vec![],
                 external_refs: vec![],
+                // CR-78 (v2.4.0): thread the parsed confidence back so the
+                // reconstructed graph re-emits byte-identically. (Unlike
+                // internal/external refs — which the parser currently drops
+                // because the round-trip tests only exercise empty refs —
+                // confidence is non-zero on real Section nodes, so it MUST
+                // round-trip to keep the canonical hash stable.)
+                confidence: p.metadata.confidence,
             }
             .validate(),
         );
@@ -544,6 +551,13 @@ struct NodeMetadata {
     /// forward-compat tolerance.
     #[serde(default)]
     external_refs: Vec<crate::types::ExternalRef>,
+    /// CR-78 (v2.4.0+): per-element detection confidence (Section nodes).
+    /// `#[serde(default)]` → `0` for pre-v2.4.0 fixtures and for non-Section
+    /// nodes (the emitter omits the field when `0`). Threaded back onto the
+    /// reconstructed `SemanticTreeElement.confidence` so re-emit is byte-
+    /// symmetric (the CR-57 round-trip invariant) for non-zero scores.
+    #[serde(default)]
+    confidence: u8,
     /// CR-45: per-element verbatim Tika style projection. `#[serde(default)]`
     /// makes the field tolerant of fixtures / hand-edited inputs that
     /// omit it (forward-compat with the spec's "tolerate absent optional
@@ -687,6 +701,7 @@ mod tests {
                     token_count: text.split_whitespace().count(),
                     internal_refs: vec![],
                     external_refs: vec![],
+                    confidence: 0,
                 }
             })
             .collect();

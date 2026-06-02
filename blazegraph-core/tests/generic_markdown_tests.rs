@@ -80,6 +80,7 @@ fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph
                 token_count: text.split_whitespace().count(),
                 internal_refs: vec![],
                 external_refs: vec![],
+                confidence: 0,
             }
         })
         .collect();

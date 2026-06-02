@@ -60,7 +60,11 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 ///
 /// The parser at [`bgraph_md::parse`] accepts every previous major's
 /// shape as well, per the dual-support contract (spec § Amendment H).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.3.0";
+///
+/// v2.4.0 (CR-78): additive — the per-element fence gains an optional
+/// `confidence: u8` field on Section nodes (detection-confidence
+/// annotation; omitted when `0`). No consumer reads it yet (Phase A).
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.4.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -158,6 +162,7 @@ mod tests {
                 children: vec![para_id],
                 internal_refs: vec![],
                 external_refs: vec![],
+                confidence: 0,
             },
         );
         nodes.insert(
@@ -183,6 +188,7 @@ mod tests {
                 children: Vec::new(),
                 internal_refs: vec![],
                 external_refs: vec![],
+                confidence: 0,
             },
         );
         let graph = DocumentGraph {

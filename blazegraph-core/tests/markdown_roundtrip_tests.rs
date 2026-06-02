@@ -63,6 +63,7 @@ fn build_synthetic_graph(
                 token_count: text.split_whitespace().count(),
                 internal_refs: vec![],
                 external_refs: vec![],
+                confidence: 0,
             }
         })
         .collect();
@@ -137,6 +138,10 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
                 token_count: n.token_count,
                 internal_refs: vec![],
                 external_refs: vec![],
+                // CR-78: carry the fixture node's confidence so a regenerated
+                // (v2.4.0) fixture round-trips faithfully. Pre-CR-78 fixtures
+                // carry 0 (the serde default).
+                confidence: n.confidence,
             }
         })
         .collect();
@@ -240,6 +245,56 @@ fn roundtrip_identity_synthetic_small() {
         None,
     );
     assert_roundtrip_identity(&original);
+}
+
+#[test]
+fn roundtrip_identity_confidence_field_survives() {
+    // CR-78 (v2.4.0): a Section node carrying a non-zero `confidence` must
+    // round-trip byte-identically through emit → parse. (Unlike the refs vecs
+    // — which the parser drops because the round-trip tests only ever exercise
+    // empty refs — confidence is non-zero on real Sections, so it must be
+    // threaded back on parse for the canonical hash to match.)
+    let mut original = build_synthetic_graph(
+        vec![
+            ("Section", "Introduction", 1, 0),
+            ("Paragraph", "Hello world.", 1, 1),
+        ],
+        Some("Confidence Round-trip Doc"),
+        None,
+    );
+    // Stamp a confidence on the Section node, then recompute the hash so the
+    // doc-level block embeds the post-stamp graph_sha256.
+    let section_id = original
+        .nodes
+        .values()
+        .find(|n| n.node_type == "Section")
+        .expect("synthetic graph has a Section")
+        .id;
+    original
+        .nodes
+        .get_mut(&section_id)
+        .unwrap()
+        .confidence = 7;
+
+    // `assert_roundtrip_identity` asserts graph_sha256(original) ==
+    // graph_sha256(parsed); the embedded confidence is part of the canonical
+    // hash, so a Verified identity already proves the field survived.
+    let parsed = assert_roundtrip_identity(&original);
+
+    // Spot-check the value directly: the parsed Section keeps confidence 7;
+    // the Paragraph stays 0 (omitted from the wire, defaulted on parse).
+    let parsed_section = parsed
+        .nodes
+        .values()
+        .find(|n| n.node_type == "Section")
+        .expect("parsed graph has a Section");
+    assert_eq!(parsed_section.confidence, 7);
+    let parsed_para = parsed
+        .nodes
+        .values()
+        .find(|n| n.node_type == "Paragraph")
+        .expect("parsed graph has a Paragraph");
+    assert_eq!(parsed_para.confidence, 0);
 }
 
 #[test]
