@@ -57,6 +57,9 @@ impl<'a> ParseRule for SectionAndHierarchyDetectionRule<'a> {
                         bookmark_match: text_element.bookmark_match.clone(),
                         token_count: text_element.token_count,
                         links: vec![],
+                        // CR-78: the legacy V1 rule does not compute the
+                        // confidence annotation (V2 is the active classifier).
+                        confidence: 0,
                     }
                 })
                 .collect()

@@ -540,6 +540,9 @@ impl RuleEngine {
                 bookmark_match: text_element.bookmark_match.clone(),
                 token_count: text_element.token_count,
                 links,
+                // CR-78: elements enter the rule pipeline unscored; the section
+                // detection rule assigns confidence to spans it promotes.
+                confidence: 0,
             };
 
             elements.push(parsed_element);

@@ -51,6 +51,52 @@ use crate::config::{ParsingConfig, SectionDetectionV2Config};
 use crate::types::*;
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Sb8 — leading multi-level numbering token ("3.5.2", "4.1"): at least one dot,
+/// so single-level list markers ("1.", "2.") never match. Used by
+/// `promote_numbered_line_seeds`.
+static NUMBERED_SEED_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)+)").unwrap());
+
+/// CR-77 (experiment) — line-leading single-level list/section marker:
+/// decimal (`1.`, `1.1.`) or a single letter (`A.`, `a.`) followed by a dot
+/// and whitespace. Unlike NUMBERED_SEED_REGEX this DOES match single-level
+/// markers — it's the structural-atom guard on the bookmark-only R3 path, not
+/// a standalone seed.
+static NUMBERED_PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\d+(?:\.\d+)*|[A-Za-z])\.\s").unwrap());
+
+/// Minimum trailing-whitespace fraction (column right edge − line right edge,
+/// over column width) for a numbered line to seed a section. A real header
+/// occupies only part of the column and leaves whitespace to the right; a TOC
+/// entry (title + dotted leader + page number) or a body/table line fills the
+/// column. Measured corpus separation is wide: real headers leave ≥ 0.23 of
+/// the column trailing, TOC lines ≈ 0.01 — so 0.15 keeps every real header
+/// (incl. long deep ones) with margin while dropping full-width lines.
+const MIN_HEADER_TRAILING_RATIO: f32 = 0.15;
+
+/// Bold detection on a raw `FontClass`. CR-20: LaTeX PDFs encode bold in the
+/// font-family name ("…-Medi", "CMBX10") rather than CSS font-weight, so check
+/// both fields.
+///
+/// CR-75: the Linux Libertine/Biolinum families (the `libertine` LaTeX package,
+/// common in arXiv preprints) also report `font-weight: normal` for every cut
+/// and encode the weight purely in the family suffix — `…T` regular, `…TB`
+/// bold, `…TI` italic, `…TZ` display. The `TB` cut is the bold one, so a family
+/// ending in `tb` is bold. Without this, a whole Libertine-typeset paper has no
+/// bold signal at all and every body-size header fails the R3 gate.
+fn font_is_bold(style: &FontClass) -> bool {
+    let weight = style.font_weight.to_lowercase();
+    if weight.contains("bold") {
+        return true;
+    }
+    let family = style.font_family.to_lowercase();
+    family.contains("bold")
+        || family.contains("medi")
+        || family.contains("bx")
+        || family.ends_with("tb")
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HierarchyContext (CR-27: stack-based with keyword tiebreaker)
@@ -393,12 +439,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
     /// Common patterns: "NimbusRomNo9L-Medi" (contains "medi"), "CMBX10" (contains "bx").
     /// We check both fields to catch both CSS-based and LaTeX-encoded bold.
     fn is_bold(element: &PdfTextElement) -> bool {
-        let weight = element.style_info.font_weight.to_lowercase();
-        if weight.contains("bold") {
-            return true;
-        }
-        let family = element.style_info.font_family.to_lowercase();
-        family.contains("bold") || family.contains("medi") || family.contains("bx")
+        font_is_bold(&element.style_info)
     }
 
     /// CR-41: Whether the XHTML parser matched this span's normalized text
@@ -570,10 +611,25 @@ impl<'a> SectionDetectionV2Rule<'a> {
     ///
     /// Rotated elements are always rejected upfront (matches the Block 02
     /// statistical filter).
+    ///
+    /// CR-78 (Phase A): the admission decision (`bool`) is unchanged from the
+    /// pre-CR-78 logic — every gate, tier, and disjunct below is byte-for-byte
+    /// what shipped in Sb9. The boolean is the sole authority over promotion.
+    /// `classify` separately calls [`Self::compute_confidence`] for promoted
+    /// spans to derive the v2.4.0 `confidence` annotation; that score reads the
+    /// same signals but never gates admission (Phase A is annotation-only).
     fn classify_pass1(&self, element_idx: usize) -> bool {
         let element = &self.text_elements[element_idx];
 
         if element.rotation() != 0 {
+            return false;
+        }
+
+        // CR-64: Tika emits rotated text as per-glyph zero-width spans on
+        // non-first pages (single-pass mode). Their projected vertical extent
+        // is recorded as font_size and would otherwise trip the structural-
+        // size gate. See DT-07.
+        if element.bounding_box().width == 0.0 {
             return false;
         }
 
@@ -582,7 +638,15 @@ impl<'a> SectionDetectionV2Rule<'a> {
         // versa) is body emphasis, not a structural element. Lifted above
         // the size/bold/isolation logic so it overrides R2's `bold OR
         // isolated` disjunct.
-        if self.has_same_y_bold_mismatch(element_idx) {
+        //
+        // CR-75: `bookmark_match` overrides this veto, consistent with CR-41
+        // (bookmark substitutes for isolation) and CR-43 (bookmark overrides
+        // the alpha-ratio gate) — the PDF outline naming a span as a section
+        // target is authoritative. Without the override, line-numbered drafts
+        // (e.g. FDA guidance) lose every header: the non-bold margin line-
+        // number shares the header's Y-line in the same leaf, so the genuine
+        // bold + bookmarked header reads as a same-Y bold mismatch and dies.
+        if !Self::has_bookmark_match(element) && self.has_same_y_bold_mismatch(element_idx) {
             return false;
         }
 
@@ -621,8 +685,77 @@ impl<'a> SectionDetectionV2Rule<'a> {
         } else {
             // R3 (at-body band): bold required; isolation OR bookmark
             // match (CR-41) supplies the structural-atom signal.
+            //
+            // CR-77 (experiment): a non-bold numbered/lettered sub-item that
+            // bookmark-matches also promotes. On line-numbered / single-column
+            // drafts (FDA guidance) the XY-cut glues the header into the body
+            // leaf, so `isolated` is never true and the deep sub-items have no
+            // bold — but the outline names them and the line-leading marker is
+            // the standalone-atom signal that isolation would otherwise carry.
             bold && (isolated || bookmark_promoted)
+                || (bookmark_promoted && NUMBERED_PREFIX_RE.is_match(&element.text))
         }
+    }
+
+    /// CR-78 (Phase A) — confidence score for a promoted span.
+    ///
+    /// `confidence = size_spine + Σ marker_bonuses`, computed from the same
+    /// detection-time signals `classify_pass1` reads. This is a free-standing
+    /// annotation: it never gates admission (Phase A), it is only attached to
+    /// spans the boolean classifier already promoted.
+    ///
+    /// Size spine (the tier on `delta = font_size − body_size`):
+    /// - R1 (`font_size > region1_threshold`, i.e. `delta > margin`) → **3**
+    /// - R2 (`delta > tolerance`) → **2**
+    /// - R3 (`|delta| ≤ tolerance`) → **1**
+    ///
+    /// A span below body (`delta < −tolerance`) is a hard reject in
+    /// `classify_pass1` and never reaches here; we score it at the R3 floor (1)
+    /// defensively so callers from the post-detection promotion passes (which
+    /// may seed below-tier fragments) never see a 0 spine.
+    ///
+    /// Marker bonuses (CR-78 staircase; `numbered` outranks `bold`/`isolated`):
+    /// - `bookmark_match` **+3** · `numbered_prefix` **+2** · `isolated` **+1** · `bold` **+1**
+    ///
+    /// Range ~1–10. Point values are a defensible starting staircase, not yet
+    /// corpus-fit — the Phase-B sweep settles them (CR-78 calibration notes).
+    fn compute_confidence(&self, element_idx: usize) -> u8 {
+        let element = &self.text_elements[element_idx];
+
+        let cfg = &self.config.section_detection_v2;
+        let body_size = self.font_size_analysis.body_text_size;
+        let font_size = element.style_info.font_size;
+        let tolerance = cfg.font_size_tolerance;
+        let delta = font_size - body_size;
+
+        let region1_threshold = match cfg.structural_size_ratio {
+            Some(ratio) => body_size * ratio,
+            None => body_size + cfg.structural_size_margin,
+        };
+
+        // Size spine: same tier boundaries as `classify_pass1`.
+        let size_spine: u8 = if font_size > region1_threshold {
+            3 // R1
+        } else if delta > tolerance {
+            2 // R2
+        } else {
+            1 // R3 (and the below-body floor — see doc comment)
+        };
+
+        let mut confidence = size_spine;
+        if Self::has_bookmark_match(element) {
+            confidence += 3;
+        }
+        if NUMBERED_PREFIX_RE.is_match(&element.text) {
+            confidence += 2;
+        }
+        if self.is_isolated_in_leaf(element_idx) {
+            confidence += 1;
+        }
+        if Self::is_bold(element) {
+            confidence += 1;
+        }
+        confidence
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -699,12 +832,17 @@ impl<'a> SectionDetectionV2Rule<'a> {
     // Per-element classification
     // ──────────────────────────────────────────────────────────────────────
 
+    ///
+    /// CR-78 (Phase A): the third tuple element is the v2.4.0 `confidence`
+    /// annotation — non-zero only for spans classified as Section, `0` for any
+    /// non-Section element (no consumer reads it on non-Sections; emission
+    /// omits `0` so the wire stays byte-identical to pre-CR-78 for them).
     fn classify(
         &self,
         element_idx: usize,
         hierarchy_context: &mut HierarchyContext,
         current_element: &ParsedPdfElement,
-    ) -> (ParsedElementType, u32) {
+    ) -> (ParsedElementType, u32, u8) {
         // Header / Footer / Margin elements are pre-classified at the
         // PdfTextElement → ParsedPdfElement boundary from
         // `placement.region_label` (Block 07). Skip section detection on them
@@ -715,7 +853,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
             ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
         ) {
             let content_level = hierarchy_context.get_content_level();
-            return (current_element.element_type.clone(), content_level);
+            return (current_element.element_type.clone(), content_level, 0);
         }
 
         let element = &self.text_elements[element_idx];
@@ -734,10 +872,13 @@ impl<'a> SectionDetectionV2Rule<'a> {
                 keyword,
                 &self.config.section_detection_v2,
             );
-            (ParsedElementType::Section, level)
+            // CR-78: annotate the promoted span with its confidence. Computed
+            // here (not gating) from the same signals classify_pass1 reads.
+            let confidence = self.compute_confidence(element_idx);
+            (ParsedElementType::Section, level, confidence)
         } else {
             let content_level = hierarchy_context.get_content_level();
-            (current_element.element_type.clone(), content_level)
+            (current_element.element_type.clone(), content_level, 0)
         }
     }
 
@@ -757,16 +898,23 @@ impl<'a> SectionDetectionV2Rule<'a> {
     /// (e.g. an inline "Section N" cross-reference matched by the
     /// inclusion pattern), the surrounding fragments are body content and
     /// must not be promoted.
+    ///
+    /// CR-78 (Phase A): a fragment promoted here inherits the confidence of
+    /// the triggering Section on its line. Downstream NodeTypeClustering fuses
+    /// the fragments by taking the max confidence, so the fused node is at
+    /// least as confident as its strongest constituent. (Kept signal-free /
+    /// `&self`-free — the passes operate on the already-scored slice.)
     fn promote_same_line_section_fragments(out: &mut [ParsedPdfElement]) {
         use std::collections::HashMap;
 
         const Y_TOL: f32 = 3.0;
 
         // First: collect per-(page, leaf) the distinct Y-lines and the
-        // Section-bearing Y-line (if any) plus its hierarchy level.
+        // Section-bearing Y-line (if any) plus its hierarchy level and
+        // confidence (CR-78).
         struct LeafInfo {
             y_lines: Vec<f32>,
-            section_y: Option<(f32, u32)>,
+            section_y: Option<(f32, u32, u8)>,
         }
         let mut leaves: HashMap<(u32, String), LeafInfo> = HashMap::new();
 
@@ -787,7 +935,7 @@ impl<'a> SectionDetectionV2Rule<'a> {
                 info.y_lines.push(y);
             }
             if el.element_type == ParsedElementType::Section && info.section_y.is_none() {
-                info.section_y = Some((y, el.hierarchy_level));
+                info.section_y = Some((y, el.hierarchy_level, el.confidence));
             }
         }
 
@@ -810,13 +958,268 @@ impl<'a> SectionDetectionV2Rule<'a> {
             if info.y_lines.len() != 1 {
                 continue;
             }
-            let Some((sy, level)) = info.section_y else {
+            let Some((sy, level, section_conf)) = info.section_y else {
                 continue;
             };
             let y = p.bounding_box.y;
             if (sy - y).abs() < Y_TOL {
                 el.element_type = ParsedElementType::Section;
                 el.hierarchy_level = level;
+                // CR-78: inherit the triggering Section's confidence (max with
+                // any score already on this fragment from a prior pass).
+                el.confidence = el.confidence.max(section_conf);
+            }
+        }
+    }
+
+    /// CR-67 Part B — Promote section-fragment neighbors.
+    ///
+    /// For each Section, examine source-order ±1 neighbors. Promote a
+    /// non-Section neighbor to Section iff:
+    ///   (a) `neighbor.style_info.class_name == section.style_info.class_name`
+    ///   (b) `|neighbor.bbox.height - section.bbox.height| < HEIGHT_TOL` (= 2.0)
+    ///
+    /// NodeTypeClustering downstream fuses adjacent same-type elements —
+    /// a promoted `"**1.1.**"` Paragraph plus its existing
+    /// `"**Document Structure**"` Section neighbor coalesce into a single
+    /// `"**1.1. Document Structure**"` Section node.
+    ///
+    /// The height gate is load-bearing. A naive same-class rule would
+    /// promote cluster-bloated Paragraphs (e.g. an `h=256` merged-title-
+    /// and-body blob next to an `h=10.5` true Section). After
+    /// NodeTypeClustering fused those, CR-65 (`graph_sanity` height
+    /// bound) would demote the resulting 266pt-tall "Section" back to
+    /// Paragraph — losing both the true Section AND any other Section
+    /// that got fused with the bloat. The 2pt tolerance keeps promotion
+    /// to true single-line same-class fragments only.
+    pub fn promote_section_fragments(elements: &mut [ParsedPdfElement]) {
+        const HEIGHT_TOL: f32 = 2.0;
+
+        // Collect indices of Section elements (snapshot before mutation so
+        // we don't cascade-promote through a chain in a single pass).
+        let section_indices: Vec<usize> = elements
+            .iter()
+            .enumerate()
+            .filter(|(_, el)| el.element_type == ParsedElementType::Section)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Collect (neighbor_idx, hierarchy_level, confidence) to promote.
+        // Defer the mutation until after the scan so a section at index N
+        // can't promote its left neighbor and then have that newly-Section
+        // neighbor re-trigger promotion of index N-2 in the same pass.
+        // CR-78: carry the triggering Section's confidence so the promoted
+        // fragment inherits it (the fused node downstream takes the max).
+        let mut to_promote: Vec<(usize, u32, u8)> = Vec::new();
+
+        for &si in &section_indices {
+            let section = &elements[si];
+            let Some(s_place) = section.placement.as_ref() else {
+                continue;
+            };
+            let s_class = &section.style_info.class_name;
+            let s_height = s_place.bounding_box.height;
+            let s_level = section.hierarchy_level;
+            let s_confidence = section.confidence;
+
+            for &offset in &[-1i32, 1i32] {
+                let ni = match (si as i32).checked_add(offset) {
+                    Some(n) if n >= 0 && (n as usize) < elements.len() => n as usize,
+                    _ => continue,
+                };
+                let neighbor = &elements[ni];
+                if neighbor.element_type == ParsedElementType::Section {
+                    continue;
+                }
+                // Header / Footer / Margin are pre-classified from region
+                // labels — never overwrite them. (Aligns with the
+                // `classify` early-out at the top of this module.)
+                if matches!(
+                    neighbor.element_type,
+                    ParsedElementType::Header
+                        | ParsedElementType::Footer
+                        | ParsedElementType::Margin
+                ) {
+                    continue;
+                }
+                if &neighbor.style_info.class_name != s_class {
+                    continue;
+                }
+                let Some(n_place) = neighbor.placement.as_ref() else {
+                    continue;
+                };
+                let n_height = n_place.bounding_box.height;
+                if (n_height - s_height).abs() >= HEIGHT_TOL {
+                    continue;
+                }
+                to_promote.push((ni, s_level, s_confidence));
+            }
+        }
+
+        for (idx, level, confidence) in to_promote {
+            // Re-check: a neighbor adjacent to two sections gets queued
+            // twice; the first promotion makes the second a no-op. Also
+            // honor the snapshot: don't overwrite a Section that was
+            // already there (defensive — section_indices excluded these).
+            if elements[idx].element_type != ParsedElementType::Section {
+                elements[idx].element_type = ParsedElementType::Section;
+                elements[idx].hierarchy_level = level;
+                // CR-78: inherit the triggering Section's confidence (max
+                // with any score already on this fragment).
+                elements[idx].confidence = elements[idx].confidence.max(confidence);
+            }
+        }
+    }
+
+    /// Sb8 — Numbered subsection seed promotion.
+    ///
+    /// Deep RFC-style subsection headers ("3.5.2. Reset Generation") are
+    /// typeset at *body* font size, distinguished only by bold weight, and
+    /// Tika splits the number into its own span. They fail the size tiers
+    /// (delta ≈ 0 → R3), R3's isolation gate (the one-line header shares an
+    /// XY-cut leaf with the body paragraph below it), and bookmark-match (the
+    /// number-only span doesn't equal the full outline title). Result: depth-3+
+    /// subsections detect at < 20% while depth-1/2 detect at ~100%.
+    ///
+    /// This seeds them off the one signal the leaf can't corrupt: a **bold,
+    /// line-leading multi-level-numbering segment** ("N.M[.K…]"). Every bold
+    /// segment on such a line is promoted to Section at the numbering depth;
+    /// `promote_section_fragments` + NodeTypeClustering then fuse the number and
+    /// title into one node. Anchoring on the visual line `(page, Y)` rather than
+    /// the leaf sidesteps the isolation failure by construction — the body
+    /// paragraph is a different Y-line and is never swept in.
+    ///
+    /// Guards keep it strictly additive and precise:
+    /// - fires only on a line with **no** existing Section (never disturbs a
+    ///   size/bookmark-detected header or its assigned depth);
+    /// - the leading segment must be **bold** — excludes TOC entries (normal
+    ///   weight) and inline cross-references (not line-leading);
+    /// - the line must carry an alphabetic title (a bare number is not a header).
+    fn promote_numbered_line_seeds(out: &mut [ParsedPdfElement]) {
+        use std::collections::HashMap;
+        const Y_TOL: f32 = 3.0;
+
+        // Group element indices by visual line: (page, quantized-Y), and learn
+        // each page's content box (left/right text edge) for the trailing-
+        // whitespace filter. Skip furniture (Header/Footer/Margin).
+        let mut lines: HashMap<(u32, i64), Vec<usize>> = HashMap::new();
+        let mut page_right: HashMap<u32, f32> = HashMap::new();
+        let mut page_left: HashMap<u32, f32> = HashMap::new();
+        for (i, el) in out.iter().enumerate() {
+            if matches!(
+                el.element_type,
+                ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
+            ) {
+                continue;
+            }
+            let Some(p) = el.placement.as_ref() else {
+                continue;
+            };
+            let right = p.bounding_box.x + p.bounding_box.width;
+            page_right
+                .entry(p.page_number)
+                .and_modify(|v| *v = v.max(right))
+                .or_insert(right);
+            page_left
+                .entry(p.page_number)
+                .and_modify(|v| *v = v.min(p.bounding_box.x))
+                .or_insert(p.bounding_box.x);
+            let ybucket = (p.bounding_box.y / Y_TOL).round() as i64;
+            lines.entry((p.page_number, ybucket)).or_default().push(i);
+        }
+
+        let mut to_promote: Vec<(usize, u32)> = Vec::new();
+        for idxs in lines.values() {
+            // Purely additive: never touch a line that already has a Section.
+            if idxs
+                .iter()
+                .any(|&i| out[i].element_type == ParsedElementType::Section)
+            {
+                continue;
+            }
+            // Leftmost segment on the line.
+            let Some(&lead) = idxs.iter().min_by(|&&a, &&b| {
+                let xa = out[a].placement.as_ref().map_or(f32::MAX, |p| p.bounding_box.x);
+                let xb = out[b].placement.as_ref().map_or(f32::MAX, |p| p.bounding_box.x);
+                xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal)
+            }) else {
+                continue;
+            };
+
+            // Leading segment must be bold and start with a multi-level number.
+            if !font_is_bold(&out[lead].style_info) {
+                continue;
+            }
+            let Some(m) = NUMBERED_SEED_REGEX.find(out[lead].text.trim_start()) else {
+                continue;
+            };
+            // Numbering depth = component count ("3.5.2" → 3). Provisional —
+            // CR-70 rebalance recomputes depth from numbering; this only needs
+            // to be consistent across the line so the fragments share a bucket
+            // in the `same_depth`-keyed Section clustering merge.
+            let level = m.as_str().matches('.').count() as u32 + 1;
+
+            // The line must carry a *bold* alphabetic title, not just a bare
+            // number. Only bold segments get promoted, so a bold number beside a
+            // non-bold title (NIST AI-RMF subcategory rows: bold "1.4:" + normal
+            // description) would otherwise leave a titleless "1.4:" section.
+            let has_bold_title = idxs.iter().any(|&i| {
+                font_is_bold(&out[i].style_info)
+                    && out[i].text.chars().filter(|c| c.is_alphabetic()).count() >= 2
+            });
+            if !has_bold_title {
+                continue;
+            }
+
+            // Geometric TOC/body filter: a real header leaves whitespace to the
+            // right of the column; a TOC entry (leader + page number) or a
+            // body/table line fills it. Require a minimum trailing-whitespace
+            // fraction of the column width.
+            let page = out[lead].placement.as_ref().map_or(0, |p| p.page_number);
+            let line_right = idxs
+                .iter()
+                .map(|&i| {
+                    out[i]
+                        .placement
+                        .as_ref()
+                        .map_or(f32::MIN, |p| p.bounding_box.x + p.bounding_box.width)
+                })
+                .fold(f32::MIN, f32::max);
+            let (Some(&right), Some(&left)) = (page_right.get(&page), page_left.get(&page)) else {
+                continue;
+            };
+            let width = right - left;
+            if width <= 0.0 || (right - line_right) / width < MIN_HEADER_TRAILING_RATIO {
+                continue;
+            }
+
+            // Promote every bold segment on the line (number + title fragments).
+            for &i in idxs {
+                if font_is_bold(&out[i].style_info) {
+                    to_promote.push((i, level));
+                }
+            }
+        }
+
+        for (i, level) in to_promote {
+            if out[i].element_type != ParsedElementType::Section {
+                out[i].element_type = ParsedElementType::Section;
+                out[i].hierarchy_level = level;
+                // CR-78: these are the body-size (R3) bold numbered seeds the
+                // size/isolation/bookmark gates all miss (CR-73/77 deep
+                // recall). Score from the signals visible on the slice: R3
+                // spine (1) + numbered_prefix (+2 on the leading fragment) +
+                // bold (+1, always true for promoted seeds). Mirrors
+                // `compute_confidence`'s R3 path without needing `&self`
+                // (body_size isn't on the slice; the pass's own premise is
+                // body-size typesetting → R3). Max-merged downstream so the
+                // numbered fragment lifts the fused node to its score.
+                let mut conf: u8 = 1; // R3 spine
+                if NUMBERED_PREFIX_RE.is_match(&out[i].text) {
+                    conf += 2;
+                }
+                conf += 1; // bold (gate above guarantees it)
+                out[i].confidence = out[i].confidence.max(conf);
             }
         }
     }
@@ -848,6 +1251,9 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
                     bookmark_match: te.bookmark_match.clone(),
                     token_count: te.token_count,
                     links: vec![],
+                    // CR-78: bootstrapped elements start unscored; `classify`
+                    // assigns confidence to any it promotes to Section.
+                    confidence: 0,
                 })
                 .collect()
         } else {
@@ -859,11 +1265,14 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
 
         for element in input_elements {
             if let Some(_te) = self.text_elements.get(element.position) {
-                let (new_type, new_level) =
+                let (new_type, new_level, confidence) =
                     self.classify(element.position, &mut hierarchy_context, &element);
                 out.push(ParsedPdfElement {
                     element_type: new_type,
                     hierarchy_level: new_level,
+                    // CR-78: confidence is the v2.4.0 annotation for promoted
+                    // Sections; 0 for everything classify() left non-Section.
+                    confidence,
                     ..element
                 });
             } else {
@@ -876,6 +1285,13 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
             }
         }
 
+        // Sb8 — seed deep numbered subsections (RFC X.Y.Z) before the fragment
+        // passes, so the same-line / source-adjacent promotion + clustering fuse
+        // the number and title that the size/isolation/bookmark gates all miss.
+        if self.config.section_detection_v2.numbered_seed_promotion {
+            Self::promote_numbered_line_seeds(&mut out);
+        }
+
         // Same-Y same-(page, leaf) section promotion. Tika fragments a
         // single visual line into multiple PdfTextElements (e.g., the
         // section heading "3.1 Encoder and Decoder Stacks" emits two
@@ -885,6 +1301,16 @@ impl<'a> ParseRule for SectionDetectionV2Rule<'a> {
         // accepting its sibling. The fragments share a structural identity:
         // if one is a Section, all of them are. Promote them together.
         Self::promote_same_line_section_fragments(&mut out);
+
+        // CR-67 Part B — source-order ±1 fragment promotion. The same-Y
+        // pass above only fires for fragments sharing a single Y line
+        // within one leaf; numbered RFC headers fragmented across spans
+        // (e.g. `**1.1.**` at one Y followed by `**Document Structure**`
+        // at a slightly different Y) miss it. This walk uses source-order
+        // adjacency + same font-class + matching bbox-height as the
+        // signature, then lets NodeTypeClustering downstream fuse the
+        // adjacent same-type elements into a single Section node.
+        Self::promote_section_fragments(&mut out);
 
         let sections = out
             .iter()
@@ -1064,6 +1490,27 @@ mod tests {
         rule.classify_pass1(0)
     }
 
+    /// CR-78 — build a `SectionDetectionV2Rule` and call `compute_confidence`
+    /// on index 0 (mirrors the `classify` helper above for the boolean path).
+    fn confidence(
+        elements: &[PdfTextElement],
+        font_analysis: &FontSizeAnalysis,
+        config: &ParsingConfig,
+    ) -> u8 {
+        let engine = RuleEngine::new().expect("engine");
+        let document_analysis = make_document_analysis();
+        let style_data = make_style_data();
+        let rule = SectionDetectionV2Rule::new(
+            &engine,
+            elements,
+            config,
+            &document_analysis,
+            font_analysis,
+            &style_data,
+        );
+        rule.compute_confidence(0)
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /// Test 1 — Region 1: auto-promotes without any confirming signals.
@@ -1196,6 +1643,121 @@ mod tests {
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
+    // ── CR-78 (Phase A) — confidence scoring ─────────────────────────────────
+    //
+    // `confidence = size_spine (R1=3 / R2=2 / R3=1) + Σ marker_bonuses`
+    // (bookmark +3, numbered +2, isolated +1, bold +1). These mirror the
+    // boolean R1/R2/R3 cases above so the expected score is read straight off
+    // the staircase. The score is annotation-only: it never gates admission.
+
+    /// R1 size-only span (mirrors `test_region1_auto_promotes_without_signals`):
+    /// delta = 16 − 10 = 6 > margin → R1 spine = 3. Non-bold, isolated (alone
+    /// on its line), non-numbered text ("Introduction"), no bookmark.
+    /// 3 (R1) + 1 (isolated) = 4.
+    #[test]
+    fn test_cr78_confidence_r1_size_only_isolated() {
+        let body = 10.0;
+        let elements = vec![make_element(16.0, false, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 4);
+    }
+
+    /// R2 bold span (mirrors `test_region2_bold_alone_promotes`):
+    /// delta = 13 − 10 = 3 → tolerance(1) < 3 ≤ margin(5) → R2 spine = 2.
+    /// Bold (+1) + isolated (+1, alone on its line). 2 + 1 + 1 = 4.
+    #[test]
+    fn test_cr78_confidence_r2_bold_isolated() {
+        let body = 10.0;
+        let elements = vec![make_element(13.0, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 4);
+    }
+
+    /// R3 body-size bold isolated span (mirrors
+    /// `test_region3_isolated_and_bold_promotes`): |delta| = 0.5 ≤ tolerance
+    /// → R3 spine = 1. Bold (+1) + isolated (+1). 1 + 1 + 1 = 3.
+    #[test]
+    fn test_cr78_confidence_r3_bold_isolated() {
+        let body = 10.0;
+        let elements = vec![make_element(10.5, true, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 3);
+    }
+
+    /// R3 bookmarked + numbered span (the CR-73/77 deep-recall case the +2 / +3
+    /// bonuses protect): body-size → R3 spine = 1. Text "10.1. Idle Timeout"
+    /// matches `NUMBERED_PREFIX_RE` (+2), bookmark_match (+3), bold (+1),
+    /// isolated (+1, alone on its line). 1 + 2 + 3 + 1 + 1 = 8.
+    #[test]
+    fn test_cr78_confidence_r3_bookmark_numbered_bold_isolated() {
+        let body = 12.0;
+        let mut element = make_element(body, true, "body", 0);
+        element.text = "10.1. Idle Timeout".to_string();
+        element.bookmark_match = Some(BookmarkSection {
+            title: "10.1. Idle Timeout".to_string(),
+            order: 75,
+            level: 3,
+        });
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 8);
+    }
+
+    /// R1 with every marker: the staircase ceiling. delta = 20 − 10 = 10 > margin
+    /// → R1 spine = 3. Numbered text (+2), bookmark (+3), bold (+1), isolated
+    /// (+1). 3 + 2 + 3 + 1 + 1 = 10.
+    #[test]
+    fn test_cr78_confidence_r1_all_markers_ceiling() {
+        let body = 10.0;
+        let mut element = make_element(20.0, true, "body", 0);
+        element.text = "1. Introduction".to_string();
+        element.bookmark_match = Some(BookmarkSection {
+            title: "1. Introduction".to_string(),
+            order: 0,
+            level: 1,
+        });
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert_eq!(confidence(&elements, &font_analysis, &config), 10);
+    }
+
+    /// `structural_size_ratio` override path: R1 threshold is `body * ratio`
+    /// rather than `body + margin`. font 16, body 10, ratio 1.5 → threshold 15,
+    /// 16 > 15 → R1 spine = 3 (+1 isolated) = 4. Guards the confidence spine
+    /// against the same proportional-scale config the boolean path honors.
+    #[test]
+    fn test_cr78_confidence_r1_via_size_ratio() {
+        let body = 10.0;
+        let elements = vec![make_element(16.0, false, "body", 0)];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, Some(1.5));
+        assert_eq!(confidence(&elements, &font_analysis, &config), 4);
+    }
+
+    /// CR-64 — Zero-width-bbox elements rejected at pass-1.
+    ///
+    /// Tika emits rotated text on non-first pages as per-glyph zero-width
+    /// spans (e.g. a vertical "Parameters" y-axis label arrives as ten
+    /// single-letter spans at width=0.0, font_size 26pt — the projected
+    /// vertical extent). Without the guard those would be auto-promoted as
+    /// Region 1 candidates because 26 > body+margin.
+    #[test]
+    fn test_cr64_zero_width_bbox_is_rejected() {
+        let body = 10.0;
+        // Element that WOULD be Region 1 (big font) — but width=0 disqualifies.
+        let mut element = make_element(26.0, false, "body", 0);
+        element.placement.bounding_box.width = 0.0;
+        let elements = vec![element];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 5.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
     /// Test 11 — Proportional mode: structural_size_ratio overrides margin.
     /// ratio = Some(1.5), body = 10 → threshold = 15.
     /// 12pt: delta = 2 > tolerance 1, < threshold 15 → Region 2; bold + isolated → promoted.
@@ -1298,6 +1860,106 @@ mod tests {
         assert!(!classify(&elements, &font_analysis, &config));
     }
 
+    // ── CR-75 tests — bookmark bypasses the same-Y bold-mismatch veto ──────────
+
+    /// CR-75: a bold + bookmark-matched header sharing its Y-line in the same
+    /// leaf with a non-bold neighbour (the line-number gutter of a line-numbered
+    /// draft) still promotes. Without the bypass, `has_same_y_bold_mismatch`
+    /// hard-rejects it before R3 — the FDA-guidance failure mode.
+    #[test]
+    fn test_cr75_bookmark_bypasses_same_y_bold_mismatch() {
+        let body = 12.0;
+        // Body-size bold header (delta 0 → R3) with an authoritative bookmark.
+        let mut header = make_element(body, true, "body", 0);
+        header.bookmark_match = Some(BookmarkSection {
+            title: "Introduction".to_string(),
+            order: 0,
+            level: 1,
+        });
+        // Non-bold gutter line-number sharing the header's Y in the same leaf.
+        let gutter = make_neighbour(0);
+
+        let elements = vec![header, gutter];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-75 paired control — without `bookmark_match`, the same-Y bold-mismatch
+    /// veto still rejects. Confirms the bypass keys on the bookmark substrate,
+    /// preserving the original bold-in-paragraph guard.
+    #[test]
+    fn test_cr75_same_y_mismatch_still_rejects_without_bookmark() {
+        let body = 12.0;
+        let header = make_element(body, true, "body", 0); // bold, no bookmark
+        let gutter = make_neighbour(0);
+
+        let elements = vec![header, gutter];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    // ── CR-77 tests — numbered-prefix + bookmark promotes at body-size R3 ─────
+
+    /// CR-77: a non-bold, non-isolated, body-size sub-item that is BOTH
+    /// line-leading numbered AND bookmark-matched promotes — the FDA deep
+    /// sub-item case (isolation unavailable, no bold, but outline-named).
+    #[test]
+    fn test_cr77_numbered_bookmark_promotes_without_bold_or_isolation() {
+        let body = 12.0;
+        let mut header = make_leaf_element(10.0, 0.0, "1", false); // not bold
+        header.text = "1. Drug Target Identification".to_string();
+        header.style_info.font_size = body;
+        header.bookmark_match = Some(BookmarkSection {
+            title: "1. Drug Target Identification".to_string(),
+            order: 5,
+            level: 4,
+        });
+        // A second line in the same leaf → leaf is multi-line → not isolated.
+        let follow = make_leaf_element(10.0, 20.0, "1", false);
+        let elements = vec![header, follow];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-77 control — numbered but NOT bookmark-matched does not promote
+    /// (keys on the authoritative outline, not the marker alone).
+    #[test]
+    fn test_cr77_numbered_without_bookmark_does_not_promote() {
+        let body = 12.0;
+        let mut header = make_leaf_element(10.0, 0.0, "1", false);
+        header.text = "1. Drug Target Identification".to_string();
+        header.style_info.font_size = body;
+        let follow = make_leaf_element(10.0, 20.0, "1", false);
+        let elements = vec![header, follow];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
+    /// CR-77 control — bookmark-matched but NOT numbered does not promote on the
+    /// CR-77 path: a non-bold, non-isolated unnumbered title still needs bold.
+    /// The marker is the guard against free-flow exact-match FPs.
+    #[test]
+    fn test_cr77_bookmark_without_number_does_not_promote() {
+        let body = 12.0;
+        let mut header = make_leaf_element(10.0, 0.0, "1", false);
+        header.text = "Drug Target Identification".to_string(); // no leading marker
+        header.style_info.font_size = body;
+        header.bookmark_match = Some(BookmarkSection {
+            title: "Drug Target Identification".to_string(),
+            order: 5,
+            level: 4,
+        });
+        let follow = make_leaf_element(10.0, 20.0, "1", false);
+        let elements = vec![header, follow];
+        let font_analysis = make_font_analysis(body, vec![("body", 100)]);
+        let config = make_config(1.0, 4.0, None);
+        assert!(!classify(&elements, &font_analysis, &config));
+    }
+
     // ── CR-20 tests — bold detection font-family fallback ─────────────────────
 
     /// Helper: build a PdfTextElement with explicit font_weight and font_family strings.
@@ -1355,6 +2017,29 @@ mod tests {
 
         let cmr = make_element_with_font(10.0, "normal", "CMR10", "body", 0);
         assert!(!SectionDetectionV2Rule::is_bold(&cmr));
+    }
+
+    /// CR-75 — Linux Libertine/Biolinum bold cut (`…TB`) detected as bold even
+    /// though Tika reports `font-weight: normal` for it (the crispr-review /
+    /// arXiv-libertine failure mode).
+    #[test]
+    fn test_cr75_libertine_biolinum_tb_is_bold() {
+        let biolinum = make_element_with_font(14.0, "normal", "LinBiolinumTB", "h1", 0);
+        assert!(SectionDetectionV2Rule::is_bold(&biolinum));
+
+        let libertine = make_element_with_font(9.0, "normal", "LinLibertineTB", "h2", 0);
+        assert!(SectionDetectionV2Rule::is_bold(&libertine));
+    }
+
+    /// CR-75 paired control — the regular (`…T`) and italic (`…TI`) cuts of the
+    /// same families are NOT bold, so the `TB` suffix rule stays surgical.
+    #[test]
+    fn test_cr75_libertine_regular_and_italic_not_bold() {
+        let regular = make_element_with_font(9.0, "normal", "LinLibertineT", "body", 0);
+        assert!(!SectionDetectionV2Rule::is_bold(&regular));
+
+        let italic = make_element_with_font(9.0, "normal", "LinLibertineTI", "body", 0);
+        assert!(!SectionDetectionV2Rule::is_bold(&italic));
     }
 
     // ── V3 leaf-based isolation tests ─────────────────────────────────────────
@@ -1702,6 +2387,21 @@ mod tests {
         let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
         // Pass 1 = true (simulating Region 1 promotion); exclusion match → demoted
         assert!(!rule.apply_pattern_refinement(true, 0, "Figure 3: Architecture"));
+    }
+
+    /// CR-73 follow-up — tightened caption exclusion. `^Table\s+[A-Z0-9]`
+    /// requires a label token after "Table", so real captions ("Table 1:",
+    /// "Table B-1:") demote while "Table of Contents" (lowercase "of", a genuine
+    /// outline heading and a bookmark TP on RFCs) survives.
+    #[test]
+    fn caption_exclusion_spares_table_of_contents() {
+        let elements = vec![make_inclusion_element("Table of Contents", 100.0, 80.0)];
+        let (config, fa, da, sd, eng) =
+            build_pattern_rule_test(&elements, vec![], vec!["^Table\\s+[A-Z0-9]"]);
+        let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
+        assert!(!rule.apply_pattern_refinement(true, 0, "Table 1: Results"), "numbered caption demoted");
+        assert!(!rule.apply_pattern_refinement(true, 0, "Table B-1: Summary"), "lettered caption demoted");
+        assert!(rule.apply_pattern_refinement(true, 0, "Table of Contents"), "TOC heading survives");
     }
 
     /// CR-26 Test 5 — Length cap rejects long body wrap-lines.
@@ -2105,5 +2805,297 @@ mod tests {
         let text_elements = vec![make_section_sized_element(Some("2-1"))];
         let types = run_apply_bootstrap(&text_elements);
         assert_eq!(types, vec![ParsedElementType::Section]);
+    }
+
+    // ── CR-67 Part B — source-order ±1 section-fragment promotion ───────
+
+    /// Build a `ParsedPdfElement` with the fields the promotion routine
+    /// reads: element_type, font class name, bbox height, hierarchy
+    /// level. Other fields get harmless defaults.
+    fn make_parsed_for_promote(
+        element_type: ParsedElementType,
+        text: &str,
+        class_name: &str,
+        height: f32,
+        hierarchy_level: u32,
+    ) -> ParsedPdfElement {
+        ParsedPdfElement {
+            element_type,
+            text: text.to_string(),
+            hierarchy_level,
+            position: 0,
+            style_info: FontClass {
+                class_name: class_name.to_string(),
+                font_family: "TestFont".to_string(),
+                font_size: 10.0,
+                font_style: "normal".to_string(),
+                font_weight: "bold".to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Some(Placement {
+                page_number: 1,
+                bounding_box: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height,
+                },
+                line_number: 0,
+                segment_number: 0,
+                rotation: 0,
+                paragraph_number: 0,
+                region_label: Some("1".to_string()),
+                page_width: 0.0,
+                page_height: 0.0,
+            }),
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            links: vec![],
+            confidence: 0,
+        }
+    }
+
+    /// Sb8 helper — a bold/normal text segment at explicit `(x, y, width)`.
+    fn seed_el_w(text: &str, x: f32, y: f32, bold: bool, width: f32) -> ParsedPdfElement {
+        ParsedPdfElement {
+            element_type: ParsedElementType::Paragraph,
+            text: text.to_string(),
+            hierarchy_level: 3,
+            position: 0,
+            style_info: FontClass {
+                class_name: "f13".to_string(),
+                font_family: if bold { "Noto-Serif-Bold" } else { "Noto-Serif" }.to_string(),
+                font_size: 13.0,
+                font_style: "normal".to_string(),
+                font_weight: if bold { "bold" } else { "normal" }.to_string(),
+                color: "#000000".to_string(),
+            },
+            placement: Some(Placement {
+                page_number: 1,
+                bounding_box: BoundingBox { x, y, width, height: 19.1 },
+                line_number: 0,
+                segment_number: 0,
+                rotation: 0,
+                paragraph_number: 0,
+                region_label: Some("1".to_string()),
+                page_width: 0.0,
+                page_height: 0.0,
+            }),
+            reading_order: 0,
+            bookmark_match: None,
+            token_count: 1,
+            links: vec![],
+            confidence: 0,
+        }
+    }
+
+    /// Short header segment (default width) that leaves trailing whitespace —
+    /// paired with a full-width body element in tests so the trailing-ratio
+    /// filter sees the column edge.
+    fn seed_el(text: &str, x: f32, y: f32, bold: bool) -> ParsedPdfElement {
+        seed_el_w(text, x, y, bold, 20.0)
+    }
+
+    /// A full-width body line so the trailing-whitespace filter knows the
+    /// column's right edge (66 → 518). Real headers stop well short of it.
+    fn body_line() -> ParsedPdfElement {
+        seed_el_w("Body text spanning the full column width to the margin", 66.0, 40.0, false, 452.0)
+    }
+
+    /// Sb8 — the canonical RFC depth-3 miss. A bold "3.5.2. " number and a bold
+    /// "Reset Generation" title share a Y-line; the body sits 19pt below. The
+    /// seed promotes both header segments to Section (depth = numbering
+    /// component count) and leaves the body as Paragraph.
+    #[test]
+    fn sb8_numbered_seed_promotes_split_header() {
+        let mut out = vec![
+            body_line(),
+            seed_el("3.5.2. ", 66.0, 468.0, true),
+            seed_el("Reset Generation", 99.0, 468.0, true),
+            seed_el("A TCP user or application can issue a reset…", 66.0, 487.0, false),
+        ];
+
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+
+        assert_eq!(out[1].element_type, ParsedElementType::Section, "number segment seeds");
+        assert_eq!(out[2].element_type, ParsedElementType::Section, "title segment seeds");
+        assert_eq!(out[1].hierarchy_level, 3, "depth = numbering component count");
+        assert_eq!(out[2].hierarchy_level, 3);
+        assert_eq!(
+            out[3].element_type,
+            ParsedElementType::Paragraph,
+            "body on a different Y-line must not be swept in",
+        );
+    }
+
+    /// Sb8 — a TOC entry has the same text shape but NORMAL weight. The bold
+    /// gate must keep it from promoting.
+    #[test]
+    fn sb8_numbered_seed_skips_non_bold_toc() {
+        let mut out = vec![
+            seed_el("3.5.2", 90.0, 66.0, false),
+            seed_el("Reset Generation", 120.0, 66.0, false),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(out[0].element_type, ParsedElementType::Paragraph);
+        assert_eq!(out[1].element_type, ParsedElementType::Paragraph);
+    }
+
+    /// Sb8 — a bold number+colon with a NON-bold title (NIST AI-RMF subcategory
+    /// shape) must not seed: only bold segments promote, so a non-bold title
+    /// would leave a bare "1.4:" section.
+    #[test]
+    fn sb8_numbered_seed_requires_bold_title() {
+        let mut out = vec![
+            seed_el("1.4:", 66.0, 100.0, true),
+            seed_el("The risk management process and its outcomes", 90.0, 100.0, false),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(out[0].element_type, ParsedElementType::Paragraph);
+        assert_eq!(out[1].element_type, ParsedElementType::Paragraph);
+    }
+
+    /// Sb8 — a full-width numbered line (TOC entry or body/table line) is
+    /// filtered geometrically: it fills the column to the right margin, leaving
+    /// no trailing whitespace, unlike a real header. The NIST Privacy Framework
+    /// TOC ("1.0 Introduction ........ 5") is the canonical case.
+    #[test]
+    fn sb8_numbered_seed_skips_full_width_line() {
+        let mut out = vec![
+            body_line(), // column right edge = 518
+            seed_el_w("1.0 Privacy Framework Introduction ......... 5", 66.0, 100.0, true, 452.0),
+            seed_el("3.5.2.", 66.0, 200.0, true),
+            seed_el("Reset Generation", 99.0, 200.0, true),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(
+            out[1].element_type,
+            ParsedElementType::Paragraph,
+            "full-width numbered line (TOC/body) leaves no trailing whitespace → filtered",
+        );
+        assert_eq!(out[2].element_type, ParsedElementType::Section, "short header kept");
+        assert_eq!(out[3].element_type, ParsedElementType::Section);
+    }
+
+    /// Sb8 — a single-level list marker ("1.") is not multi-level numbering and
+    /// must not seed (would over-promote numbered list items).
+    #[test]
+    fn sb8_numbered_seed_skips_single_level() {
+        let mut out = vec![
+            seed_el("1.", 66.0, 100.0, true),
+            seed_el("First do this thing", 80.0, 100.0, true),
+        ];
+        SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
+        assert_eq!(out[0].element_type, ParsedElementType::Paragraph);
+        assert_eq!(out[1].element_type, ParsedElementType::Paragraph);
+    }
+
+    /// CR-67 Part B — canonical RFC fragmentation. A `**1.1.**` Paragraph
+    /// (rejected by alpha-ratio) sits immediately before a
+    /// `**Document Structure**` Section, sharing font class `f7` and
+    /// bbox height 10.5. Same-class same-height → promotion fires; both
+    /// neighbors classify as Section (NodeTypeClustering then fuses
+    /// them into one Section node downstream).
+    #[test]
+    fn cr67_promote_same_class_same_height_fires() {
+        let mut elements = vec![
+            make_parsed_for_promote(
+                ParsedElementType::Paragraph,
+                "**1.1.**",
+                "f7",
+                10.5,
+                3,
+            ),
+            make_parsed_for_promote(
+                ParsedElementType::Section,
+                "**Document Structure**",
+                "f7",
+                10.5,
+                2,
+            ),
+        ];
+
+        SectionDetectionV2Rule::promote_section_fragments(&mut elements);
+
+        assert_eq!(
+            elements[0].element_type,
+            ParsedElementType::Section,
+            "left neighbor with same font class + matching height must promote"
+        );
+        assert_eq!(
+            elements[0].hierarchy_level, 2,
+            "promoted fragment inherits the section's hierarchy level"
+        );
+        assert_eq!(elements[1].element_type, ParsedElementType::Section);
+    }
+
+    /// CR-67 Part B — same-class but height mismatch outside HEIGHT_TOL
+    /// (2.0). 10.5 vs 12.6 → diff 2.1 ≥ 2.0 → no promotion. Defends
+    /// against picking up adjacent inline emphasis that happens to share
+    /// a font class but is visually a different glyph run.
+    #[test]
+    fn cr67_promote_height_mismatch_no_promotion() {
+        let mut elements = vec![
+            make_parsed_for_promote(
+                ParsedElementType::Paragraph,
+                "**1.1.**",
+                "f7",
+                10.5,
+                3,
+            ),
+            make_parsed_for_promote(
+                ParsedElementType::Section,
+                "**Title**",
+                "f7",
+                12.6,
+                2,
+            ),
+        ];
+
+        SectionDetectionV2Rule::promote_section_fragments(&mut elements);
+
+        assert_eq!(
+            elements[0].element_type,
+            ParsedElementType::Paragraph,
+            "height-mismatch (Δ=2.1 ≥ HEIGHT_TOL) must NOT promote",
+        );
+        assert_eq!(elements[1].element_type, ParsedElementType::Section);
+    }
+
+    /// CR-67 Part B — alphafold 3.1-bloat defense. A merged-title-and-body
+    /// blob (Paragraph, h=256) sits source-order adjacent to a true
+    /// single-line Section (h=10.5) sharing font class f22. Without the
+    /// height gate, the blob would promote → NodeTypeClustering fuses →
+    /// CR-65 demotes the 266-tall result back to Paragraph → both
+    /// nodes lost. The height gate must reject promotion.
+    #[test]
+    fn cr67_promote_bloated_paragraph_height_gate_rejects() {
+        let mut elements = vec![
+            make_parsed_for_promote(
+                ParsedElementType::Paragraph,
+                "3.1. In our first... [bloated body merge]",
+                "f22",
+                256.0,
+                3,
+            ),
+            make_parsed_for_promote(
+                ParsedElementType::Section,
+                "3.2 Section title",
+                "f22",
+                10.5,
+                2,
+            ),
+        ];
+
+        SectionDetectionV2Rule::promote_section_fragments(&mut elements);
+
+        assert_eq!(
+            elements[0].element_type,
+            ParsedElementType::Paragraph,
+            "bloated paragraph (h=256 vs section h=10.5) must NOT promote — \
+             the height gate is load-bearing against CR-65 cascade demotion",
+        );
+        assert_eq!(elements[1].element_type, ParsedElementType::Section);
     }
 }

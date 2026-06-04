@@ -102,6 +102,10 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
                 token_count: parsed.token_count,
                 internal_refs,
                 external_refs,
+                // CR-78 (v2.4.0): carry the rule engine's detection confidence
+                // through to the SemanticTreeElement. `0` for non-Section
+                // elements (the rule engine leaves them unscored).
+                confidence: parsed.confidence,
             }
             .validate()
         })
@@ -287,6 +291,7 @@ mod tests {
             }),
             token_count: 42,
             links: vec![],
+            confidence: 0,
         }
     }
 

@@ -249,7 +249,7 @@ fn node_type_to_fence_tag(node_type: &str) -> &'static str {
 /// `parent`/`children` (derivable from heading structure on reverse
 /// parse).
 fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
-    use crate::types::{ExternalRef, InternalRef};
+    use crate::types::{is_zero_u8, ExternalRef, InternalRef};
     #[derive(Serialize)]
     struct NodeMetadata<'a> {
         id: &'a NodeId,
@@ -265,6 +265,12 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         /// CR-62 (v2.3.0+): per-element refs to external locations.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         external_refs: &'a Vec<ExternalRef>,
+        /// CR-78 (v2.4.0+): per-element detection confidence (Section nodes).
+        /// Omitted when `0` so non-Section nodes and pre-CR-78 fixtures stay
+        /// byte-identical — mirrors the refs' "skip when empty" rule and keeps
+        /// the canonical hash unchanged for them.
+        #[serde(skip_serializing_if = "is_zero_u8")]
+        confidence: u8,
         /// CR-45: verbatim Tika style projection (foreground / background
         /// color, font_family, font_size, is_bold, is_italic, font_class).
         /// CR-59 (v2.1.0+): gated on `EmitOptions::include_style_info`. When
@@ -293,6 +299,7 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         token_count: node.token_count,
         internal_refs: &node.internal_refs,
         external_refs: &node.external_refs,
+        confidence: node.confidence,
         style,
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
@@ -357,6 +364,7 @@ mod tests {
                     children: Vec::new(),
                     internal_refs: vec![],
                     external_refs: vec![],
+                    confidence: 0,
                 },
             );
         }
@@ -384,6 +392,7 @@ mod tests {
                 children: child_ids,
                 internal_refs: vec![],
                 external_refs: vec![],
+                confidence: 0,
             },
         );
 
@@ -442,6 +451,37 @@ mod tests {
         assert!(
             md.contains("Hello world.\n```bgraph-paragraph\n"),
             "paragraph body should be outside (preceding) the fence; got:\n{md}",
+        );
+    }
+
+    #[test]
+    fn cr78_confidence_emitted_for_section_omitted_when_zero() {
+        // CR-78 (v2.4.0): the per-element fence carries `confidence` for a
+        // Section with a non-zero score; the Paragraph (confidence 0) omits
+        // the field entirely (skip_serializing_if), so non-Section nodes stay
+        // byte-identical to pre-CR-78 output.
+        let mut graph = build_graph(vec![
+            ("Section", "Intro", 1, 0),
+            ("Paragraph", "Hello world.", 1, 1),
+        ]);
+        let section_id = graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Section")
+            .expect("graph has a Section")
+            .id;
+        graph.nodes.get_mut(&section_id).unwrap().confidence = 5;
+
+        let md = emit_markdown(&graph);
+        assert!(
+            md.contains("\"confidence\":5"),
+            "section fence should carry confidence; got:\n{md}",
+        );
+        // Exactly one `confidence` key — the Paragraph (0) must omit it.
+        assert_eq!(
+            md.matches("\"confidence\"").count(),
+            1,
+            "only the non-zero Section should emit confidence; got:\n{md}",
         );
     }
 

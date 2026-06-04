@@ -75,6 +75,7 @@ impl GraphBuilder {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
+            confidence: 0,
         };
         graph.nodes.insert(root_id, document_node);
 
@@ -177,6 +178,7 @@ impl GraphBuilder {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
+            confidence: 0,
         };
         graph.nodes.insert(root_id, document_node);
 
@@ -277,6 +279,9 @@ impl GraphBuilder {
         // bgraph.md emitter can serialize them per the v2.3.0 schema.
         node.internal_refs = element.internal_refs.clone();
         node.external_refs = element.external_refs.clone();
+        // CR-78 (v2.4.0): thread detection confidence through to the node so
+        // the bgraph.md emitter can serialize it.
+        node.confidence = element.confidence;
         node
     }
 
@@ -291,6 +296,8 @@ impl GraphBuilder {
         // CR-62: see above.
         node.internal_refs = element.internal_refs.clone();
         node.external_refs = element.external_refs.clone();
+        // CR-78: see above.
+        node.confidence = element.confidence;
         node
     }
 }

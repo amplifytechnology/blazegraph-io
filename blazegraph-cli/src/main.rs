@@ -1014,6 +1014,9 @@ mod tests {
                     token_count: 1,
                     parent: Some(root_id),
                     children: Vec::new(),
+                    internal_refs: Vec::new(),
+                    external_refs: Vec::new(),
+                    confidence: 0,
                 },
             );
         }
@@ -1038,6 +1041,9 @@ mod tests {
                 token_count: 0,
                 parent: None,
                 children: child_ids,
+                internal_refs: Vec::new(),
+                external_refs: Vec::new(),
+                confidence: 0,
             },
         );
         DocumentGraph {

@@ -14,6 +14,65 @@ graph_sanity:
       check: true
       correct: true
 
+    # CR-71 — evidence-first section detection (landed Sb6). The old per-invariant
+    # demoters (CR-65 height / CR-68 overlap / CR-69 count) are parked OFF
+    # (check/correct false); their geometric predicates are now read by the
+    # flag-only `section_detectors`, whose thresholds still live on these structs.
+    # `section_prune` does the single demotion (geo + font >= 2), then the CR-70
+    # rebalance rebuilds topology.
+
+    # CR-65 predicate threshold (read by the height detector). tolerance 2.0.
+    section_height_bounded_by_title:
+      check: false
+      correct: false
+      tolerance: 2.0
+
+    # CR-69 predicate thresholds (read by the count detector).
+    section_overlap_count:
+      check: false
+      correct: false
+      count_threshold: 3
+      min_overlap_frac: 0.0
+
+    # CR-68 predicate threshold (read by the overlap detector). 0.20 is the live
+    # overlap signal — figure callouts with a high covering-paragraph overlap.
+    section_paragraph_overlap:
+      check: false
+      correct: false
+      threshold: 0.20
+      bookmark_bypass: false
+
+    # CR-71 flag-only detectors: reuse the predicates above, write evidence, never
+    # mutate node_type. The verdict (main_font / bad_fonts) is derived from these.
+    section_detectors:
+      height_flag: true
+      overlap_flag: true
+      count_flag: true
+
+    # CR-71 prune (the only demoter in the evidence-first path): demote a flagged
+    # section whose font is in bad_fonts (geo + font >= 2). emit_evidence_artifact
+    # is a debug-only dump, off in production.
+    section_prune:
+      enabled: true
+      prune_on_detection: true
+      emit_evidence_artifact: false
+
+    # CR-78 Phase B — confidence floor. Demote Sections whose detection-time
+    # confidence is below this (after the CR-71 prune, before the CR-70 rebalance).
+    # 0 = off (baseline). The per-doc precision lever for over-detected docs —
+    # set per-doc by the config picker, not as a global default.
+    min_confidence: 0
+
+    # CR-70 topology rebalance (runs last). Sb8: document_title_nesting nests the
+    # body under its title (largest-font level-1 section); the caps are 4/5 (was
+    # 3/4) so the added title level keeps deep X.Y.Z sections distinct.
+    topology_rebalance:
+      check: true
+      correct: true
+      max_section_depth: 4
+      max_total_depth: 5
+      document_title_nesting: true
+
 # Pipeline configuration - defines which rules to run and in what order
 # NEW APPROACH: Section detection FIRST, then spatial clustering
 pipeline:
@@ -64,6 +123,14 @@ section_detection_v2:
   enforce_max_depth: true
   starting_section_level: 1
 
+  # Sb8 — seed deep numbered subsections. RFC X.Y.Z headers are typeset at body
+  # size + bold, with the number split into its own span, so they fail the size
+  # tiers (delta≈0 → R3), R3's isolation gate (header shares a leaf with the body
+  # paragraph), and bookmark-match (split number). This promotes a bold,
+  # line-leading multi-level-numbering segment ("3.5.2. Title") to a Section
+  # directly; the same-line / source-adjacent fragment passes fuse number+title.
+  numbered_seed_promotion: true
+
   # Inclusion patterns: promote a weak/rejected candidate to section when the regex
   # matches AND the per-pattern structural gates pass AND the text length is within
   # `inclusion_max_length`. Patterns require the keyword followed by an explicit
@@ -91,9 +158,13 @@ section_detection_v2:
   inclusion_max_length: 20
 
   # Exclusion patterns: demote a promoted candidate (applied before inclusion).
+  # The caption patterns require a label token ([A-Z0-9]) after Figure/Table so
+  # real captions ("Figure 6:", "Table 1:", "Table B-1:") demote while a genuine
+  # heading like "Table of Contents" (lowercase "of") survives — it is itself an
+  # outline entry on RFCs (a bookmark TP), and the captions are FP anchors.
   exclusion_patterns:
-    - "^Figure\\s"
-    - "^Table\\s"
+    - "^Figure\\s+[A-Z0-9]"
+    - "^Table\\s+[A-Z0-9]"
     - "^\\d+\\.?\\d*$" # bare numbers / decimals like "0.1", "4.92"
     - "^[\\d\\s\\.]+$" # rows of numbers (table data)
 

@@ -528,14 +528,40 @@ fn region_rank(label: Option<&str>) -> (u8, Option<&str>) {
     }
 }
 
+/// CR-67 Part A — strips the dot from a leading section-numbering prefix
+/// (e.g. `"3.1. Approach 1"` → `"3.1 Approach 1"`). Conservative pattern:
+/// only fires when the dot immediately follows a numeric (`\d+(?:\.\d+)*`)
+/// or letter-then-optional-digits (`[A-Z]\d*`) prefix and is itself
+/// followed by whitespace. Sentence-ending periods (`"...ends in a
+/// period."`) are not section-numbering prefixes and pass through
+/// unchanged.
+static SECTION_NUMBER_PREFIX_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)*|[A-Z]\d*)\.\s").unwrap());
+
 /// NFKC + whitespace fold for cross-source string equivalence. Used to align
 /// PDF-extracted glyph runs (which can contain ligatures like ﬀ ﬁ) with
 /// bookmark titles (which usually decompose to plain ASCII). Also collapses
 /// any internal whitespace runs to a single space so layout-driven word
 /// breaks don't defeat matching.
-fn normalize_for_match(s: &str) -> String {
+///
+/// CR-67 Part A: additionally strips the trailing dot that follows a
+/// leading section-numbering token (`"3.1. Approach 1"` → `"3.1 Approach
+/// 1"`, `"5. Conclusion"` → `"5 Conclusion"`). This aligns body-text
+/// emissions like `"3.1. Title"` with outline entries written as
+/// `"3.1 Title"`, restoring the bookmark-match bypass for elements that
+/// fail the `isolated_in_leaf` XY-cut gate.
+///
+/// CR-76 (A): case-folds the result so all-caps body headers match their
+/// title-case outline entries (`"1 INTRODUCTION"` → outline `"1 Introduction"`,
+/// the crispr-review top-level-header case). Applied symmetrically to both the
+/// bookmark title and the body text, so it only ever widens matching against
+/// the authoritative outline — never invents a match the outline doesn't name.
+pub(crate) fn normalize_for_match(s: &str) -> String {
     let nfkc: String = s.nfkc().collect();
-    nfkc.split_whitespace().collect::<Vec<_>>().join(" ")
+    let folded = nfkc.split_whitespace().collect::<Vec<_>>().join(" ");
+    SECTION_NUMBER_PREFIX_REGEX
+        .replace(&folded, "$1 ")
+        .to_lowercase()
 }
 
 /// Build a `PdfTextElement` from the current parse state and span attrs.
@@ -1186,5 +1212,77 @@ mod tests {
             raw_tags: vec![],
             link: None,
         }
+    }
+
+    // ── CR-67 Part A: section-numbering trailing-dot strip ──────────────────
+
+    /// CR-67 Part A: `normalize_for_match` strips the dot that follows a
+    /// leading section-numbering prefix so body-text emissions like
+    /// `"3.1. Approach 1"` align with outline entries `"3.1 Approach 1"`.
+    /// Covers numeric (`3.1.`, `5.`) and letter-then-digit (`A1.`, `B.`)
+    /// prefix variants. The rescue is what lets alphafold's 3.1 header
+    /// reach the bookmark-match disjunct (CR-41) after `isolated_in_leaf`
+    /// rejects it.
+    #[test]
+    fn test_normalize_for_match_strips_section_numbering_trailing_dot() {
+        // Numeric multi-level prefix — the alphafold case. (Output is
+        // case-folded as of CR-76.)
+        assert_eq!(
+            normalize_for_match("3.1. Approach 1: Fix model sizes"),
+            "3.1 approach 1: fix model sizes",
+        );
+        // Single-level numeric prefix.
+        assert_eq!(
+            normalize_for_match("5. Conclusion"),
+            "5 conclusion",
+        );
+        // Letter-then-optional-digit prefix (appendix style).
+        assert_eq!(
+            normalize_for_match("A. Appendix"),
+            "a appendix",
+        );
+        assert_eq!(
+            normalize_for_match("B1. Detailed Notes"),
+            "b1 detailed notes",
+        );
+    }
+
+    /// CR-76 (A): the match key is case-folded so an all-caps body header
+    /// matches its title-case outline entry. `"1 INTRODUCTION"` (crispr's
+    /// body rendering) must produce the same key as outline `"1 Introduction"`.
+    #[test]
+    fn test_normalize_for_match_case_folds_all_caps_header() {
+        assert_eq!(
+            normalize_for_match("1 INTRODUCTION"),
+            normalize_for_match("1 Introduction"),
+        );
+        assert_eq!(
+            normalize_for_match("7 CONCLUSION"),
+            normalize_for_match("7. Conclusion"),
+        );
+    }
+
+    /// CR-67 Part A: the strip is tightly scoped to leading section
+    /// prefixes; a trailing period at the end of a normal sentence must
+    /// pass through unchanged. Same for unrelated leading text that
+    /// happens to contain a dot.
+    #[test]
+    fn test_normalize_for_match_preserves_sentence_period() {
+        // Plain sentence — trailing period is not a section prefix.
+        assert_eq!(
+            normalize_for_match("This sentence ends in a period."),
+            "this sentence ends in a period.",
+        );
+        // No whitespace after the prefix-shape dot → not a prefix
+        // either (this is a numbered identifier, not a header).
+        assert_eq!(
+            normalize_for_match("3.14is pi"),
+            "3.14is pi",
+        );
+        // Lowercase-letter prefix is not in the allowed grammar.
+        assert_eq!(
+            normalize_for_match("a. lowercase header-ish"),
+            "a. lowercase header-ish",
+        );
     }
 }

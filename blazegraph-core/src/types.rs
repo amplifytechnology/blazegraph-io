@@ -261,6 +261,22 @@ pub struct DocumentNode {
     /// CR-62 (v2.3.0+): references to external locations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_refs: Vec<ExternalRef>,
+    /// CR-78 (v2.4.0+): detection confidence for Section nodes
+    /// (`size_spine + Σ marker_bonuses`; see `ParsedPdfElement.confidence`).
+    /// `0` for non-Section nodes (and for any pre-v2.4.0 graph), and omitted
+    /// from the wire when `0` so those nodes stay byte-identical — the same
+    /// "skip when empty" discipline CR-62 used for the refs vecs. Phase A is
+    /// annotation-only; no consumer reads this yet.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub confidence: u8,
+}
+
+/// `skip_serializing_if` predicate for [`DocumentNode::confidence`] (and the
+/// bgraph.md per-element fence emitter): omit the field from the wire (and the
+/// canonical hash) when it is `0`, so non-Section nodes and pre-CR-78 graphs
+/// serialize byte-identically to v2.3.0.
+pub(crate) fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl DocumentNode {
@@ -285,6 +301,7 @@ impl DocumentNode {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
+            confidence: 0,
         }
     }
 
@@ -309,6 +326,7 @@ impl DocumentNode {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
+            confidence: 0,
         }
     }
 
@@ -990,6 +1008,14 @@ pub struct SemanticTreeElement {
     /// Same reading-order + substring-anchor invariants as `internal_refs`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_refs: Vec<ExternalRef>,
+
+    /// CR-78 (v2.4.0+): detection confidence for spans promoted to Section
+    /// (size spine R1=3/R2=2/R3=1 + marker bonuses: bookmark +3, numbered +2,
+    /// isolated +1, bold +1). `0` for non-Section elements. Threaded from the
+    /// rule engine's `ParsedPdfElement.confidence` and projected onto
+    /// `DocumentNode.confidence`. Phase A is annotation-only.
+    #[serde(default)]
+    pub confidence: u8,
 }
 
 /// CR-62: A reference from an element to a location within the same document.
@@ -1218,6 +1244,16 @@ pub struct ParsedPdfElement {
     /// projection time (see `preprocessors/pdf/semantic_tree_projection.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<PdfLinkAnnotation>,
+    /// CR-78 (Phase A, v2.4.0+): detection confidence for spans promoted to
+    /// Section. `confidence = size_spine (R1=3/R2=2/R3=1) + Σ marker_bonuses
+    /// (bookmark +3, numbered +2, isolated +1, bold +1)`, computed at
+    /// detection time in `rules::section_detection_v2`. `0` for non-Section
+    /// elements (no consumer reads it there). Carried through clustering as
+    /// the max across merged fragments, then projected onto
+    /// `SemanticTreeElement.confidence` → `DocumentNode.confidence`.
+    /// Phase A is annotation-only: nothing reads this to gate admission.
+    #[serde(default)]
+    pub confidence: u8,
 }
 
 impl ParsedPdfElement {
@@ -1418,6 +1454,7 @@ mod semantic_tree_element_validate_tests {
             token_count: 0,
             internal_refs: vec![],
             external_refs: vec![],
+            confidence: 0,
         }
     }
 

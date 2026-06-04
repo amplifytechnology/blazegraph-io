@@ -915,6 +915,16 @@ pub struct SectionDetectionV2Config {
     pub enforce_max_depth: bool,
     pub starting_section_level: u32,
 
+    /// Sb8 — promote a bold, line-leading multi-level-numbering segment
+    /// ("3.5.2. Title") to a Section regardless of font size or leaf isolation.
+    /// Recovers deep RFC subsections typeset at body size + bold weight, which
+    /// the size tiers (delta≈0 → R3), R3's isolation gate (the one-line header
+    /// shares a leaf with the body paragraph), and the split-number
+    /// bookmark-match all miss. The existing same-line / source-adjacent
+    /// fragment-promotion passes then fuse number + title into one node.
+    #[serde(default = "default_true")]
+    pub numbered_seed_promotion: bool,
+
     /// Regex patterns that promote a weak/rejected candidate to a section
     /// (escape hatch — e.g., "^\\d+\\.\\d+" for numbered subsections).
     /// Promotion additionally requires the per-pattern structural gates
@@ -996,6 +1006,210 @@ impl Default for InvariantToggle {
     }
 }
 
+/// CR-65 — Per-invariant config for the section-height-bounded-by-title rule.
+/// Has the same check/correct toggles as `InvariantToggle` plus a tolerance
+/// multiplier applied to the title's bbox.height.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionHeightInvariantConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Section bbox.height ≤ title.bbox.height × tolerance.
+    /// Default 2.0 — permissive enough to leave FP discrimination to downstream
+    /// rules; saves "Appendix"-class single-line big-font headers (typically
+    /// ~1.4× title height) that would otherwise be incorrectly demoted.
+    pub tolerance: f32,
+}
+
+impl Default for SectionHeightInvariantConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            tolerance: 2.0,
+        }
+    }
+}
+
+/// CR-68 — Per-invariant config for Section/Paragraph overlap-demote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionParagraphOverlapInvariantConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Demote a Section if its bbox 2D-area overlaps a same-page Paragraph
+    /// by more than this fraction of the Section's OWN area.
+    /// 0.0 = OFF sentinel (early-return, no cost).
+    pub threshold: f32,
+    /// Never demote a Section whose normalized text matches a bookmark-outline
+    /// title. Precision helper, NOT the safety mechanism (half the corpus has
+    /// no outline).
+    pub bookmark_bypass: bool,
+}
+
+impl Default for SectionParagraphOverlapInvariantConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            // Off by default (0.0 = OFF sentinel). Superseded by CR-69's
+            // geometry-only count rule: the fraction signal could not separate
+            // figure callouts from over-merge victims without the bookmark-
+            // bypass crutch (demoted 11 real rfc-dpop headers, corpus −0.026).
+            // Code retained, gated off — slated for cleanup once the evidence-
+            // first redesign (CR-71+) lands. See Sb LOGBOOK 2026-05-28.
+            threshold: 0.0,
+            bookmark_bypass: true,
+        }
+    }
+}
+
+/// CR-69 — Per-invariant config for the geometry-only overlap-COUNT demote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionOverlapCountInvariantConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Demote a Section whose bbox overlaps at least this many same-page nodes
+    /// of ANY type (excluding itself). A figure callout misclassified as a
+    /// Section sits in a cluttered figure region and overlaps several sibling
+    /// callouts + figure elements (count >= 3); a real header — even one
+    /// engulfed by a single over-merged paragraph — overlaps <= 2. This is the
+    /// geometry-only safety mechanism CR-68's fraction rule lacked (no
+    /// bookmark-bypass needed).
+    pub count_threshold: u32,
+    /// Minimum overlap, as a fraction of the Section's own area, for another
+    /// node to count toward the tally. 0.0 = any positive overlap counts.
+    pub min_overlap_frac: f32,
+}
+
+impl Default for SectionOverlapCountInvariantConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            count_threshold: 3,
+            min_overlap_frac: 0.0,
+        }
+    }
+}
+
+/// CR-71A — Per-document config for the flag-only section detectors.
+///
+/// The evidence-first redesign folds CR-65 / CR-68 / CR-69 from demote-in-place
+/// invariants into read-only **detectors** that write `NodeFlags` into the
+/// transient `SectionEvidence` sidecar (never mutating `node_type`). Each
+/// boolean toggles whether the corresponding geometric predicate runs; the
+/// *thresholds* the predicates read are reused verbatim from the existing
+/// `Section*InvariantConfig` structs (the detectors ignore those structs'
+/// `.correct` — a flagger has nothing to correct). Off by default so the live
+/// pipeline keeps the parked-off CR-65/68/69 baseline until the experiment
+/// config (old demoters off, these on, `prune_on_detection = false`) flips it.
+/// All detectors default OFF (a derived `Default`): the live path keeps the
+/// CR-65/68/69 demote-in-place baseline. The CR-71A experiment config turns
+/// these on (with the old demoters off) to observe the flagged set without
+/// mutating the graph.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SectionDetectorsConfig {
+    /// Run the CR-65 height-bounded-by-title predicate as a flag detector.
+    pub height_flag: bool,
+    /// Run the CR-68 section/paragraph overlap-fraction predicate as a flag
+    /// detector.
+    pub overlap_flag: bool,
+    /// Run the CR-69 same-page overlap-count predicate as a flag detector.
+    pub count_flag: bool,
+}
+
+/// CR-71A — Config for the single section-prune step (the only graph mutator
+/// before the CR-70 rebalance).
+///
+/// In CR-71A the prune step is a **literal no-op**: even with
+/// `prune_on_detection = true` it does nothing to the graph — it only writes a
+/// flagged-set summary into `SanityReport.section_prune` and, when
+/// `emit_evidence_artifact` is set, dumps the per-doc `<doc>.evidence.json`
+/// debug artifact. The mutating body is CR-71B (designed after observing the
+/// flagged set), gated behind the same `prune_on_detection` master switch.
+/// All fields default to `false` (a derived `Default`): the live path does not
+/// run the prune step, the master mutate switch is off, and the debug artifact
+/// is not emitted.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SectionPruneConfig {
+    /// Master gate for the prune step running at all.
+    pub enabled: bool,
+    /// The master mutate switch. `false` (default) = flag + log + artifact, the
+    /// graph is left byte-identical; `true` = the CR-71B prune body acts (a
+    /// no-op in CR-71A regardless).
+    pub prune_on_detection: bool,
+    /// Debug: write the per-doc `<doc>.evidence.json` artifact (the input to the
+    /// CR-71B Python pruning prototype). Default false — not on in normal runs.
+    pub emit_evidence_artifact: bool,
+}
+
+/// CR-70 — Per-invariant config for the topology-rebalance step.
+///
+/// Runs LAST in the sanity pipe (after all node_type demotions). Rebuilds the
+/// parent/child/depth topology by replaying the stack-based outline build over
+/// the surviving nodes in `text_order`, deriving section depth from stack
+/// position (collapsing gaps left by demoted levels) and capping it. Demoted
+/// sections are treated as content — they no longer open a level, and their
+/// orphaned children re-attach to the enclosing section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyRebalanceConfig {
+    pub check: bool,
+    pub correct: bool,
+    /// Maximum depth a Section may occupy. A section whose natural stack depth
+    /// exceeds this is clamped here and parented to the nearest ancestor at
+    /// `max_section_depth - 1` — deep nesting flattens into cap-level siblings
+    /// ("3 is the rest").
+    pub max_section_depth: u32,
+    /// Maximum depth any node may occupy. Content under a cap-level section
+    /// sits at `max_total_depth`.
+    pub max_total_depth: u32,
+    /// Sb8 — nest the document body under its title. Among the would-be level-1
+    /// sections, the content tier is the most-common font size; any section
+    /// larger than it is a structural top node (the title, plus a large-font
+    /// `Appendix` heading). Top nodes stay level-1 siblings; every content
+    /// section drops one level under the preceding top node — so the title owns
+    /// the body and an `Appendix` owns its run, summarisable independently.
+    /// Pure topology, reusing the stack replay. The caps are +1 vs the pre-Sb8
+    /// 3/4 to absorb the new title level so deep `X.Y.Z` stays distinct.
+    #[serde(default = "default_true")]
+    pub document_title_nesting: bool,
+}
+
+impl Default for TopologyRebalanceConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+            max_section_depth: 4,
+            max_total_depth: 5,
+            document_title_nesting: true,
+        }
+    }
+}
+
+/// CR-72 — Per-invariant config for numbering-scheme-restart nesting.
+///
+/// Detects a numbering scheme that restarts into a *subordinate* scheme
+/// (letters `A.`, `B.`… or roman `I.`, `II.`…) after an established decimal run,
+/// introduced by an unnumbered container heading (the canonical case being an
+/// `Appendix` block). When fired, the subordinate run nests UNDER the container
+/// instead of sitting as level-1 siblings. Runs inside `rebalance_topology` —
+/// it shapes the level signal the stack replay consumes. When `correct` is
+/// false, the rebalance behaves exactly as it does without this rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NumberingRestartConfig {
+    pub check: bool,
+    pub correct: bool,
+}
+
+impl Default for NumberingRestartConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            correct: true,
+        }
+    }
+}
+
 /// Set of invariants the graph sanity pipe enforces.
 /// Future invariants (childless pruning, repetition filter, etc.) will appear
 /// here as additional fields.
@@ -1004,6 +1218,60 @@ pub struct GraphSanityInvariants {
     /// `node.depth = parent.depth + 1` for every non-root node.
     /// Correction strategy: BFS from root, recompute depth.
     pub depth_consistency: InvariantToggle,
+
+    /// CR-65 — Section bbox.height bounded by document title's bbox.height.
+    /// Catches figure-cluster bloat that survives NodeTypeClustering by
+    /// demoting Sections whose bbox.height exceeds title.height × tolerance.
+    #[serde(default)]
+    pub section_height_bounded_by_title: SectionHeightInvariantConfig,
+
+    /// CR-68 — Section demoted when its bbox overlaps a same-page Paragraph
+    /// (fraction rule, bookmark-bypass). Runs with CR-69's count rule.
+    #[serde(default)]
+    pub section_paragraph_overlap: SectionParagraphOverlapInvariantConfig,
+
+    /// CR-69 — Section demoted when its bbox overlaps >= count_threshold
+    /// same-page nodes of any type (geometry-only figure-cluster detector).
+    #[serde(default)]
+    pub section_overlap_count: SectionOverlapCountInvariantConfig,
+
+    /// CR-70 — Rebuild parent/child/depth topology over the surviving nodes
+    /// after all demotions settle (numbering-anchored capped stack rebuild).
+    /// Sequenced LAST. Subsumes `depth_consistency` (depth becomes a rebalance
+    /// output) when enabled.
+    #[serde(default)]
+    pub topology_rebalance: TopologyRebalanceConfig,
+
+    /// CR-72 — Nest a subordinate-scheme restart (letter/roman run) under the
+    /// unnumbered container heading that introduces it (appendix grouping).
+    /// Runs as part of the topology rebalance.
+    #[serde(default)]
+    pub numbering_restart: NumberingRestartConfig,
+
+    /// CR-71A — Flag-only section detectors (CR-65/68/69 predicates, read-only).
+    /// They write evidence into the transient sidecar; they never mutate the
+    /// graph. Off by default (the live path keeps the parked-off demoters).
+    #[serde(default)]
+    pub section_detectors: SectionDetectorsConfig,
+
+    /// CR-71A — The single section-prune step (the only graph mutator before the
+    /// CR-70 rebalance). A literal no-op in CR-71A; writes the flagged-set
+    /// summary into `SanityReport.section_prune` and (debug) the evidence
+    /// artifact.
+    #[serde(default)]
+    pub section_prune: SectionPruneConfig,
+
+    /// CR-78 Phase B — confidence floor. Demote every Section whose detection-time
+    /// `confidence` (CR-78 size-spine + marker bonuses) is below this value, in the
+    /// mutator slot after the CR-71 prune and before the CR-70 rebalance (topology
+    /// rebuilt over survivors). `0` = off (default; baseline behavior). The per-doc
+    /// precision lever for over-detected docs — meant to be set per-doc by the
+    /// config picker, NOT as a global default: a global high floor erases the
+    /// low-confidence-but-real RFC/paper subsections (see the Sb LOGBOOK
+    /// confidence-landing analysis — TP vs FP separates only in the over-detecting
+    /// genres).
+    #[serde(default)]
+    pub min_confidence: u8,
 }
 
 /// Configuration for the graph sanity-check-and-correction pipe (CR-28).
@@ -1035,6 +1303,7 @@ impl Default for SectionDetectionV2Config {
             max_depth: 6,
             enforce_max_depth: true,
             starting_section_level: 1,
+            numbered_seed_promotion: true,
             inclusion_patterns: vec![
                 InclusionPattern {
                     pattern: r"^\d+\.".to_string(), // "1.", "2.", ...
@@ -1058,7 +1327,10 @@ impl Default for SectionDetectionV2Config {
                 },
             ],
             inclusion_max_length: 30,
-            exclusion_patterns: vec![r"^Figure\s".to_string(), r"^Table\s".to_string()],
+            exclusion_patterns: vec![
+                r"^Figure\s+[A-Z0-9]".to_string(),
+                r"^Table\s+[A-Z0-9]".to_string(),
+            ],
             tiebreaker_keywords: vec![
                 TiebreakerKeyword {
                     name: "part".into(),
