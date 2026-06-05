@@ -33,13 +33,18 @@
 //! 6. `compute_structural_profile` then `compute_breadcrumbs` — same
 //!    post-build sequence as the PDF and markdown channels.
 //!
-//! ## Scope (C1)
+//! ## Scope (C1 + C2)
 //!
-//! Body structure only: Section / Paragraph / Table / Blockquote, depth from
-//! the `outlineLvl` gate, run-text concatenation, and emphasis projection
-//! (`<w:b/>` → `**…**`, `<w:i/>` → `*…*`). **Out of scope** (later handoffs):
-//! hyperlink ref extraction (C2 — but hyperlink run *text* IS included
-//! inline), metadata population (C3), CLI dispatch (C4), header/footer (C5).
+//! Body structure: Section / Paragraph / Table / Blockquote, depth from the
+//! `outlineLvl` gate, run-text concatenation, and emphasis projection
+//! (`<w:b/>` → `**…**`, `<w:i/>` → `*…*`) (C1). Plus hyperlink ref extraction
+//! (C2): each `<w:hyperlink w:anchor>` becomes an `InternalRef` and each
+//! `<w:hyperlink r:id>` with `TargetMode="External"` (resolved via
+//! `word/_rels/document.xml.rels`) becomes an `ExternalRef` on the element
+//! that contains it; the link's visible run text reuses the same `<w:t>`
+//! concatenation (the ref is *additional*, not a replacement). **Out of
+//! scope** (later handoffs): metadata population (C3), CLI dispatch (C4),
+//! header/footer (C5).
 //!
 //! ## ParseIdentity
 //!
@@ -60,6 +65,7 @@ use crate::tokens::estimate_token_count;
 use crate::types::*;
 
 use super::super::md::types::{ParseError, ParseIdentity, ParseOptions, ParseResult};
+use super::rels::HyperlinkRel;
 
 /// Resolved style information for one `styleId`, after walking the
 /// `<w:basedOn>` chain. `outline_lvl` is the field that drives the Section
@@ -100,12 +106,17 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     // styles.xml is best-effort: a document with only inline outline levels
     // still parses. Absence yields an empty style map.
     let styles_xml = read_zip_entry(&mut archive, "word/styles.xml").unwrap_or_default();
+    // document.xml.rels resolves `<w:hyperlink r:id>` → URL + TargetMode
+    // (C2). Best-effort: a document with no `r:id` hyperlinks (or none at
+    // all) has no rels part to read; absence yields an empty map.
+    let rels_xml = read_zip_entry(&mut archive, "word/_rels/document.xml.rels").unwrap_or_default();
 
-    // 2. Styles resolution map.
+    // 2. Styles resolution map + hyperlink relationships map.
     let styles = build_styles_map(&styles_xml)?;
+    let hyperlink_rels = super::rels::parse_hyperlink_rels(&rels_xml)?;
 
     // 3. Body walk → elements.
-    let elements = walk_body(&document_xml, &styles)?;
+    let elements = walk_body(&document_xml, &styles, &hyperlink_rels)?;
 
     // 4. Provenance — DOCX has no source PDF, so
     //    `source_sha256 = sha256(zip bytes)`. `config_hash = "none"`
@@ -303,6 +314,10 @@ struct TableAccumulator {
     tbl_depth: u32,
     /// Current row being built.
     current_row: Vec<String>,
+    /// Hyperlink refs from all cells, bubbled up at cell finish. The table
+    /// flattens to one node (decision 6), so cell refs attach to that one
+    /// Table element (the visible text is the cell text, already in `rows`).
+    refs: PendingRefs,
 }
 
 /// Walk `<w:body>`'s top-level children (`<w:p>` and `<w:tbl>`) in document
@@ -312,6 +327,7 @@ struct TableAccumulator {
 fn walk_body(
     document_xml: &str,
     styles: &HashMap<String, EffectiveStyle>,
+    hyperlink_rels: &HashMap<String, HyperlinkRel>,
 ) -> Result<Vec<SemanticTreeElement>, ParseError> {
     let mut reader = Reader::from_str(document_xml);
     let mut elements: Vec<SemanticTreeElement> = Vec::new();
@@ -421,7 +437,7 @@ fn walk_body(
                                 }
                             }
                         } else if let Some(Block::Paragraph(acc)) = &mut block {
-                            para_on_end(acc, name);
+                            para_on_end(acc, name, hyperlink_rels);
                         }
                     }
                     Some(Block::Table(_)) => {
@@ -439,7 +455,7 @@ fn walk_body(
                                 }
                             }
                         } else if let Some(Block::Table(acc)) = &mut block {
-                            table_on_end(acc, name);
+                            table_on_end(acc, name, hyperlink_rels);
                         }
                     }
                 }
@@ -473,6 +489,7 @@ fn para_on_start(
             }
         }
         // Run formatting / text — delegate to the run assembler.
+        b"hyperlink" => acc.runs.on_hyperlink_start(e),
         b"r" => acc.runs.on_run_start(),
         b"rPr" => acc.runs.in_rpr = true,
         b"b" if acc.runs.in_rpr => acc.runs.bold = run_bool_on(e),
@@ -505,7 +522,11 @@ fn para_on_empty(acc: &mut ParagraphAccumulator, e: &BytesStart) {
     }
 }
 
-fn para_on_end(acc: &mut ParagraphAccumulator, name: &[u8]) {
+fn para_on_end(
+    acc: &mut ParagraphAccumulator,
+    name: &[u8],
+    hyperlink_rels: &HashMap<String, HyperlinkRel>,
+) {
     match name {
         b"pPr" => {
             acc.in_ppr = false;
@@ -514,6 +535,7 @@ fn para_on_end(acc: &mut ParagraphAccumulator, name: &[u8]) {
         b"t" => acc.runs.in_t = false,
         b"rPr" => acc.runs.in_rpr = false,
         b"r" => acc.runs.on_run_end(),
+        b"hyperlink" => acc.runs.on_hyperlink_end(hyperlink_rels),
         _ => {}
     }
 }
@@ -536,14 +558,15 @@ fn finish_paragraph(
         current_section_depth + 1
     };
 
-    let mut text = acc.runs.finish();
+    let (mut text, refs) = acc.runs.finish_with_refs();
     // Trim Section heading text (heading-marker semantics, decision 5);
     // leave Paragraph/Blockquote text as-assembled.
     if element_type == SemanticElementType::Section {
         text = text.trim().to_string();
     }
     // Skip empty paragraphs (decision 6b) — also keeps `.validate()` from
-    // rejecting an empty-body Paragraph/Section.
+    // rejecting an empty-body Paragraph/Section. (A hyperlink-only paragraph
+    // with no visible text would have empty refs too — nothing to attach.)
     if text.trim().is_empty() {
         return None;
     }
@@ -557,8 +580,8 @@ fn finish_paragraph(
             physical_location: None,
             style: None,
             token_count: estimate_token_count(&text),
-            internal_refs: vec![],
-            external_refs: vec![],
+            internal_refs: refs.internal,
+            external_refs: refs.external,
             confidence: 0,
         }
         .validate(),
@@ -581,6 +604,11 @@ fn table_on_start(
         b"p" => {
             if let Some(cell) = acc.cell_runs.as_mut() {
                 cell.on_paragraph_break();
+            }
+        }
+        b"hyperlink" => {
+            if let Some(cell) = acc.cell_runs.as_mut() {
+                cell.on_hyperlink_start(e);
             }
         }
         b"r" => {
@@ -622,11 +650,20 @@ fn table_on_start(
     Ok(())
 }
 
-fn table_on_end(acc: &mut TableAccumulator, name: &[u8]) {
+fn table_on_end(
+    acc: &mut TableAccumulator,
+    name: &[u8],
+    hyperlink_rels: &HashMap<String, HyperlinkRel>,
+) {
     match name {
         b"tc" => {
             if let Some(cell) = acc.cell_runs.take() {
-                acc.current_row.push(cell.finish());
+                // Bubble the cell's hyperlink refs up to the table (one node,
+                // decision 6) along with its assembled text.
+                let (text, refs) = cell.finish_with_refs();
+                acc.current_row.push(text);
+                acc.refs.internal.extend(refs.internal);
+                acc.refs.external.extend(refs.external);
             }
         }
         b"tr" => {
@@ -647,6 +684,11 @@ fn table_on_end(acc: &mut TableAccumulator, name: &[u8]) {
         b"r" => {
             if let Some(cell) = acc.cell_runs.as_mut() {
                 cell.on_run_end();
+            }
+        }
+        b"hyperlink" => {
+            if let Some(cell) = acc.cell_runs.as_mut() {
+                cell.on_hyperlink_end(hyperlink_rels);
             }
         }
         _ => {}
@@ -676,8 +718,9 @@ fn finish_table(
         physical_location: None,
         style: None,
         token_count: estimate_token_count(&text),
-        internal_refs: vec![],
-        external_refs: vec![],
+        // Hyperlink refs from any cell attach to the one Table node (decision 6).
+        internal_refs: acc.refs.internal,
+        external_refs: acc.refs.external,
         confidence: 0,
     }
     .validate()
@@ -711,6 +754,34 @@ struct RunAssembler {
     bold: bool,
     italic: bool,
     run_text: String,
+    // Hyperlink state (C2). A `<w:hyperlink>` wraps runs inside a `<w:p>` /
+    // cell; we record its attributes + the `out`-buffer offset at open, then
+    // slice the visible text (the wrapped run concatenation) at close to build
+    // a ref. Refs accumulate here and are drained by the owning accumulator at
+    // `finish`. `<w:hyperlink>` does not nest in practice; if it did, only the
+    // innermost open link is tracked (the outer reopens on the next start).
+    open_link: Option<OpenHyperlink>,
+    refs: PendingRefs,
+}
+
+/// An in-flight `<w:hyperlink>`: its attributes + the `out`-buffer length at
+/// the moment it opened. The visible link text is `out[text_start..]` once the
+/// link closes.
+struct OpenHyperlink {
+    /// `w:anchor` — an internal link to a `<w:bookmarkStart w:name>`.
+    anchor: Option<String>,
+    /// `r:id` — a relationship id resolved via `document.xml.rels`.
+    rel_id: Option<String>,
+    /// `out.len()` when the link opened (byte offset of the visible text).
+    text_start: usize,
+}
+
+/// Hyperlink-derived refs collected while assembling a paragraph / cell, drained
+/// into the element's `internal_refs` / `external_refs` at finish.
+#[derive(Default)]
+struct PendingRefs {
+    internal: Vec<InternalRef>,
+    external: Vec<ExternalRef>,
 }
 
 impl RunAssembler {
@@ -720,6 +791,60 @@ impl RunAssembler {
         self.bold = false;
         self.italic = false;
         self.run_text.clear();
+    }
+
+    /// Open a `<w:hyperlink>`: record its `w:anchor` / `r:id` and the current
+    /// output offset so the visible text can be sliced when it closes.
+    fn on_hyperlink_start(&mut self, e: &BytesStart) {
+        self.open_link = Some(OpenHyperlink {
+            anchor: attr_value(e, b"w:anchor"),
+            rel_id: attr_value(e, b"r:id"),
+            text_start: self.out.len(),
+        });
+    }
+
+    /// Close a `<w:hyperlink>`: build the ref from its attributes + the visible
+    /// text accumulated since it opened, resolving `r:id` via `rels`.
+    ///
+    /// - `w:anchor="name"` → `InternalRef` targeting the bookmark name.
+    /// - `r:id` whose rels target is `TargetMode="External"` → `ExternalRef`.
+    /// - `r:id` that is internal-part / unresolved, and a hyperlink with
+    ///   neither attribute → skipped (out of scope per contract decision 7).
+    ///
+    /// `w:anchor` takes precedence when both are present (a same-document
+    /// anchor is the internal target; the contract maps anchor → internal).
+    fn on_hyperlink_end(&mut self, rels: &HashMap<String, HyperlinkRel>) {
+        let Some(link) = self.open_link.take() else {
+            return;
+        };
+        // Visible text = the run concatenation produced inside the hyperlink.
+        let text = self.out[link.text_start..].to_string();
+
+        if let Some(name) = link.anchor {
+            self.refs.internal.push(InternalRef {
+                text,
+                source_page: None,
+                source_bbox: None,
+                target: InternalRefTarget::Named {
+                    name,
+                    page: None,
+                    point: None,
+                },
+            });
+        } else if let Some(rel) = link.rel_id.as_deref().and_then(|id| rels.get(id)) {
+            if rel.is_external() {
+                self.refs.external.push(ExternalRef {
+                    text,
+                    source_page: None,
+                    source_bbox: None,
+                    target: ExternalRefTarget::Uri {
+                        url: rel.target.clone(),
+                    },
+                });
+            }
+            // Non-External r:id (internal-part link) → skip (decision 7).
+        }
+        // Hyperlink with neither attribute → nothing to attribute; skip.
     }
 
     fn on_run_end(&mut self) {
@@ -754,8 +879,11 @@ impl RunAssembler {
         }
     }
 
-    fn finish(self) -> String {
-        self.out
+    /// Consume the assembler, returning the assembled text and the hyperlink
+    /// refs collected along the way. Used where refs must be attributed to the
+    /// owning element (paragraphs, and — bubbled up — table cells).
+    fn finish_with_refs(self) -> (String, PendingRefs) {
+        (self.out, self.refs)
     }
 }
 
@@ -1096,15 +1224,85 @@ mod tests {
     }
 
     #[test]
-    fn refs_left_empty() {
-        // C1 leaves internal_refs / external_refs empty (C2 fills them).
+    fn structured_has_no_refs() {
+        // `structured.docx` carries no hyperlinks, so C2 emits no refs on it
+        // (the ref machinery only fires on `<w:hyperlink>` elements).
         let graph = parse_fixture("structured.docx");
         let total_refs: usize = graph
             .nodes
             .values()
             .map(|n| n.internal_refs.len() + n.external_refs.len())
             .sum();
-        assert_eq!(total_refs, 0, "C1 emits no refs (C2's job)");
+        assert_eq!(total_refs, 0, "no hyperlinks in structured.docx → no refs");
+    }
+
+    // =====================================================================
+    // End-to-end ref extraction — `with_links.docx`, a clean fixture with
+    // real hyperlinks (generated by `scripts/generate_docx_fixtures.py`):
+    // one external (URL via r:id → rels TargetMode=External) and one internal
+    // (w:anchor → a heading bookmark). Exercises the full zip → rels → walk →
+    // ref path against a real OOXML container.
+    // =====================================================================
+
+    #[test]
+    fn with_links_external_ref_resolved() {
+        // The external hyperlink (r:id → https://blazegraph.io/) resolves to
+        // exactly one ExternalRef::Uri with the visible link text.
+        let graph = parse_fixture("with_links.docx");
+        let externals: Vec<&ExternalRef> = graph
+            .nodes
+            .values()
+            .flat_map(|n| &n.external_refs)
+            .collect();
+        assert_eq!(
+            externals.len(),
+            1,
+            "one external hyperlink → one ExternalRef"
+        );
+        let r = externals[0];
+        assert_eq!(r.text, "the project site", "visible link text");
+        match &r.target {
+            ExternalRefTarget::Uri { url } => {
+                assert_eq!(url, "https://blazegraph.io/", "URL from rels Target")
+            }
+        }
+    }
+
+    #[test]
+    fn with_links_internal_anchor_ref() {
+        // The internal hyperlink (w:anchor="conclusion") resolves to exactly
+        // one InternalRef::Named targeting the bookmark name.
+        let graph = parse_fixture("with_links.docx");
+        let internals: Vec<&InternalRef> = graph
+            .nodes
+            .values()
+            .flat_map(|n| &n.internal_refs)
+            .collect();
+        assert_eq!(internals.len(), 1, "one anchor hyperlink → one InternalRef");
+        let r = internals[0];
+        assert_eq!(r.text, "Conclusion section", "visible link text");
+        match &r.target {
+            InternalRefTarget::Named { name, page, point } => {
+                assert_eq!(name, "conclusion", "target = bookmark name");
+                assert!(
+                    page.is_none() && point.is_none(),
+                    "Free flow, no page/point"
+                );
+            }
+            other => panic!("expected Named target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_links_total_ref_count() {
+        // Exactly two refs total across the document: 1 internal + 1 external.
+        let graph = parse_fixture("with_links.docx");
+        let (mut internal, mut external) = (0usize, 0usize);
+        for n in graph.nodes.values() {
+            internal += n.internal_refs.len();
+            external += n.external_refs.len();
+        }
+        assert_eq!((internal, external), (1, 1), "1 internal + 1 external ref");
     }
 
     // =====================================================================
@@ -1294,7 +1492,7 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new()).unwrap();
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].text, "a\tb\nc");
         assert_eq!(els[0].element_type, SemanticElementType::Paragraph);
@@ -1306,7 +1504,7 @@ mod tests {
             <w:p><w:pPr><w:spacing w:after="0"/></w:pPr></w:p>
             <w:p><w:r><w:t>real</w:t></w:r></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new()).unwrap();
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1, "spacing-only paragraph is skipped");
         assert_eq!(els[0].text, "real");
         assert_eq!(els[0].text_order, 0, "text_order has no gap from the skip");
@@ -1317,7 +1515,7 @@ mod tests {
         let doc = "<w:document><w:body>\
             <w:p><w:r><w:t xml:space=\"preserve\"> leading</w:t></w:r></w:p>\
         </w:body></w:document>";
-        let els = walk_body(doc, &HashMap::new()).unwrap();
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         // The preserved leading space survives in a Paragraph (not trimmed).
         assert_eq!(els[0].text, " leading");
@@ -1325,18 +1523,175 @@ mod tests {
 
     #[test]
     fn hyperlink_run_text_is_inline() {
-        // <w:hyperlink> wrapping a run: the run text flows inline (the ref
-        // itself is C2's job). We don't special-case the hyperlink element.
+        // <w:hyperlink> wrapping a run: the run text flows inline AND produces
+        // a ref (C2). The text is included inline regardless of the ref.
         let doc = r#"<w:document><w:body>
             <w:p><w:r><w:t>See </w:t></w:r><w:hyperlink w:anchor="x"><w:r><w:t>here</w:t></w:r></w:hyperlink><w:r><w:t> now</w:t></w:r></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new()).unwrap();
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(
             els[0].text, "See here now",
             "hyperlink run text included inline"
         );
-        assert!(els[0].internal_refs.is_empty(), "C1 emits no refs");
+    }
+
+    // =====================================================================
+    // C2 — hyperlink → ref mapping (synthetic XML, contract decision 7).
+    // The rels parser itself is unit-tested in `rels.rs`; these exercise the
+    // mapping a `<w:hyperlink>` attribute → InternalRef / ExternalRef, the
+    // visible-text capture, and the skip cases.
+    // =====================================================================
+
+    /// Build a hyperlink rels map from `(id, target, external)` triples.
+    fn rels_map(entries: &[(&str, &str, bool)]) -> HashMap<String, HyperlinkRel> {
+        entries
+            .iter()
+            .map(|(id, target, external)| {
+                let xml = format!(
+                    r#"<Relationships><Relationship Id="{id}" Type="http://x/relationships/hyperlink" Target="{target}"{mode}/></Relationships>"#,
+                    mode = if *external { r#" TargetMode="External""# } else { "" },
+                );
+                let m = super::super::rels::parse_hyperlink_rels(&xml).unwrap();
+                (id.to_string(), m[*id].clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hyperlink_anchor_becomes_internal_ref() {
+        // `<w:hyperlink w:anchor="sec1">` → InternalRef::Named { name: "sec1" }
+        // with the visible run text and no source page/bbox (Free flow).
+        let doc = r#"<w:document><w:body>
+            <w:p><w:r><w:t>Jump to </w:t></w:r><w:hyperlink w:anchor="sec1"><w:r><w:t>Section One</w:t></w:r></w:hyperlink></w:p>
+        </w:body></w:document>"#;
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(els.len(), 1);
+        assert_eq!(els[0].text, "Jump to Section One");
+        assert_eq!(els[0].internal_refs.len(), 1, "one InternalRef");
+        assert!(els[0].external_refs.is_empty());
+        let r = &els[0].internal_refs[0];
+        assert_eq!(r.text, "Section One", "visible link text captured");
+        assert!(
+            r.source_page.is_none() && r.source_bbox.is_none(),
+            "Free flow"
+        );
+        match &r.target {
+            InternalRefTarget::Named { name, page, point } => {
+                assert_eq!(name, "sec1", "target = bookmark name");
+                assert!(page.is_none() && point.is_none(), "no page/point in DOCX");
+            }
+            other => panic!("expected Named target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hyperlink_external_rid_becomes_external_ref() {
+        // `<w:hyperlink r:id="rId7">` resolved via rels (TargetMode=External)
+        // → ExternalRef::Uri { url } with the visible text.
+        let doc = r#"<w:document><w:body>
+            <w:p><w:r><w:t>Visit </w:t></w:r><w:hyperlink r:id="rId7"><w:r><w:t>our site</w:t></w:r></w:hyperlink></w:p>
+        </w:body></w:document>"#;
+        let rels = rels_map(&[("rId7", "https://example.com/", true)]);
+        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        assert_eq!(els.len(), 1);
+        assert_eq!(els[0].text, "Visit our site");
+        assert_eq!(els[0].external_refs.len(), 1, "one ExternalRef");
+        assert!(els[0].internal_refs.is_empty());
+        let r = &els[0].external_refs[0];
+        assert_eq!(r.text, "our site");
+        assert!(r.source_page.is_none() && r.source_bbox.is_none());
+        match &r.target {
+            ExternalRefTarget::Uri { url } => assert_eq!(url, "https://example.com/"),
+        }
+    }
+
+    #[test]
+    fn hyperlink_non_external_rid_is_skipped() {
+        // An `r:id` whose rels target is NOT external (internal-part link) →
+        // out of scope; no ref emitted, but the run text stays inline.
+        let doc = r#"<w:document><w:body>
+            <w:p><w:hyperlink r:id="rId3"><w:r><w:t>internal part</w:t></w:r></w:hyperlink></w:p>
+        </w:body></w:document>"#;
+        let rels = rels_map(&[("rId3", "media/image1.png", false)]);
+        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        assert_eq!(els.len(), 1);
+        assert_eq!(els[0].text, "internal part", "text stays inline");
+        assert!(
+            els[0].internal_refs.is_empty() && els[0].external_refs.is_empty(),
+            "non-External r:id emits no ref (decision 7)"
+        );
+    }
+
+    #[test]
+    fn hyperlink_unresolved_rid_is_skipped() {
+        // An `r:id` absent from rels (dangling) → no ref, text preserved.
+        let doc = r#"<w:document><w:body>
+            <w:p><w:hyperlink r:id="rIdMissing"><w:r><w:t>dangling</w:t></w:r></w:hyperlink></w:p>
+        </w:body></w:document>"#;
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(els[0].text, "dangling");
+        assert!(els[0].internal_refs.is_empty() && els[0].external_refs.is_empty());
+    }
+
+    #[test]
+    fn hyperlink_anchor_wins_when_both_present() {
+        // A hyperlink carrying both w:anchor and r:id → InternalRef (anchor is
+        // the same-document target; contract maps anchor → internal).
+        let doc = r#"<w:document><w:body>
+            <w:p><w:hyperlink w:anchor="here" r:id="rId7"><w:r><w:t>both</w:t></w:r></w:hyperlink></w:p>
+        </w:body></w:document>"#;
+        let rels = rels_map(&[("rId7", "https://example.com/", true)]);
+        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        assert_eq!(els[0].internal_refs.len(), 1, "anchor takes precedence");
+        assert!(els[0].external_refs.is_empty());
+    }
+
+    #[test]
+    fn hyperlink_emphasis_in_visible_text_is_captured() {
+        // The captured visible text is the *wrapped* run concatenation, so an
+        // emphasized link text round-trips its markdown marks into ref.text.
+        let doc = r#"<w:document><w:body>
+            <w:p><w:hyperlink w:anchor="x"><w:r><w:rPr><w:b/></w:rPr><w:t>Bold Link</w:t></w:r></w:hyperlink></w:p>
+        </w:body></w:document>"#;
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(els[0].internal_refs[0].text, "**Bold Link**");
+    }
+
+    #[test]
+    fn multiple_hyperlinks_in_one_paragraph() {
+        // Two links in one paragraph → two refs, each with its own slice of
+        // visible text (offset-based capture keeps them separate).
+        let doc = r#"<w:document><w:body>
+            <w:p><w:hyperlink w:anchor="a"><w:r><w:t>first</w:t></w:r></w:hyperlink><w:r><w:t> and </w:t></w:r><w:hyperlink r:id="rId9"><w:r><w:t>second</w:t></w:r></w:hyperlink></w:p>
+        </w:body></w:document>"#;
+        let rels = rels_map(&[("rId9", "https://ex/", true)]);
+        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        assert_eq!(els[0].text, "first and second");
+        assert_eq!(els[0].internal_refs.len(), 1);
+        assert_eq!(els[0].internal_refs[0].text, "first");
+        assert_eq!(els[0].external_refs.len(), 1);
+        assert_eq!(els[0].external_refs[0].text, "second");
+    }
+
+    #[test]
+    fn hyperlink_in_table_cell_attaches_to_table_node() {
+        // A hyperlink inside a table cell → its ref bubbles up to the one
+        // Table node (decision 6 flattens the table to a single node).
+        let doc = r#"<w:document><w:body>
+            <w:tbl><w:tr>
+                <w:tc><w:p><w:hyperlink r:id="rId5"><w:r><w:t>cell link</w:t></w:r></w:hyperlink></w:p></w:tc>
+                <w:tc><w:p><w:hyperlink w:anchor="bm"><w:r><w:t>cell anchor</w:t></w:r></w:hyperlink></w:p></w:tc>
+            </w:tr></w:tbl>
+        </w:body></w:document>"#;
+        let rels = rels_map(&[("rId5", "https://cell/", true)]);
+        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        assert_eq!(els.len(), 1);
+        assert_eq!(els[0].element_type, SemanticElementType::Table);
+        assert_eq!(els[0].external_refs.len(), 1, "external cell link → Table");
+        assert_eq!(els[0].external_refs[0].text, "cell link");
+        assert_eq!(els[0].internal_refs.len(), 1, "anchor cell link → Table");
+        assert_eq!(els[0].internal_refs[0].text, "cell anchor");
     }
 
     #[test]
@@ -1347,7 +1702,7 @@ mod tests {
                 <w:tr><w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc></w:tr>
             </w:tbl>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new()).unwrap();
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].element_type, SemanticElementType::Table);
         assert_eq!(els[0].text, "a | b\n1 | 2");
@@ -1358,7 +1713,7 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:tbl><w:tr><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Head</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new()).unwrap();
+        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els[0].text, "**Head**", "bold cell projects to `**…**`");
     }
 }
