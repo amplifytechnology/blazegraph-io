@@ -1275,6 +1275,12 @@ pub enum ParsedElementType {
     Header,
     Footer,
     Margin,
+    /// CR-79 (Tier 1): a region leaf the `TableDetectionRule` tagged as a
+    /// table from its `RegionSignature` (multi-column + regular rows). It is
+    /// an additive marker — set on every element in a qualifying region so
+    /// NodeTypeClustering fuses the whole region into one `Table` node (bbox =
+    /// union). No cell/row/column structure (that is Tier 2).
+    Table,
 }
 
 impl ParsedElementType {

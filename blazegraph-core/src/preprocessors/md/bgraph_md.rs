@@ -1133,6 +1133,24 @@ mod tests {
         assert_eq!(tbl.content.text, raw_table);
     }
 
+    /// CR-79 — a `Table` node round-trips with full emit→parse symmetry: the
+    /// reconstructed graph is canonical-equal to the original and the parse
+    /// identity is `Verified`. This is the round-trip acceptance for the Tier 1
+    /// table node the `TableDetectionRule` produces.
+    #[test]
+    fn parse_table_node_round_trip_symmetry_cr79() {
+        let raw_table = "| col a | col b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
+        let original =
+            build_synthetic_graph(vec![("Table", raw_table, 1, 0)], Some("CR-79 Table"), None);
+        let md = emit_markdown(&original);
+        let result = parse(&md, ParseOptions::default()).expect("table node round-trips");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        assert_eq!(canonical(&result.graph), canonical(&original));
+        // Second emit is byte-identical (idempotent emit on a parsed graph).
+        let md2 = emit_markdown(&result.graph);
+        assert_eq!(md, md2, "second emit must be byte-identical");
+    }
+
     #[test]
     fn parse_round_trip_with_reserved_prefix_in_body_self_referential() {
         // v2.0.0 escape contract: a Paragraph body containing the

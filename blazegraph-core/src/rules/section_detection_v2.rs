@@ -848,9 +848,18 @@ impl<'a> SectionDetectionV2Rule<'a> {
         // `placement.region_label` (Block 07). Skip section detection on them
         // so running headers, footers, and out-of-region marginalia never get
         // promoted to Section.
+        // CR-79: TableDetection runs before V2 and tags whole region leaves
+        // `Table`. Section detection must not re-type them — preserve the tag
+        // so the leaf reaches NodeTypeClustering as `Table` and fuses into one
+        // table node. (V2 only ever promotes Paragraph→Section, so this is a
+        // belt-and-suspenders guard against the pattern-refinement pass ever
+        // matching a Table fragment.)
         if matches!(
             current_element.element_type,
-            ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
+            ParsedElementType::Header
+                | ParsedElementType::Footer
+                | ParsedElementType::Margin
+                | ParsedElementType::Table
         ) {
             let content_level = hierarchy_context.get_content_level();
             return (current_element.element_type.clone(), content_level, 0);

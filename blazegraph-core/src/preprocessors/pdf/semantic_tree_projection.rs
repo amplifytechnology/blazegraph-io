@@ -216,6 +216,9 @@ fn project_element_type(input: &ParsedElementType) -> SemanticElementType {
         ParsedElementType::Header => SemanticElementType::Header,
         ParsedElementType::Footer => SemanticElementType::Footer,
         ParsedElementType::Margin => SemanticElementType::Margin,
+        // CR-79 (Tier 1): a region leaf tagged Table by the TableDetectionRule
+        // projects to the channel-agnostic Table node type.
+        ParsedElementType::Table => SemanticElementType::Table,
     }
 }
 

@@ -259,7 +259,8 @@ impl<'a> SpatialClusteringRule<'a> {
             | ParsedElementType::ListItem
             | ParsedElementType::Header
             | ParsedElementType::Footer
-            | ParsedElementType::Margin => &self.config.spatial_clustering.paragraphs,
+            | ParsedElementType::Margin
+            | ParsedElementType::Table => &self.config.spatial_clustering.paragraphs,
         }
     }
 

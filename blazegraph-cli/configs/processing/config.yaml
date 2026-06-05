@@ -77,6 +77,15 @@ graph_sanity:
 # NEW APPROACH: Section detection FIRST, then spatial clustering
 pipeline:
   rules:
+    # CR-79 (Tier 1) — PARKED 2026-06-05. The pipe + signals are fully wired
+    # but DISABLED: the leaf-level feature signal is directional, not cleanly
+    # separable (see CR-79 "Parked" section). Re-enable when a future session
+    # finds the separator. When on, it tags table region leaves Table FIRST so
+    # they leave section detection's population and graph_sanity sees a clean
+    # remainder. Analytics signals (grid_vcuts/aligned_cols/column_consistency)
+    # keep computing regardless — they're the resume substrate.
+    - name: "TableDetection"
+      enabled: false
     - name: "SectionDetectionV2"
       enabled: true
     - name: "PatternBasedSectionDetection"
@@ -89,6 +98,28 @@ pipeline:
       enabled: false
     - name: "Validation"
       enabled: false
+
+# CR-79 (Tier 1) table detection. Reads the per-region `RegionSignature`
+# (already computed in analytics/page_stats) and tags qualifying body leaves
+# Table; NodeTypeClustering then fuses each tagged region into one Table node
+# (bbox = union). It TAGS, it does not extract cells — that is Tier 2.
+#
+# table  ⇔  n_peaks >= min_peaks_x  &&  n_peaks_y >= min_peaks_y
+#       &&  y_peak_cv <= max_y_peak_cv  &&  density >= min_density
+#
+# min_peaks_x / min_peaks_y are unambiguous (>=2 = multi-column / multi-row).
+# max_y_peak_cv (row-regularity ceiling) and min_density (fill-ratio floor) are
+# the eyeball-tuned thresholds — calibrate against the off-wire debug dump
+# (cache/table/<doc>.table.json).
+table_detection:
+  enabled: true
+  # v2 metric (cv dropped — it was backwards). AND-gated for precision.
+  min_rows: 2                  # n_peaks_y >= : multi-row
+  min_cols: 2                  # aligned_cols >= : columns recurring across rows (signal B)
+  min_grid_vcuts: 1            # grid_vcuts >= : XY-cut column grid absorbed (signal A)
+  min_column_consistency: 0.6  # mean fill of aligned columns (signal B) — TUNE
+  min_density: 0.0             # soft floor, default off
+
 section_detection_v2:
   # Font size tolerance (points). Defines the ±tolerance band around body size.
   # delta < -tolerance             → REJECT
@@ -284,6 +315,20 @@ node_type_clustering:
   margin:
     # Keep region_label as a partition dimension — sidebars and edge-marginal
     # notes in different leaves are distinct logical units.
+    same_line: false
+    same_paragraph: false
+    same_depth: false
+    ignore_region_label: false
+    max_y_gap: null
+    prose_line_separator: " "
+    table_line_separator: "\n"
+
+  table:
+    # CR-79 (Tier 1) — fuse the WHOLE region into one Table node. A table spans
+    # many lines / paragraphs / Y-gaps, so every within-region gate is dropped;
+    # the region IS the table boundary (one node per region leaf). Two stacked
+    # tables in distinct leaves keep distinct region_label → stay separate; a
+    # table never fuses with adjacent prose (type differs).
     same_line: false
     same_paragraph: false
     same_depth: false
