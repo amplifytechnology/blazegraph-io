@@ -42,10 +42,11 @@ enum Command {
     /// Parse a document into a semantic graph (or emit it back to
     /// markdown).
     ///
-    /// Input formats: `.pdf` (PDF channel) and `.bgraph.md` / `.md`
-    /// (markdown channel — bgraph.md round-trip artifact or generic
-    /// markdown, lib auto-detects). Format detection is by extension
-    /// first; content-sniff for unknown extensions.
+    /// Input formats: `.pdf` (PDF channel), `.docx` (OOXML channel),
+    /// and `.bgraph.md` / `.md` (markdown channel — bgraph.md
+    /// round-trip artifact or generic markdown, lib auto-detects).
+    /// Format detection is by extension first; content-sniff for
+    /// unknown extensions.
     Parse(ParseArgs),
 
     /// Strip bgraph fences from a bgraph.md file.
@@ -63,7 +64,7 @@ enum Command {
 
 #[derive(ClapArgs)]
 struct ParseArgs {
-    /// Path to the input file (PDF, .bgraph.md, or .md).
+    /// Path to the input file (PDF, .docx, .bgraph.md, or .md).
     #[arg(short, long, default_value = "../sample_pdfs/sample3.pdf")]
     input: String,
 
@@ -337,11 +338,13 @@ fn run_parse(args: ParseArgs) -> Result<()> {
     match detect_input_format(Path::new(&args.input))? {
         InputFormat::Markdown { content } => run_parse_markdown(args, content),
         InputFormat::Pdf => run_parse_pdf(args, cache_dir),
+        InputFormat::Docx => run_parse_docx(args),
         InputFormat::Unknown => Err(anyhow!(
             "❌ Input format not recognized: {}\n\
              \n\
              Supported formats:\n\
              \t.pdf            — PDF documents (full parsing pipeline)\n\
+             \t.docx           — Word documents (OOXML channel)\n\
              \t.bgraph.md      — Blazegraph markdown round-trip artifact\n\
              \t.md, .markdown  — Generic markdown\n",
             args.input
@@ -513,13 +516,64 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
         }
     }
 
-    let graph = result.graph;
+    emit_parsed_graph(&args, result.graph)
+}
+
+// =========================================================================
+// DOCX channel (C4)
+// =========================================================================
+
+fn run_parse_docx(args: ParseArgs) -> Result<()> {
+    use blazegraph_io_core::preprocessors::docx::parse_docx;
+    use blazegraph_io_core::preprocessors::md::ParseOptions;
+
+    println!("📄 Parsing DOCX: {}", args.input);
+
+    // The lib's `parse_docx` takes raw zip bytes (no pre-read in
+    // `detect_input_format`, mirroring the PDF arm).
+    let bytes =
+        std::fs::read(&args.input).map_err(|e| anyhow!("failed to read {}: {e}", args.input))?;
+
+    // `ParseOptions` is shared with the markdown channel; `accept_drift`
+    // is meaningless for DOCX (no embedded `graph_sha256` to verify),
+    // but we thread it through for API symmetry.
+    let opts = ParseOptions {
+        accept_drift: args.accept_drift,
+    };
+    let result = parse_docx(&bytes, opts).map_err(|e| anyhow!("\n❌ DOCX parse failed: {e}\n"))?;
+
+    let mut graph = result.graph;
+
+    // The lib leaves `source_filename` empty — same convention as the
+    // markdown channel; the CLI owns the filename. Overwrite the
+    // provenance's `source_filename` with the input basename.
+    if let Some(prov) = graph.document_info.parse_provenance.as_mut() {
+        prov.source_filename = Path::new(&args.input)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&args.input)
+            .to_string();
+    }
+
+    emit_parsed_graph(&args, graph)
+}
+
+/// Shared emit/output tail for the markdown and DOCX channels: log the
+/// node count, resolve the output path by `-f`, and write via
+/// `save_graph` (graph / sequential / flat / markdown / bgraph-md).
+///
+/// Factored out of `run_parse_markdown` so the DOCX path emits through
+/// the identical logic — every input parses to the channel-agnostic
+/// canonical graph first, and the emit format is chosen by `-f` alone
+/// (the B6 routing rule). The PDF channel keeps its own success-branch
+/// tail because it carries extra concerns (JVM fast-exit, stage dump).
+fn emit_parsed_graph(args: &ParseArgs, graph: DocumentGraph) -> Result<()> {
     println!("📊 Graph: {} nodes", graph.nodes.len());
 
     // CR-59 (v2.1.0+): style emission is opt-in. Pipeline keeps
     // `node.style_info` populated for library consumers; the bgraph.md
     // serializer is gated via `EmitOptions::include_style_info`.
-    let output_path = resolve_output_path(&args);
+    let output_path = resolve_output_path(args);
     save_graph(
         &graph,
         &output_path,
@@ -611,6 +665,11 @@ enum InputFormat {
     /// generic markdown). The lib's `parse_markdown` dispatcher
     /// content-sniffs and routes; the CLI just passes the bytes.
     Markdown { content: String },
+    /// DOCX input (OOXML WordprocessingML). Like the PDF variant, the
+    /// bytes are read in the dispatched `run_parse_docx` (the lib's
+    /// `parse_docx` takes the raw zip bytes), so this variant carries
+    /// no payload — extension detection alone selects it.
+    Docx,
     /// Unknown extension and content does not look like markdown.
     Unknown,
 }
@@ -638,6 +697,11 @@ fn detect_input_format(path: &Path) -> Result<InputFormat> {
 
     match ext_lower.as_deref() {
         Some("pdf") => Ok(InputFormat::Pdf),
+        // Extension is decisive for DOCX — no content sniff. The bytes
+        // are read in `run_parse_docx` (the lib's `parse_docx` takes
+        // raw zip bytes), mirroring the PDF arm's "read in the channel"
+        // shape rather than the markdown arm's pre-read.
+        Some("docx") => Ok(InputFormat::Docx),
         Some("md") | Some("markdown") => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
@@ -782,7 +846,7 @@ fn show_help() {
 
     println!("\n📋 `parse` options:");
     println!("  --config <path>         Load custom config file (PDF only)");
-    println!("  --input <path>          Input file (PDF, .bgraph.md, or .md)");
+    println!("  --input <path>          Input file (PDF, .docx, .bgraph.md, or .md)");
     println!("  --output <path>         Output file path (auto-generated if not specified)");
     println!("  --output-format <fmt>   Output format: graph, sequential, flat, or markdown");
     println!("  --accept-drift          Accept hash-drifted bgraph.md input (returns derivative)");
@@ -805,6 +869,7 @@ fn show_help() {
 
     println!("\n📥 Input Formats (parse, auto-detected):");
     println!("  .pdf                    PDF channel (full pipeline)");
+    println!("  .docx                   Word/OOXML channel (S10 Track C)");
     println!("  .bgraph.md              bgraph.md round-trip artifact");
     println!("  .md / .markdown         Generic markdown (B6)");
 
@@ -821,6 +886,8 @@ fn show_help() {
 
     println!("\n📝 Usage Examples:");
     println!("  blazegraph parse -i document.pdf");
+    println!("  blazegraph parse -i document.docx");
+    println!("  blazegraph parse -i document.docx -f markdown -o document.md");
     println!("  blazegraph parse -i document.pdf -f bgraph-md -o document.bgraph.md");
     println!("  blazegraph parse -i document.md -f markdown -o roundtrip.md");
     println!("  blazegraph parse -i document.md -f graph -o document.json");
