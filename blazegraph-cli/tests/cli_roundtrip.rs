@@ -660,6 +660,102 @@ fn cli_generic_markdown_roundtrip_via_dash_f_markdown() {
 }
 
 #[test]
+fn parse_docx_fixture_produces_graph() {
+    // C4: `.docx` input is dispatched to the DOCX channel
+    // (`parse_docx`) through the CLI surface. Parse the clean
+    // purpose-built `structured.docx` fixture and assert a non-empty
+    // graph with both Sections and Paragraphs (the fixture carries 6
+    // Sections incl. a Title, 6 Paragraphs incl. TOC lines, 1 Table,
+    // and 1 Blockquote — see the C1 orchestrator addendum).
+    //
+    // Fixture lives in the sibling core crate; resolve relative to this
+    // crate's manifest dir so the test is CWD-independent.
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../blazegraph-core/test_fixtures/docx/structured.docx");
+    assert!(
+        fixture.exists(),
+        "docx fixture missing at {}",
+        fixture.display()
+    );
+
+    let dir = unique_temp_dir("docx-fixture");
+    let out_json = dir.join("structured.json");
+
+    let output = Command::new(BIN)
+        .args([
+            "parse",
+            "-i",
+            fixture.to_str().unwrap(),
+            "-o",
+            out_json.to_str().unwrap(),
+            "-f",
+            "graph",
+        ])
+        .output()
+        .expect("CLI binary spawns");
+    assert!(
+        output.status.success(),
+        "CLI exited non-zero parsing docx fixture: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Read the CLI-saved graph back and assert structure.
+    let raw = std::fs::read_to_string(&out_json).expect("read docx graph json");
+    let sorted: SortedDocumentGraph =
+        serde_json::from_str(&raw).expect("CLI-saved docx JSON deserializes");
+
+    assert!(
+        !sorted.nodes.is_empty(),
+        "docx parse must produce a non-empty graph"
+    );
+
+    let section_count = sorted
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "Section")
+        .count();
+    let paragraph_count = sorted
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "Paragraph")
+        .count();
+    assert!(
+        section_count > 0,
+        "docx graph must contain Section nodes; node types present: {:?}",
+        sorted
+            .nodes
+            .iter()
+            .map(|n| n.node_type.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        paragraph_count > 0,
+        "docx graph must contain Paragraph nodes; node types present: {:?}",
+        sorted
+            .nodes
+            .iter()
+            .map(|n| n.node_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // The DOCX channel stamps `source_format = "docx"`, and the CLI
+    // overwrites the lib-empty `source_filename` with the input
+    // basename.
+    let prov = sorted
+        .document_info
+        .parse_provenance
+        .as_ref()
+        .expect("docx graph carries parse provenance");
+    assert_eq!(prov.source_format, "docx", "source_format must be docx");
+    assert_eq!(
+        prov.source_filename, "structured.docx",
+        "CLI must overwrite source_filename with the input basename"
+    );
+}
+
+#[test]
 fn cli_unknown_input_format_errors_with_clear_message() {
     let dir = unique_temp_dir("unknown-format");
     let unknown = dir.join("data.xyz");
