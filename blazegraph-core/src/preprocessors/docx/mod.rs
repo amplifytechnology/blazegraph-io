@@ -22,6 +22,7 @@
 //! land in later handoffs (C3 / C2).
 
 pub mod body;
+pub(crate) mod rels;
 
 pub use body::parse_docx;
 
