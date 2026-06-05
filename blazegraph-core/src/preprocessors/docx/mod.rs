@@ -10,6 +10,20 @@
 //! its method bodies populated from `docProps/core.xml`,
 //! `docProps/app.xml`, and `docProps/custom.xml` per the inventory probe
 //! at `scripts/docx_metadata_probe.py`.
+//!
+//! ## Body channel (C1, S10)
+//!
+//! [`body::parse_docx`] is the live entry point: `.docx` zip bytes →
+//! `DocumentGraph`, mirroring the markdown channel's
+//! [`crate::preprocessors::md::generic_md::parse`]. It owns the OOXML
+//! container read, the `styles.xml` resolution map, the `<w:body>` walk, and
+//! the Section/Paragraph/Table/Blockquote projection with emphasis
+//! canonicalization. Metadata (`DocxMetadataExtractor`) and ref extraction
+//! land in later handoffs (C3 / C2).
+
+pub mod body;
+
+pub use body::parse_docx;
 
 use crate::preprocessors::metadata::MetadataExtractor;
 use crate::types::{ChannelMetadata, DocxMetadata};

@@ -195,4 +195,12 @@ pub enum ParseError {
         parsed: String,
         expected: String,
     },
+
+    /// The DOCX container could not be read as a WordprocessingML document:
+    /// the bytes are not a valid ZIP, `word/document.xml` is absent, or its
+    /// XML is malformed. Carries a human-facing detail. (S10 / Track C — the
+    /// DOCX channel shares this `ParseError` enum with the markdown channel
+    /// since both project to the same `ParseResult`.)
+    #[error("malformed docx: {0}")]
+    MalformedDocx(String),
 }
