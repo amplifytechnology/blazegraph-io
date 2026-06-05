@@ -292,8 +292,10 @@ mod tests {
         // Empty hash → empty channel-md namespace (extractor still
         // returns Some(MdMetadata::default()) so downstream code that
         // assumes `md.is_some()` after parsing MD frontmatter holds).
-        assert!(
-            meta.md.as_ref().map(|m| m.extras.is_empty()).unwrap_or(true)
-        );
+        assert!(meta
+            .md
+            .as_ref()
+            .map(|m| m.extras.is_empty())
+            .unwrap_or(true));
     }
 }

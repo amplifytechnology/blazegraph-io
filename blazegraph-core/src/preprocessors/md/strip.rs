@@ -158,8 +158,8 @@ fn strip_with_frontmatter(input: &str) -> Result<String, ParseError> {
         // artifact in the first place.
         return Ok(body);
     };
-    let mut value: serde_json::Value = serde_json::from_str(json_line)
-        .map_err(|source| ParseError::JsonParse { source })?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(json_line).map_err(|source| ParseError::JsonParse { source })?;
     if let Some(obj) = value.as_object_mut() {
         // Forward-compat: drop `bookmarks` if it surfaces at top level.
         obj.remove("bookmarks");
@@ -627,16 +627,13 @@ fn main() {}
         let yaml_payload = &after_open[..close_idx];
         let yaml_payload_with_nl = format!("{yaml_payload}\n");
         // YAML round-trips.
-        let parsed: serde_json::Value = serde_yaml::from_str(&yaml_payload_with_nl)
-            .expect("frontmatter YAML must parse");
+        let parsed: serde_json::Value =
+            serde_yaml::from_str(&yaml_payload_with_nl).expect("frontmatter YAML must parse");
         assert_eq!(
             parsed.get("graph_sha256").and_then(|v| v.as_str()),
             Some("deadbeef")
         );
-        assert_eq!(
-            parsed.get("schema").and_then(|v| v.as_str()),
-            Some("2.0.0")
-        );
+        assert_eq!(parsed.get("schema").and_then(|v| v.as_str()), Some("2.0.0"));
         // Exactly one blank line between `---` close and body.
         // After `\n---\n` (the close), the next two bytes should be
         // `\n<non-blank>` — i.e., a single blank then content.
@@ -685,9 +682,9 @@ fn main() {}
         ];
         let mut last_idx: Option<usize> = None;
         for key in expected_order {
-            let idx = frontmatter
-                .find(key)
-                .unwrap_or_else(|| panic!("canonical key {key} missing in frontmatter:\n{frontmatter}"));
+            let idx = frontmatter.find(key).unwrap_or_else(|| {
+                panic!("canonical key {key} missing in frontmatter:\n{frontmatter}")
+            });
             if let Some(prev) = last_idx {
                 assert!(
                     idx > prev,
@@ -711,10 +708,12 @@ fn main() {}
             .map(|(yaml, _rest)| yaml)
             .expect("frontmatter must be delimited");
         let yaml_with_nl = format!("{frontmatter}\n");
-        let parsed: serde_json::Value =
-            serde_yaml::from_str(&yaml_with_nl).expect("YAML parses");
+        let parsed: serde_json::Value = serde_yaml::from_str(&yaml_with_nl).expect("YAML parses");
         let source = parsed.get("source").expect("source key present");
-        assert!(source.is_object(), "source must be a nested map, got: {source:?}");
+        assert!(
+            source.is_object(),
+            "source must be a nested map, got: {source:?}"
+        );
         assert_eq!(
             source.get("format").and_then(|v| v.as_str()),
             Some("pdf"),
@@ -813,8 +812,7 @@ fn main() {}
     #[test]
     fn cr55_test6_node_types_lib_removes_matching_element_body_and_fence() {
         let md = sample_bgraph_md();
-        let out =
-            strip(&md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(&md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         assert!(
             !out.contains("```bgraph-header"),
             "header fence must be removed; got:\n{out}"
@@ -838,11 +836,8 @@ fn main() {}
     #[test]
     fn cr55_test7_node_types_composed_with_body_only_pass() {
         let md = sample_bgraph_md();
-        let after_filter = strip(
-            &md,
-            StripMode::NodeTypes(vec!["header".to_string()]),
-        )
-        .expect("filter pass OK");
+        let after_filter =
+            strip(&md, StripMode::NodeTypes(vec!["header".to_string()])).expect("filter pass OK");
         let out = strip(&after_filter, StripMode::BodyOnly).expect("body-only pass OK");
         // No frontmatter under body-only.
         assert!(
@@ -876,8 +871,7 @@ Body paragraph.
 {\"id\":\"y\",\"text_order\":1}
 ```
 ";
-        let out =
-            strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         assert!(!out.contains("Running header"));
         assert!(!out.contains("```bgraph-header"));
         // Paragraph element survives.
@@ -909,8 +903,7 @@ previous body
 {\"id\":\"h\",\"text_order\":1}
 ```
 ";
-        let out =
-            strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         // Header fence pair gone.
         assert!(!out.contains("```bgraph-header"));
         // Previous element fully intact.
@@ -942,8 +935,7 @@ A paragraph that mentions the reserved prefix in its body:
         // The indented `   ```bgraph-header` line is NOT a fence
         // (not at column zero). Asking to strip headers must therefore
         // leave the paragraph's body intact.
-        let out =
-            strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         assert!(
             out.contains("mentions the reserved prefix"),
             "paragraph body must survive when reserved-prefix appears only mid-body; got:\n{out}"

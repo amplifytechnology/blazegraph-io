@@ -1079,11 +1079,26 @@ merge_bands: false
         // distinct lines, and a deliberately large Y-gap between rows. Under
         // the Paragraph default these would split; under Table they must fuse.
         let mut p_a = mk_placement_in_region(5, 0, 0, 100.0, Some("2-1"));
-        p_a.bounding_box = BoundingBox { x: 0.0, y: 100.0, width: 50.0, height: 10.0 };
+        p_a.bounding_box = BoundingBox {
+            x: 0.0,
+            y: 100.0,
+            width: 50.0,
+            height: 10.0,
+        };
         let mut p_b = mk_placement_in_region(5, 1, 1, 300.0, Some("2-1"));
-        p_b.bounding_box = BoundingBox { x: 60.0, y: 300.0, width: 50.0, height: 10.0 };
+        p_b.bounding_box = BoundingBox {
+            x: 60.0,
+            y: 300.0,
+            width: 50.0,
+            height: 10.0,
+        };
         let mut p_c = mk_placement_in_region(5, 2, 2, 500.0, Some("2-1"));
-        p_c.bounding_box = BoundingBox { x: 20.0, y: 500.0, width: 80.0, height: 10.0 };
+        p_c.bounding_box = BoundingBox {
+            x: 20.0,
+            y: 500.0,
+            width: 80.0,
+            height: 10.0,
+        };
 
         let els = vec![
             mk_element(ParsedElementType::Table, "h1 h2", 3, 0, p_a),

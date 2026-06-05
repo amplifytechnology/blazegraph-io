@@ -979,8 +979,10 @@ mod tests {
         );
         let out = parse_xhtml(&xhtml).expect("parse should succeed");
         assert_eq!(out.text_elements.len(), 1);
-        assert!(out.text_elements[0].link.is_none(),
-            "spans without data-link-* should produce link: None");
+        assert!(
+            out.text_elements[0].link.is_none(),
+            "spans without data-link-* should produce link: None"
+        );
     }
 
     /// CR-40 acceptance: spans inside `<aside data-rotation="...">` inherit
@@ -1146,8 +1148,26 @@ mod tests {
         // Segments are 0, 1, 2 in Tika emission order, but visual order is
         // body0 → MAY → body1.
         let mut elements: Vec<PdfTextElement> = vec![
-            mk_test_element(1, "received. An implementation ", 65.9, 457.0, 0, 2, 0, None),
-            mk_test_element(1, " interrupt delivery of stream data", 228.0, 457.0, 0, 2, 1, None),
+            mk_test_element(
+                1,
+                "received. An implementation ",
+                65.9,
+                457.0,
+                0,
+                2,
+                0,
+                None,
+            ),
+            mk_test_element(
+                1,
+                " interrupt delivery of stream data",
+                228.0,
+                457.0,
+                0,
+                2,
+                1,
+                None,
+            ),
             mk_test_element(1, "MAY", 207.1, 457.0, 0, 2, 2, None),
         ];
 
@@ -1232,15 +1252,9 @@ mod tests {
             "3.1 approach 1: fix model sizes",
         );
         // Single-level numeric prefix.
-        assert_eq!(
-            normalize_for_match("5. Conclusion"),
-            "5 conclusion",
-        );
+        assert_eq!(normalize_for_match("5. Conclusion"), "5 conclusion",);
         // Letter-then-optional-digit prefix (appendix style).
-        assert_eq!(
-            normalize_for_match("A. Appendix"),
-            "a appendix",
-        );
+        assert_eq!(normalize_for_match("A. Appendix"), "a appendix",);
         assert_eq!(
             normalize_for_match("B1. Detailed Notes"),
             "b1 detailed notes",
@@ -1275,10 +1289,7 @@ mod tests {
         );
         // No whitespace after the prefix-shape dot → not a prefix
         // either (this is a numbered identifier, not a header).
-        assert_eq!(
-            normalize_for_match("3.14is pi"),
-            "3.14is pi",
-        );
+        assert_eq!(normalize_for_match("3.14is pi"), "3.14is pi",);
         // Lowercase-letter prefix is not in the allowed grammar.
         assert_eq!(
             normalize_for_match("a. lowercase header-ish"),

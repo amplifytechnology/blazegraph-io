@@ -137,11 +137,7 @@ fn corpus_rfc_quic_source_file_unmodified_after_strip() {
     let input = std::fs::read_to_string(&path).expect("read");
     let _ = strip(&input, StripMode::BodyWithFrontmatter).expect("default");
     let _ = strip(&input, StripMode::BodyOnly).expect("body-only");
-    let _ = strip(
-        &input,
-        StripMode::NodeTypes(vec!["header".to_string()]),
-    )
-    .expect("node-types");
+    let _ = strip(&input, StripMode::NodeTypes(vec!["header".to_string()])).expect("node-types");
 
     let after_meta = std::fs::metadata(&path).expect("re-stat");
     let after_mtime = after_meta.modified().expect("mtime");
@@ -150,8 +146,5 @@ fn corpus_rfc_quic_source_file_unmodified_after_strip() {
 
     assert_eq!(before_mtime, after_mtime, "source mtime must not change");
     assert_eq!(before_len, after_len, "source length must not change");
-    assert_eq!(
-        before_bytes, after_bytes,
-        "source bytes must not change"
-    );
+    assert_eq!(before_bytes, after_bytes, "source bytes must not change");
 }

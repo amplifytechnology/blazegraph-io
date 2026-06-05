@@ -445,14 +445,13 @@ fn cli_strip_default_mode_emits_frontmatter() {
         .map(|(yaml, _)| yaml)
         .expect("frontmatter delimited");
     let yaml_str = format!("{frontmatter}\n");
-    let parsed: serde_json::Value = serde_yaml::from_str(&yaml_str)
-        .expect("frontmatter must round-trip through serde_yaml");
+    let parsed: serde_json::Value =
+        serde_yaml::from_str(&yaml_str).expect("frontmatter must round-trip through serde_yaml");
     assert!(parsed.get("graph_sha256").is_some());
     // Body survives.
     assert!(out.contains("First paragraph body."));
     // Source file untouched (content sanity).
-    let src_after =
-        std::fs::read_to_string(&fixture_md).expect("read source after strip");
+    let src_after = std::fs::read_to_string(&fixture_md).expect("read source after strip");
     assert_eq!(md, src_after, "source file must not be modified by strip");
 }
 
@@ -551,10 +550,7 @@ fn cli_strip_rejects_bgraph_as_node_type() {
         ])
         .output()
         .expect("CLI binary spawns");
-    assert!(
-        !output.status.success(),
-        "`--node-types bgraph` must fail"
-    );
+    assert!(!output.status.success(), "`--node-types bgraph` must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("body-only"),

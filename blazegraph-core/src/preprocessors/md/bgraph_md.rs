@@ -70,10 +70,7 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                                 "duplicate doc-level bgraph fence".to_string(),
                             ));
                         }
-                        if metadata_seen
-                            || !parsed_elements.is_empty()
-                            || bookmarks.is_some()
-                        {
+                        if metadata_seen || !parsed_elements.is_empty() || bookmarks.is_some() {
                             return Err(ParseError::MalformedFence(
                                 "doc-level bgraph fence must appear first".to_string(),
                             ));
@@ -108,9 +105,8 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                             ));
                         }
                         metadata_seen = true;
-                        document_metadata =
-                            serde_json::from_str(body.trim_end_matches('\n'))
-                                .map_err(|source| ParseError::JsonParse { source })?;
+                        document_metadata = serde_json::from_str(body.trim_end_matches('\n'))
+                            .map_err(|source| ParseError::JsonParse { source })?;
                         pending_body = None;
                     }
                     "bgraph-bookmarks" => {
@@ -149,13 +145,8 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                             metadata: meta,
                         });
                     }
-                    "bgraph-paragraph"
-                    | "bgraph-header"
-                    | "bgraph-footer"
-                    | "bgraph-margin"
-                    | "bgraph-code-block"
-                    | "bgraph-list"
-                    | "bgraph-block-quote"
+                    "bgraph-paragraph" | "bgraph-header" | "bgraph-footer" | "bgraph-margin"
+                    | "bgraph-code-block" | "bgraph-list" | "bgraph-block-quote"
                     | "bgraph-table" => {
                         // v2.1.0+ single convention: body-outside for
                         // every content variant (including H/F/M; CR-48
@@ -727,8 +718,7 @@ mod tests {
     fn parse_doc_level_identity_plus_metadata_fence_round_trips_title() {
         // v2.1.0 (CR-56 § I.4): `title` lives in the bgraph-metadata
         // fence, not the doc-level block. Round-trip still recovers it.
-        let graph =
-            build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], Some("Title"), None);
+        let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], Some("Title"), None);
         let md = emit_markdown(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let info = &result.graph.document_info;

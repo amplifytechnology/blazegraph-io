@@ -796,8 +796,7 @@ mod tests {
         let graph = parse_ok("This is **_combined_** styling.\n");
         let nodes = nodes_in_order(&graph);
         assert_eq!(
-            nodes[0].content.text,
-            "This is ***combined*** styling.",
+            nodes[0].content.text, "This is ***combined*** styling.",
             "Combined bold-italic should normalize to ***triple-asterisk*** form",
         );
     }

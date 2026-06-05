@@ -75,9 +75,7 @@ pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> S
     // every emitted bgraph.md, even when all fields are null. Placed
     // immediately after the doc-level `bgraph` block, before any
     // `bgraph-bookmarks` fence.
-    parts.push(emit_metadata_block(
-        &graph.document_info.document_metadata,
-    ));
+    parts.push(emit_metadata_block(&graph.document_info.document_metadata));
     parts.push(String::new());
 
     // Optional `bgraph-bookmarks` fence — emitted only when the source
@@ -125,8 +123,7 @@ fn emit_bookmarks_block(graph: &DocumentGraph) -> Option<String> {
 /// Always emitted by v2.1.0+ even when every field is null — the fence's
 /// presence is part of the wire-format contract (CR-56 § I.3).
 fn emit_metadata_block(metadata: &DocumentMetadata) -> String {
-    let json = serde_json::to_string(metadata)
-        .expect("DocumentMetadata is always serializable");
+    let json = serde_json::to_string(metadata).expect("DocumentMetadata is always serializable");
     format!("```bgraph-metadata\n{json}\n```")
 }
 
@@ -731,11 +728,9 @@ mod tests {
 
         // Placement (v2.1.0+): bookmarks fence sits between the
         // bgraph-metadata block and the first per-element fence.
-        let metadata_close = md
-            .find("```\n\n```bgraph-bookmarks")
-            .expect(
-                "bookmarks fence should follow the metadata block, separated by exactly one blank line",
-            );
+        let metadata_close = md.find("```\n\n```bgraph-bookmarks").expect(
+            "bookmarks fence should follow the metadata block, separated by exactly one blank line",
+        );
         let first_section = md.find("```bgraph-section").expect("section fence");
         assert!(
             metadata_close < first_section,

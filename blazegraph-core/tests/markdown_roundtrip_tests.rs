@@ -270,11 +270,7 @@ fn roundtrip_identity_confidence_field_survives() {
         .find(|n| n.node_type == "Section")
         .expect("synthetic graph has a Section")
         .id;
-    original
-        .nodes
-        .get_mut(&section_id)
-        .unwrap()
-        .confidence = 7;
+    original.nodes.get_mut(&section_id).unwrap().confidence = 7;
 
     // `assert_roundtrip_identity` asserts graph_sha256(original) ==
     // graph_sha256(parsed); the embedded confidence is part of the canonical

@@ -678,7 +678,11 @@ fn compute_column_alignment(
     // Row id per span, by clustering y-centers (same rule as visual lines).
     let mut by_y: Vec<usize> = (0..spans.len()).collect();
     let yc = |i: usize| spans[i].bbox.y + spans[i].bbox.height / 2.0;
-    by_y.sort_by(|&a, &b| yc(a).partial_cmp(&yc(b)).unwrap_or(std::cmp::Ordering::Equal));
+    by_y.sort_by(|&a, &b| {
+        yc(a)
+            .partial_cmp(&yc(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut row_of = vec![0usize; spans.len()];
     let mut row = 0usize;
     let mut last_y = yc(by_y[0]);

@@ -244,8 +244,6 @@ fn parse_node_type(s: &str) -> std::result::Result<String, String> {
     }
 }
 
-
-
 /// CLI mirror of [`blazegraph_io_core::preprocessors::md::StripMode`]
 /// (the two exposed-as-`--mode` variants — `NodeTypes` is reached via
 /// the orthogonal `--node-types` flag, not as a `--mode` value).
@@ -436,7 +434,12 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
             // only the bgraph.md serializer gates emission, threaded
             // through `save_graph` → `EmitOptions::include_style_info`.
             let output_path = resolve_output_path(&args);
-            save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
+            save_graph(
+                &graph,
+                &output_path,
+                &args.output_format,
+                args.include_style_info,
+            )?;
 
             // Fast exit - skip JVM shutdown sequence
             #[cfg(feature = "jni-backend")]
@@ -517,7 +520,12 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
     // `node.style_info` populated for library consumers; the bgraph.md
     // serializer is gated via `EmitOptions::include_style_info`.
     let output_path = resolve_output_path(&args);
-    save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
+    save_graph(
+        &graph,
+        &output_path,
+        &args.output_format,
+        args.include_style_info,
+    )?;
     Ok(())
 }
 
@@ -804,7 +812,9 @@ fn show_help() {
     println!(
         "  --mode body-with-frontmatter  (default) Strip every fence; lift doc-level metadata to YAML frontmatter"
     );
-    println!("  --mode body-only        Remove all bgraph fences (Unstructured-equivalent body output)");
+    println!(
+        "  --mode body-only        Remove all bgraph fences (Unstructured-equivalent body output)"
+    );
     println!(
         "  --node-types <list>     Comma-sep types to strip entirely via structural rule (e.g. header,footer,margin)"
     );
@@ -816,9 +826,13 @@ fn show_help() {
     println!("  blazegraph parse -i document.md -f graph -o document.json");
     println!("  blazegraph parse -i document.bgraph.md -o document.json");
     println!("  blazegraph parse -i document.bgraph.md --accept-drift -o derived.json");
-    println!("  blazegraph strip -i document.bgraph.md -o document.md   # default: body+frontmatter");
+    println!(
+        "  blazegraph strip -i document.bgraph.md -o document.md   # default: body+frontmatter"
+    );
     println!("  blazegraph strip -i document.bgraph.md --mode body-only -o document_body.md");
-    println!("  blazegraph strip -i document.bgraph.md --node-types header,footer,margin -o clean.md");
+    println!(
+        "  blazegraph strip -i document.bgraph.md --node-types header,footer,margin -o clean.md"
+    );
 
     #[cfg(feature = "jni-backend")]
     {

@@ -144,7 +144,16 @@ fn emit_evidence_artifact(
         .per_node
         .iter()
         .filter(|(_, f)| f.any())
-        .map(|(id, _)| (*id, graph.nodes.get(id).and_then(|n| n.text_order).unwrap_or(u32::MAX)))
+        .map(|(id, _)| {
+            (
+                *id,
+                graph
+                    .nodes
+                    .get(id)
+                    .and_then(|n| n.text_order)
+                    .unwrap_or(u32::MAX),
+            )
+        })
         .collect();
     flagged.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -272,9 +281,7 @@ mod tests {
     use super::*;
     use crate::graphs::detectors::NodeFlags;
     use crate::graphs::graph_sanity::SanityReport;
-    use crate::types::{
-        BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation, StyleMetadata,
-    };
+    use crate::types::{BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation, StyleMetadata};
     use uuid::Uuid;
 
     /// Build root → one Section with given font + bbox, plus N extra sections.
@@ -295,7 +302,12 @@ mod tests {
             n.location.semantic.depth = 1;
             n.location.physical = Some(PhysicalLocation {
                 page: 1,
-                bounding_box: BoundingBox { x: 0.0, y: (i as f32) * 20.0, width: 100.0, height: 12.0 },
+                bounding_box: BoundingBox {
+                    x: 0.0,
+                    y: (i as f32) * 20.0,
+                    width: 100.0,
+                    height: 12.0,
+                },
             });
             n.style_info = Some(StyleMetadata {
                 font_class: String::new(),
@@ -323,7 +335,12 @@ mod tests {
             );
             ev.per_node.insert(
                 *id,
-                NodeFlags { font_stem: stem, height_flag: false, overlap_flag: false, count_flag: true },
+                NodeFlags {
+                    font_stem: stem,
+                    height_flag: false,
+                    overlap_flag: false,
+                    count_flag: true,
+                },
             );
         }
         ev.aggregate_verdicts(graph);
@@ -334,12 +351,19 @@ mod tests {
     /// byte-identical (no-op) and records a summary with pruned == 0.
     #[test]
     fn test_prune_noop_leaves_graph_byte_identical() {
-        let (mut graph, ids) =
-            build_sections(&[("1. Intro", Some("Times")), ("FLOPS", Some("DejaVuSans")), ("2. Body", Some("Times"))]);
+        let (mut graph, ids) = build_sections(&[
+            ("1. Intro", Some("Times")),
+            ("FLOPS", Some("DejaVuSans")),
+            ("2. Body", Some("Times")),
+        ]);
         let before = serde_json::to_string(&graph).unwrap();
         let evidence = flagged_evidence(&graph, &[ids[1]]);
         let mut report = SanityReport::default();
-        let cfg = SectionPruneConfig { enabled: true, prune_on_detection: false, emit_evidence_artifact: false };
+        let cfg = SectionPruneConfig {
+            enabled: true,
+            prune_on_detection: false,
+            emit_evidence_artifact: false,
+        };
 
         prune_sections(&mut graph, &evidence, &mut report, &cfg);
 
@@ -363,16 +387,32 @@ mod tests {
         ]);
         // Flag the DejaVuSans figure callout (the geometric signal).
         let evidence = flagged_evidence(&graph, &[ids[1]]);
-        assert!(evidence.bad_fonts.contains("dejavusans"), "dejavusans confirmed bad");
+        assert!(
+            evidence.bad_fonts.contains("dejavusans"),
+            "dejavusans confirmed bad"
+        );
         let mut report = SanityReport::default();
-        let cfg = SectionPruneConfig { enabled: true, prune_on_detection: true, emit_evidence_artifact: false };
+        let cfg = SectionPruneConfig {
+            enabled: true,
+            prune_on_detection: true,
+            emit_evidence_artifact: false,
+        };
 
         prune_sections(&mut graph, &evidence, &mut report, &cfg);
 
         // geo + font >= 2 demotes FLOPS; the main-font Times headers stay.
-        assert_eq!(graph.nodes[&ids[1]].node_type, "Paragraph", "FLOPS (geo + bad font) demoted");
-        assert_eq!(graph.nodes[&ids[0]].node_type, "Section", "main-font header kept");
-        assert_eq!(graph.nodes[&ids[2]].node_type, "Section", "main-font header kept");
+        assert_eq!(
+            graph.nodes[&ids[1]].node_type, "Paragraph",
+            "FLOPS (geo + bad font) demoted"
+        );
+        assert_eq!(
+            graph.nodes[&ids[0]].node_type, "Section",
+            "main-font header kept"
+        );
+        assert_eq!(
+            graph.nodes[&ids[2]].node_type, "Section",
+            "main-font header kept"
+        );
         assert_eq!(report.section_prune.unwrap().pruned, 1);
     }
 
@@ -398,9 +438,15 @@ mod tests {
         // Every flagged section present, by node_id, with its attributes.
         let secs = parsed["sections"].as_array().unwrap();
         assert_eq!(secs.len(), 2, "exactly the two flagged sections");
-        let present: Vec<&str> = secs.iter().map(|s| s["node_id"].as_str().unwrap()).collect();
+        let present: Vec<&str> = secs
+            .iter()
+            .map(|s| s["node_id"].as_str().unwrap())
+            .collect();
         for id in [ids[1], ids[3]] {
-            assert!(present.contains(&id.to_string().as_str()), "flagged section {id} in artifact");
+            assert!(
+                present.contains(&id.to_string().as_str()),
+                "flagged section {id} in artifact"
+            );
         }
         // Each carries the flag booleans + the text_order join key (text / font
         // / bbox are NOT duplicated — they live in the output graph JSON).

@@ -35,18 +35,16 @@ impl MdMetadataExtractor {
     }
 
     fn get_string(&self, key: &str) -> Option<String> {
-        self.frontmatter
-            .get(key)
-            .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                // YAML frontmatter may parse `date: 2026-05-12` as an
-                // integer-derived value or other scalar; stringify so the
-                // lossless free-form representation lands on the canonical
-                // `created` slot.
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                serde_json::Value::Bool(b) => Some(b.to_string()),
-                _ => None,
-            })
+        self.frontmatter.get(key).and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            // YAML frontmatter may parse `date: 2026-05-12` as an
+            // integer-derived value or other scalar; stringify so the
+            // lossless free-form representation lands on the canonical
+            // `created` slot.
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        })
     }
 }
 
@@ -93,8 +91,7 @@ impl MetadataExtractor for MdMetadataExtractor {
     /// `pubDate`, Obsidian aliases, etc.) lands in `md.extras` keyed by
     /// raw frontmatter key.
     fn extract_channel_metadata(&self, _: &()) -> ChannelMetadata {
-        const CANONICAL_KEYS: &[&str] =
-            &["title", "author", "description", "language", "date"];
+        const CANONICAL_KEYS: &[&str] = &["title", "author", "description", "language", "date"];
         const STRONG_CONVENTION_KEYS: &[&str] = &["draft", "tags", "categories"];
 
         let mut md = MdMetadata {
@@ -141,7 +138,10 @@ mod tests {
     use crate::preprocessors::metadata::extract_document_metadata;
 
     fn fm(pairs: &[(&str, serde_json::Value)]) -> BTreeMap<String, serde_json::Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -174,7 +174,10 @@ mod tests {
         let md = extract_document_metadata(&extractor, &());
         let md_ns = md.md.expect("md namespace populated");
         assert_eq!(md_ns.draft, Some(true));
-        assert_eq!(md_ns.tags, vec!["rust".to_string(), "blazegraph".to_string()]);
+        assert_eq!(
+            md_ns.tags,
+            vec!["rust".to_string(), "blazegraph".to_string()]
+        );
         assert_eq!(md_ns.categories, vec!["news".to_string()]);
         assert!(md_ns.extras.is_empty());
     }

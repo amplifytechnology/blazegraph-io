@@ -147,7 +147,10 @@ impl<'a> ParseRule for TableDetectionRule<'a> {
     fn apply(&self, elements: Vec<ParsedPdfElement>) -> Result<Vec<ParsedPdfElement>> {
         let cfg = &self.config.table_detection;
         if !cfg.enabled {
-            println!("   ⏭️  TableDetection disabled — passing through {} elements", elements.len());
+            println!(
+                "   ⏭️  TableDetection disabled — passing through {} elements",
+                elements.len()
+            );
             return Ok(elements);
         }
 
@@ -281,7 +284,8 @@ impl<'a> TableDetectionRule<'a> {
     fn doc_stem(&self) -> String {
         // `BLAZEGRAPH_TABLE_DUMP_STEM` lets the CLI/harness pin the filename to
         // the source stem (the rule otherwise can't see the source filename).
-        let raw = std::env::var("BLAZEGRAPH_TABLE_DUMP_STEM").unwrap_or_else(|_| "unknown".to_string());
+        let raw =
+            std::env::var("BLAZEGRAPH_TABLE_DUMP_STEM").unwrap_or_else(|_| "unknown".to_string());
         sanitize_stem(&raw)
     }
 }
@@ -334,8 +338,8 @@ mod tests {
             region_label: label.to_string(),
             n_peaks: 1,
             n_peaks_y: 12,
-            grid_vcuts: 0,           // no column grid
-            aligned_cols: 0,         // single column
+            grid_vcuts: 0,   // no column grid
+            aligned_cols: 0, // single column
             column_consistency: 0.0,
             density: 0.5,
             ..RegionSignature::default()
@@ -390,7 +394,12 @@ mod tests {
         }
     }
 
-    fn paragraph_el(position: usize, page: u32, label: &str, reading_order: u32) -> ParsedPdfElement {
+    fn paragraph_el(
+        position: usize,
+        page: u32,
+        label: &str,
+        reading_order: u32,
+    ) -> ParsedPdfElement {
         ParsedPdfElement {
             element_type: ParsedElementType::Paragraph,
             text: format!("cell {position}"),
@@ -435,14 +444,7 @@ mod tests {
         let fsa = FontSizeAnalysis::default();
         let parsing = ParsingConfig::default();
 
-        let rule = TableDetectionRule::new(
-            &engine,
-            &[],
-            &parsing,
-            &analysis,
-            &fsa,
-            &style_data,
-        );
+        let rule = TableDetectionRule::new(&engine, &[], &parsing, &analysis, &fsa, &style_data);
 
         let elements = vec![
             paragraph_el(0, 1, "2-1", 0),

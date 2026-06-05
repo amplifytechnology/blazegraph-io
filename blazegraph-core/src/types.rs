@@ -86,7 +86,6 @@ pub struct DocumentInfo {
     /// (cross-pack global vs pack-scoped) at write time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
-
     // CR-60 (2026-05-22) retracted `source_identity` and `supersedes`
     // here per the byte-in/byte-out schema-boundary principle
     // (`docs/P2/core/architecture/11-byte-in-byte-out.md`,
@@ -691,9 +690,7 @@ pub enum PdfLinkKind {
     },
     /// External URI (typically `https://...`; future enrichment slice
     /// CR-63 may also produce `mailto:...` for pattern-detected emails).
-    ExternalUri {
-        url: String,
-    },
+    ExternalUri { url: String },
 }
 
 impl PdfTextElement {
@@ -769,14 +766,14 @@ pub struct DocumentMetadata {
 /// per `09-metadata-first-class.md` § Channel-specific (pdf).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PdfMetadata {
-    pub version: Option<String>,           // pdf:PDFVersion
-    pub producer: Option<String>,          // pdf:producer
-    pub creator_tool: Option<String>,      // xmp:CreatorTool
-    pub publisher: Option<String>,         // xmp:dc:publisher | dc:publisher
-    pub page_count: Option<u32>,           // xmpTPg:NPages
-    pub encrypted: Option<bool>,           // pdf:encrypted
-    pub has_marked_content: Option<bool>,  // pdf:hasMarkedContent
-    pub modified: Option<String>,          // dcterms:modified
+    pub version: Option<String>,          // pdf:PDFVersion
+    pub producer: Option<String>,         // pdf:producer
+    pub creator_tool: Option<String>,     // xmp:CreatorTool
+    pub publisher: Option<String>,        // xmp:dc:publisher | dc:publisher
+    pub page_count: Option<u32>,          // xmpTPg:NPages
+    pub encrypted: Option<bool>,          // pdf:encrypted
+    pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
+    pub modified: Option<String>,         // dcterms:modified
     #[serde(default)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -1181,11 +1178,7 @@ impl SemanticElementType {
     /// wire-format domain.
     pub fn body_is_markdown_inline(self) -> bool {
         match self {
-            Self::Section
-            | Self::Paragraph
-            | Self::Header
-            | Self::Footer
-            | Self::Margin => true,
+            Self::Section | Self::Paragraph | Self::Header | Self::Footer | Self::Margin => true,
             Self::CodeBlock | Self::List | Self::Blockquote | Self::Table => false,
             Self::Message => panic!(
                 "SemanticElementType::Message::body_is_markdown_inline called — \
