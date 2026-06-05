@@ -26,8 +26,14 @@ uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.0"
 
-# XML parsing for Tika XHTML
+# XML parsing for Tika XHTML and the OOXML (DOCX) body walk.
 quick-xml = "0.31"
+
+# OOXML container (DOCX is a ZIP). `default-features = false` + only the
+# `deflate` codec keeps the dependency surface minimal — we read a
+# well-understood subset (`word/document.xml`, `word/styles.xml`) and
+# never write archives. See the C1 DOCX-channel handoff.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Unicode NFKC normalization for compat-decomposable glyphs (ligatures,
 # non-breaking space, etc.) — folds chars that look identical on screen
