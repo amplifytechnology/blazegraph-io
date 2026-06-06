@@ -42,9 +42,17 @@
 //! `<w:hyperlink r:id>` with `TargetMode="External"` (resolved via
 //! `word/_rels/document.xml.rels`) becomes an `ExternalRef` on the element
 //! that contains it; the link's visible run text reuses the same `<w:t>`
-//! concatenation (the ref is *additional*, not a replacement). **Out of
-//! scope** (later handoffs): metadata population (C3), CLI dispatch (C4),
-//! header/footer (C5).
+//! concatenation (the ref is *additional*, not a replacement).
+//!
+//! ## Header / footer (C5)
+//!
+//! `<w:sectPr>` carries `<w:headerReference r:id=…>` / `<w:footerReference
+//! r:id=…>`; each `r:id` resolves through `word/_rels/document.xml.rels`
+//! (`super::rels::parse_chrome_rels`) to a `word/headerN.xml` / `footerN.xml`
+//! part whose `<w:hdr>` / `<w:ftr>` root holds `<w:p>` paragraphs — same run
+//! structure as the body. Those become `Header` / `Footer` elements at
+//! **Document level** (page chrome, not body flow) appended after the body, so
+//! a stripper can trivially drop them (see [`append_chrome_elements`]).
 //!
 //! ## ParseIdentity
 //!
@@ -116,13 +124,24 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     let core_xml = read_zip_entry(&mut archive, "docProps/core.xml").unwrap_or_default();
     let app_xml = read_zip_entry(&mut archive, "docProps/app.xml").unwrap_or_default();
 
-    // 2. Styles resolution map + hyperlink relationships map + docProps.
+    // 2. Styles resolution map + hyperlink relationships map + header/footer
+    //    relationships map (C5) + docProps.
     let styles = build_styles_map(&styles_xml)?;
     let hyperlink_rels = super::rels::parse_hyperlink_rels(&rels_xml)?;
+    let chrome_rels = super::rels::parse_chrome_rels(&rels_xml)?;
     let props = super::props::DocxProps::parse(&core_xml, &app_xml)?;
 
-    // 3. Body walk → elements.
-    let elements = walk_body(&document_xml, &styles, &hyperlink_rels)?;
+    // 3. Body walk → elements + captured `<w:sectPr>` header/footer references.
+    let BodyWalk {
+        mut elements,
+        chrome_ref_ids,
+    } = walk_body(&document_xml, &styles, &hyperlink_rels)?;
+
+    // 3b. Header/footer parts (C5): resolve the captured references through the
+    //     chrome rels, read each distinct part, and append its paragraphs as
+    //     `Header` / `Footer` elements at Document level — page chrome the
+    //     `strip` path can trivially drop.
+    append_chrome_elements(&mut archive, &chrome_ref_ids, &chrome_rels, &mut elements)?;
 
     // 4. Provenance — DOCX has no source PDF, so
     //    `source_sha256 = sha256(zip bytes)`. `config_hash = "none"`
@@ -332,17 +351,35 @@ struct TableAccumulator {
     refs: PendingRefs,
 }
 
+/// The result of walking `<w:body>`: the projected body elements plus the
+/// `r:id`s of every `<w:headerReference>` / `<w:footerReference>` seen inside
+/// `<w:sectPr>`. The chrome `r:id`s are resolved to header/footer parts after
+/// the walk (C5) — the part bytes aren't available inside the walk (it sees
+/// only `document.xml`), so we collect the references and read the parts in
+/// `parse_docx`.
+struct BodyWalk {
+    elements: Vec<SemanticTreeElement>,
+    /// `r:id`s of `<w:headerReference>` / `<w:footerReference>` in document
+    /// order of first appearance (dedup is by *resolved part*, done later).
+    chrome_ref_ids: Vec<String>,
+}
+
 /// Walk `<w:body>`'s top-level children (`<w:p>` and `<w:tbl>`) in document
 /// order, projecting each to one [`SemanticTreeElement`]. Paragraphs nested
 /// inside table cells are consumed by the table-text assembly, not emitted
-/// as standalone nodes.
+/// as standalone nodes. Also collects `<w:sectPr>` header/footer references
+/// (C5) for post-walk part resolution.
 fn walk_body(
     document_xml: &str,
     styles: &HashMap<String, EffectiveStyle>,
     hyperlink_rels: &HashMap<String, HyperlinkRel>,
-) -> Result<Vec<SemanticTreeElement>, ParseError> {
+) -> Result<BodyWalk, ParseError> {
     let mut reader = Reader::from_str(document_xml);
     let mut elements: Vec<SemanticTreeElement> = Vec::new();
+    // `<w:headerReference>` / `<w:footerReference>` `r:id`s, captured wherever
+    // they appear (the body-level `<w:sectPr>`, or a section-break `<w:sectPr>`
+    // inside a paragraph's `<w:pPr>`). Resolved to parts after the walk.
+    let mut chrome_ref_ids: Vec<String> = Vec::new();
 
     let mut in_body = false;
     // The block currently being accumulated (a top-level `<w:p>` or
@@ -376,6 +413,12 @@ fn walk_body(
                     }
                     continue;
                 }
+                // `<w:headerReference>` / `<w:footerReference>` live inside a
+                // `<w:sectPr>` — capture the `r:id` wherever they appear (rare
+                // as a Start form, but tolerate it) without disturbing block
+                // accumulation; the element name never collides with a block /
+                // run element.
+                capture_chrome_ref(name, &e, &mut chrome_ref_ids);
                 match &mut block {
                     // Not inside a block yet — a top-level child opens one.
                     None => match name {
@@ -396,6 +439,12 @@ fn walk_body(
                 if !in_body {
                     continue;
                 }
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
+                // The normal form: `<w:headerReference … r:id=…/>` is a
+                // self-closing empty element. Capture it before delegating the
+                // rest to the open block's empty handler.
+                capture_chrome_ref(name, &e, &mut chrome_ref_ids);
                 match &mut block {
                     Some(Block::Paragraph(acc)) => para_on_empty(acc, &e),
                     Some(Block::Table(acc)) => {
@@ -477,7 +526,21 @@ fn walk_body(
         }
     }
 
-    Ok(elements)
+    Ok(BodyWalk {
+        elements,
+        chrome_ref_ids,
+    })
+}
+
+/// Capture a `<w:headerReference>` / `<w:footerReference>`'s `r:id` into
+/// `chrome_ref_ids` (in document order, no dedup — dedup is by resolved part).
+/// A no-op for any other element.
+fn capture_chrome_ref(name: &[u8], e: &BytesStart, chrome_ref_ids: &mut Vec<String>) {
+    if name == b"headerReference" || name == b"footerReference" {
+        if let Some(id) = attr_value(e, b"r:id") {
+            chrome_ref_ids.push(id);
+        }
+    }
 }
 
 // ---- Paragraph accumulation ------------------------------------------------
@@ -598,6 +661,230 @@ fn finish_paragraph(
         }
         .validate(),
     )
+}
+
+// =============================================================================
+// Header / footer parts (C5)
+// =============================================================================
+//
+// DOCX headers/footers live in separate parts (`word/header1.xml`,
+// `word/footer1.xml`, …), referenced from `<w:sectPr>` via
+// `<w:headerReference r:id=…>` / `<w:footerReference r:id=…>`. We resolve each
+// `r:id` through `word/_rels/document.xml.rels` (`parse_chrome_rels`), read the
+// referenced part, and walk its `<w:hdr>` / `<w:ftr>` root paragraphs into
+// `Header` / `Footer` elements — same run-text + emphasis machinery as the
+// body (`RunAssembler`), but each part's paragraphs are **page chrome, not
+// body flow**: they attach at **Document level** (`hierarchy_level = 1`, so
+// `find_parent` puts them directly under Document, not nested under the last
+// body Section), carry `physical_location = None`, and are appended after the
+// body so a stripper can trivially drop them.
+
+/// Hierarchy level for header/footer chrome elements: Document level (1).
+/// `find_parent` resolves `level <= 1` to the root, so the node attaches
+/// directly under Document rather than the last open body Section. Because the
+/// chrome elements are appended *after* every body element, the `truncate(1)`
+/// inside `find_parent` is harmless (no later body Section to detach).
+const CHROME_HIERARCHY_LEVEL: u32 = 1;
+
+/// Resolve the body's `<w:sectPr>` header/footer references to parts, read each
+/// distinct part once, and walk its paragraphs into `Header` / `Footer`
+/// elements appended after the body.
+///
+/// **Dedup is by resolved part path.** A document typically references the same
+/// header/footer for the `default` / `first` / `even` page types (each a
+/// distinct `r:id` pointing at the *same* `headerN.xml`); we read each distinct
+/// part exactly once, so identical chrome isn't emitted three times. Two
+/// references that resolve to *different* parts (genuinely different first-page
+/// vs. default chrome) each emit their own nodes. Resolution order follows the
+/// references' document order; within that, parts are deduped on first sight.
+///
+/// `text_order_start` is the next free `text_order` after the body elements
+/// (so the appended chrome continues the contiguous `0..N` sequence the builder
+/// asserts).
+fn append_chrome_elements<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    chrome_ref_ids: &[String],
+    chrome_rels: &HashMap<String, super::rels::ChromeRel>,
+    elements: &mut Vec<SemanticTreeElement>,
+) -> Result<(), ParseError> {
+    use super::rels::ChromeKind;
+    use std::collections::HashSet;
+
+    let mut seen_parts: HashSet<String> = HashSet::new();
+
+    for rid in chrome_ref_ids {
+        let Some(rel) = chrome_rels.get(rid) else {
+            // A reference whose `r:id` isn't a header/footer rel (or is
+            // unresolved) — skip. The body already parsed; missing chrome is
+            // not a hard error.
+            continue;
+        };
+        // Resolve the part path: targets in `document.xml.rels` are relative to
+        // the `word/` directory (`header1.xml` → `word/header1.xml`).
+        let part_path = format!("word/{}", rel.target);
+        if !seen_parts.insert(part_path.clone()) {
+            continue; // distinct-part dedup (default/first/even → same part).
+        }
+        // Best-effort read: an orphaned reference to an absent part is skipped
+        // rather than failing the whole parse.
+        let Some(part_xml) = read_zip_entry(archive, &part_path) else {
+            continue;
+        };
+        let element_type = match rel.kind {
+            ChromeKind::Header => SemanticElementType::Header,
+            ChromeKind::Footer => SemanticElementType::Footer,
+        };
+        let texts = walk_chrome_part(&part_xml)?;
+        for text in texts {
+            let text_order = elements.len() as u32;
+            elements.push(
+                SemanticTreeElement {
+                    text: text.clone(),
+                    element_type,
+                    hierarchy_level: CHROME_HIERARCHY_LEVEL,
+                    text_order,
+                    physical_location: None,
+                    style: None,
+                    token_count: estimate_token_count(&text),
+                    internal_refs: Vec::new(),
+                    external_refs: Vec::new(),
+                    confidence: 0,
+                }
+                .validate(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Walk a header/footer part (`<w:hdr>` / `<w:ftr>` root) into one assembled
+/// text string per non-empty top-level `<w:p>`, reusing the body's
+/// `RunAssembler` (run-text concatenation + emphasis projection, decisions 5 /
+/// 5b). Empty/whitespace-only paragraphs (spacing-only) are skipped, mirroring
+/// the body's empty-paragraph rule (decision 6b).
+///
+/// Scope (v1): paragraph runs only. Hyperlinks in chrome resolve through the
+/// part's *own* rels (`headerN.xml.rels`), not `document.xml.rels`, so chrome
+/// ref attribution is out of scope — the run text still flows through inline
+/// (`<w:hyperlink>` isn't special-cased), only the ref entry is omitted. Any
+/// `<w:tbl>` inside chrome is ignored (no Table-in-chrome node in v1); its
+/// cell text is not assembled.
+fn walk_chrome_part(part_xml: &str) -> Result<Vec<String>, ParseError> {
+    let mut reader = Reader::from_str(part_xml);
+    let mut texts: Vec<String> = Vec::new();
+    // The currently-open top-level `<w:p>`'s run assembler, if any. Nested
+    // paragraphs (e.g. inside a chrome table) reuse the same assembler — v1
+    // doesn't model chrome tables, so this stays flat.
+    let mut runs: Option<RunAssembler> = None;
+    // Depth of `<w:p>` nesting so a stray nested `<w:p>` doesn't prematurely
+    // flush the outer one. Chrome paragraphs are flat in practice; the guard
+    // is defensive.
+    let mut p_depth: u32 = 0;
+
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| ParseError::MalformedDocx(format!("header/footer part: {e}")))?;
+        match event {
+            Event::Start(e) => {
+                let qname = e.name();
+                match local_name(qname.as_ref()) {
+                    b"p" => {
+                        p_depth += 1;
+                        if runs.is_none() {
+                            runs = Some(RunAssembler::default());
+                        }
+                    }
+                    b"r" => {
+                        if let Some(r) = runs.as_mut() {
+                            r.on_run_start();
+                        }
+                    }
+                    b"rPr" => {
+                        if let Some(r) = runs.as_mut() {
+                            r.in_rpr = true;
+                        }
+                    }
+                    b"b" => {
+                        if let Some(r) = runs.as_mut() {
+                            if r.in_rpr {
+                                r.bold = run_bool_on(&e);
+                            }
+                        }
+                    }
+                    b"i" => {
+                        if let Some(r) = runs.as_mut() {
+                            if r.in_rpr {
+                                r.italic = run_bool_on(&e);
+                            }
+                        }
+                    }
+                    b"t" => {
+                        if let Some(r) = runs.as_mut() {
+                            r.in_t = true;
+                        }
+                    }
+                    b"drawing" => {
+                        reader
+                            .read_to_end(e.name())
+                            .map_err(|err| ParseError::MalformedDocx(format!("drawing: {err}")))?;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Empty(e) => {
+                if let Some(r) = runs.as_mut() {
+                    r.on_empty(&e);
+                }
+            }
+            Event::Text(t) => {
+                if let Some(r) = runs.as_mut() {
+                    let text = t
+                        .unescape()
+                        .map(|c| c.into_owned())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned());
+                    r.on_text(&text);
+                }
+            }
+            Event::End(e) => {
+                let qname = e.name();
+                match local_name(qname.as_ref()) {
+                    b"p" => {
+                        p_depth = p_depth.saturating_sub(1);
+                        if p_depth == 0 {
+                            if let Some(r) = runs.take() {
+                                let (text, _refs) = r.finish_with_refs();
+                                // Skip empty/whitespace-only chrome paragraphs
+                                // (decision 6b) — `.validate()` rejects empties.
+                                if !text.trim().is_empty() {
+                                    texts.push(text);
+                                }
+                            }
+                        }
+                    }
+                    b"t" => {
+                        if let Some(r) = runs.as_mut() {
+                            r.in_t = false;
+                        }
+                    }
+                    b"rPr" => {
+                        if let Some(r) = runs.as_mut() {
+                            r.in_rpr = false;
+                        }
+                    }
+                    b"r" => {
+                        if let Some(r) = runs.as_mut() {
+                            r.on_run_end();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(texts)
 }
 
 // ---- Table accumulation ----------------------------------------------------
@@ -1059,6 +1346,17 @@ mod tests {
             .count()
     }
 
+    /// Run `walk_body` and return just the body elements (dropping the chrome
+    /// references), so the body-level unit tests keep their `els` semantics
+    /// after `walk_body` grew a `BodyWalk` return (C5).
+    fn walk_body_els(
+        document_xml: &str,
+        styles: &HashMap<String, EffectiveStyle>,
+        hyperlink_rels: &HashMap<String, HyperlinkRel>,
+    ) -> Result<Vec<SemanticTreeElement>, ParseError> {
+        walk_body(document_xml, styles, hyperlink_rels).map(|w| w.elements)
+    }
+
     fn sections_by_depth(graph: &DocumentGraph) -> HashMap<u32, usize> {
         let mut m: HashMap<u32, usize> = HashMap::new();
         for n in nodes_in_order(graph) {
@@ -1515,7 +1813,7 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].text, "a\tb\nc");
         assert_eq!(els[0].element_type, SemanticElementType::Paragraph);
@@ -1527,7 +1825,7 @@ mod tests {
             <w:p><w:pPr><w:spacing w:after="0"/></w:pPr></w:p>
             <w:p><w:r><w:t>real</w:t></w:r></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1, "spacing-only paragraph is skipped");
         assert_eq!(els[0].text, "real");
         assert_eq!(els[0].text_order, 0, "text_order has no gap from the skip");
@@ -1538,7 +1836,7 @@ mod tests {
         let doc = "<w:document><w:body>\
             <w:p><w:r><w:t xml:space=\"preserve\"> leading</w:t></w:r></w:p>\
         </w:body></w:document>";
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         // The preserved leading space survives in a Paragraph (not trimmed).
         assert_eq!(els[0].text, " leading");
@@ -1551,7 +1849,7 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:p><w:r><w:t>See </w:t></w:r><w:hyperlink w:anchor="x"><w:r><w:t>here</w:t></w:r></w:hyperlink><w:r><w:t> now</w:t></w:r></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(
             els[0].text, "See here now",
@@ -1588,7 +1886,7 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:p><w:r><w:t>Jump to </w:t></w:r><w:hyperlink w:anchor="sec1"><w:r><w:t>Section One</w:t></w:r></w:hyperlink></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].text, "Jump to Section One");
         assert_eq!(els[0].internal_refs.len(), 1, "one InternalRef");
@@ -1616,7 +1914,7 @@ mod tests {
             <w:p><w:r><w:t>Visit </w:t></w:r><w:hyperlink r:id="rId7"><w:r><w:t>our site</w:t></w:r></w:hyperlink></w:p>
         </w:body></w:document>"#;
         let rels = rels_map(&[("rId7", "https://example.com/", true)]);
-        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &rels).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].text, "Visit our site");
         assert_eq!(els[0].external_refs.len(), 1, "one ExternalRef");
@@ -1637,7 +1935,7 @@ mod tests {
             <w:p><w:hyperlink r:id="rId3"><w:r><w:t>internal part</w:t></w:r></w:hyperlink></w:p>
         </w:body></w:document>"#;
         let rels = rels_map(&[("rId3", "media/image1.png", false)]);
-        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &rels).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].text, "internal part", "text stays inline");
         assert!(
@@ -1652,7 +1950,7 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:p><w:hyperlink r:id="rIdMissing"><w:r><w:t>dangling</w:t></w:r></w:hyperlink></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els[0].text, "dangling");
         assert!(els[0].internal_refs.is_empty() && els[0].external_refs.is_empty());
     }
@@ -1665,7 +1963,7 @@ mod tests {
             <w:p><w:hyperlink w:anchor="here" r:id="rId7"><w:r><w:t>both</w:t></w:r></w:hyperlink></w:p>
         </w:body></w:document>"#;
         let rels = rels_map(&[("rId7", "https://example.com/", true)]);
-        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &rels).unwrap();
         assert_eq!(els[0].internal_refs.len(), 1, "anchor takes precedence");
         assert!(els[0].external_refs.is_empty());
     }
@@ -1677,7 +1975,7 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:p><w:hyperlink w:anchor="x"><w:r><w:rPr><w:b/></w:rPr><w:t>Bold Link</w:t></w:r></w:hyperlink></w:p>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els[0].internal_refs[0].text, "**Bold Link**");
     }
 
@@ -1689,7 +1987,7 @@ mod tests {
             <w:p><w:hyperlink w:anchor="a"><w:r><w:t>first</w:t></w:r></w:hyperlink><w:r><w:t> and </w:t></w:r><w:hyperlink r:id="rId9"><w:r><w:t>second</w:t></w:r></w:hyperlink></w:p>
         </w:body></w:document>"#;
         let rels = rels_map(&[("rId9", "https://ex/", true)]);
-        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &rels).unwrap();
         assert_eq!(els[0].text, "first and second");
         assert_eq!(els[0].internal_refs.len(), 1);
         assert_eq!(els[0].internal_refs[0].text, "first");
@@ -1708,7 +2006,7 @@ mod tests {
             </w:tr></w:tbl>
         </w:body></w:document>"#;
         let rels = rels_map(&[("rId5", "https://cell/", true)]);
-        let els = walk_body(doc, &HashMap::new(), &rels).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &rels).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].element_type, SemanticElementType::Table);
         assert_eq!(els[0].external_refs.len(), 1, "external cell link → Table");
@@ -1725,7 +2023,7 @@ mod tests {
                 <w:tr><w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc></w:tr>
             </w:tbl>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].element_type, SemanticElementType::Table);
         assert_eq!(els[0].text, "a | b\n1 | 2");
@@ -1736,7 +2034,250 @@ mod tests {
         let doc = r#"<w:document><w:body>
             <w:tbl><w:tr><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Head</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         </w:body></w:document>"#;
-        let els = walk_body(doc, &HashMap::new(), &HashMap::new()).unwrap();
+        let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els[0].text, "**Head**", "bold cell projects to `**…**`");
+    }
+
+    // =====================================================================
+    // C5 — header / footer parts
+    // =====================================================================
+
+    /// The fixture's header part (`word/header1.xml`, referenced from
+    /// `<w:sectPr>` via `<w:headerReference>`) emits its text as a `Header`
+    /// node — not a Paragraph, not a Section.
+    #[test]
+    fn header_part_emits_header_nodes() {
+        let graph = parse_fixture("with_headers.docx");
+        let headers: Vec<&DocumentNode> = nodes_in_order(&graph)
+            .into_iter()
+            .filter(|n| n.node_type == "Header")
+            .collect();
+        assert_eq!(headers.len(), 1, "one running header → one Header node");
+        assert_eq!(headers[0].content.text, "Confidential Draft");
+        // Page chrome attaches at Document level, not nested under a body
+        // Section (handoff: `hierarchy_level = 1`).
+        assert_eq!(
+            headers[0].location.semantic.depth, 1,
+            "Header is page chrome → Document-level (depth 1)"
+        );
+        assert_eq!(
+            headers[0].parent,
+            Some(graph.document_info.root_id),
+            "Header attaches directly under the Document root"
+        );
+    }
+
+    /// The fixture's footer part (`word/footer1.xml`) emits its text as a
+    /// `Footer` node at Document level.
+    #[test]
+    fn footer_part_emits_footer_nodes() {
+        let graph = parse_fixture("with_headers.docx");
+        let footers: Vec<&DocumentNode> = nodes_in_order(&graph)
+            .into_iter()
+            .filter(|n| n.node_type == "Footer")
+            .collect();
+        assert_eq!(footers.len(), 1, "one running footer → one Footer node");
+        assert_eq!(footers[0].content.text, "Page footer text");
+        assert_eq!(
+            footers[0].location.semantic.depth, 1,
+            "Footer is page chrome → Document-level (depth 1)"
+        );
+        assert_eq!(footers[0].parent, Some(graph.document_info.root_id));
+    }
+
+    /// Header/footer chrome is appended *after* the body, so the body's
+    /// Section tree is unchanged (the appended Document-level chrome must not
+    /// detach later body Sections — there are none after it by construction).
+    #[test]
+    fn header_footer_does_not_disturb_body_tree() {
+        let graph = parse_fixture("with_headers.docx");
+        // Body: Heading1 (Overview) + Heading2 (Details) → 2 Sections; 2 body
+        // Paragraphs. Chrome adds 1 Header + 1 Footer on top.
+        assert_eq!(count_by_type(&graph, "Section"), 2, "2 body headings");
+        assert_eq!(count_by_type(&graph, "Paragraph"), 2, "2 body paragraphs");
+        assert_eq!(count_by_type(&graph, "Header"), 1);
+        assert_eq!(count_by_type(&graph, "Footer"), 1);
+        // The Heading2 nests under the Heading1 (depth 2 under depth 1) — the
+        // body tree didn't flatten.
+        let depths = sections_by_depth(&graph);
+        assert_eq!(depths.get(&1).copied(), Some(1), "Overview at depth 1");
+        assert_eq!(depths.get(&2).copied(), Some(1), "Details at depth 2");
+        // Chrome comes last in reading order (appended after the body).
+        let order: Vec<&str> = nodes_in_order(&graph)
+            .iter()
+            .map(|n| n.node_type.as_str())
+            .collect();
+        let last_two = &order[order.len() - 2..];
+        assert!(
+            last_two.contains(&"Header") && last_two.contains(&"Footer"),
+            "Header/Footer appended after the body; got order {order:?}"
+        );
+    }
+
+    /// Strippability (the binding requirement): the emitted bgraph.md carries
+    /// `bgraph-header` / `bgraph-footer` fences, and the existing `strip`
+    /// `NodeTypes` path removes them — header/footer text gone, body intact.
+    #[test]
+    fn headers_are_strippable() {
+        use crate::graphs::serialization::markdown::emit_markdown;
+        use crate::preprocessors::md::strip::strip;
+        use crate::preprocessors::md::types::StripMode;
+
+        let graph = parse_fixture("with_headers.docx");
+        let md = emit_markdown(&graph);
+        // The bgraph.md emitter tags chrome nodes with the strippable fences.
+        assert!(
+            md.contains("```bgraph-header"),
+            "emitted bgraph.md must carry a bgraph-header fence; got:\n{md}"
+        );
+        assert!(
+            md.contains("```bgraph-footer"),
+            "emitted bgraph.md must carry a bgraph-footer fence; got:\n{md}"
+        );
+        assert!(md.contains("Confidential Draft"));
+        assert!(md.contains("Page footer text"));
+
+        // Strip header + footer node types.
+        let stripped = strip(
+            &md,
+            StripMode::NodeTypes(vec!["header".to_string(), "footer".to_string()]),
+        )
+        .expect("strip header/footer");
+
+        // Chrome text + fences are gone.
+        assert!(
+            !stripped.contains("Confidential Draft"),
+            "header body must be stripped; got:\n{stripped}"
+        );
+        assert!(
+            !stripped.contains("Page footer text"),
+            "footer body must be stripped; got:\n{stripped}"
+        );
+        assert!(!stripped.contains("```bgraph-header"));
+        assert!(!stripped.contains("```bgraph-footer"));
+
+        // Body content survives with no loss (the binding requirement).
+        assert!(stripped.contains("Overview"), "body heading survives");
+        assert!(
+            stripped.contains("Body prose under the overview heading."),
+            "body paragraph survives; got:\n{stripped}"
+        );
+        assert!(stripped.contains("Details"));
+        assert!(stripped.contains("A second paragraph of plain body text."));
+        // Body element fences are untouched by the node-type filter.
+        assert!(stripped.contains("```bgraph-section"));
+        assert!(stripped.contains("```bgraph-paragraph"));
+    }
+
+    // ---- chrome-walk + dedup unit tests (synthetic XML) -------------------
+
+    #[test]
+    fn walk_chrome_part_assembles_paragraphs() {
+        // A header part with two paragraphs (the second multi-run) → two
+        // assembled text strings in order.
+        let hdr = r#"<w:hdr>
+            <w:p><w:pPr><w:pStyle w:val="Header"/></w:pPr><w:r><w:t>First line</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Second </w:t></w:r><w:r><w:t>line</w:t></w:r></w:p>
+        </w:hdr>"#;
+        let texts = walk_chrome_part(hdr).unwrap();
+        assert_eq!(texts, vec!["First line", "Second line"]);
+    }
+
+    #[test]
+    fn walk_chrome_part_projects_emphasis_and_skips_empty() {
+        // Bold/italic runs project to canonical marks; an empty (spacing-only)
+        // paragraph is skipped (decision 6b).
+        let ftr = r#"<w:ftr>
+            <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Confidential</w:t></w:r></w:p>
+            <w:p></w:p>
+            <w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Draft</w:t></w:r></w:p>
+        </w:ftr>"#;
+        let texts = walk_chrome_part(ftr).unwrap();
+        assert_eq!(
+            texts,
+            vec!["**Confidential**", "*Draft*"],
+            "emphasis projected; empty paragraph skipped"
+        );
+    }
+
+    /// Dedup: `default` / `first` / `even` references that resolve to the
+    /// *same* part are read once → one Header node, not three. Drive
+    /// `append_chrome_elements` through a real zip with one header part
+    /// referenced by three rels.
+    #[test]
+    fn chrome_dedup_collapses_same_part_across_types() {
+        use super::super::rels::{ChromeKind, ChromeRel};
+        use std::io::Write;
+
+        // Build a minimal zip with one header part.
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            zw.start_file("word/header1.xml", opts).unwrap();
+            zw.write_all(b"<w:hdr><w:p><w:r><w:t>Shared header</w:t></w:r></w:p></w:hdr>")
+                .unwrap();
+            zw.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+
+        // Three references (default/first/even) all → header1.xml.
+        let mut rels: HashMap<String, ChromeRel> = HashMap::new();
+        for rid in ["rId9", "rId11", "rId12"] {
+            rels.insert(
+                rid.to_string(),
+                ChromeRel {
+                    target: "header1.xml".to_string(),
+                    kind: ChromeKind::Header,
+                },
+            );
+        }
+        let ref_ids = vec!["rId9".to_string(), "rId11".to_string(), "rId12".to_string()];
+
+        let mut elements: Vec<SemanticTreeElement> = Vec::new();
+        append_chrome_elements(&mut archive, &ref_ids, &rels, &mut elements).unwrap();
+
+        assert_eq!(
+            elements.len(),
+            1,
+            "three refs to the same part → one Header node (distinct-part dedup)"
+        );
+        assert_eq!(elements[0].element_type, SemanticElementType::Header);
+        assert_eq!(elements[0].text, "Shared header");
+        assert_eq!(elements[0].hierarchy_level, CHROME_HIERARCHY_LEVEL);
+    }
+
+    /// An orphaned/unresolved reference (no matching chrome rel, or the part
+    /// is absent) is skipped — no node, no error.
+    #[test]
+    fn chrome_unresolved_reference_is_skipped() {
+        use super::super::rels::{ChromeKind, ChromeRel};
+
+        // Empty archive (no parts at all).
+        let mut buf = Vec::new();
+        {
+            let zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+
+        // One reference whose rel points at an absent part, and one with no
+        // rel entry at all.
+        let mut rels: HashMap<String, ChromeRel> = HashMap::new();
+        rels.insert(
+            "rId9".to_string(),
+            ChromeRel {
+                target: "header1.xml".to_string(), // not in the archive
+                kind: ChromeKind::Header,
+            },
+        );
+        let ref_ids = vec!["rId9".to_string(), "rIdMissing".to_string()];
+
+        let mut elements: Vec<SemanticTreeElement> = Vec::new();
+        append_chrome_elements(&mut archive, &ref_ids, &rels, &mut elements).unwrap();
+        assert!(
+            elements.is_empty(),
+            "unresolved / absent chrome parts yield no nodes (and no error)"
+        );
     }
 }
