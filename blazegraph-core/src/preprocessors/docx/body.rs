@@ -72,6 +72,7 @@ use crate::graphs::node_id::NodeIdGenerator;
 use crate::tokens::estimate_token_count;
 use crate::types::*;
 
+use super::super::canonical::wrap_emphasis;
 use super::super::md::types::{ParseError, ParseIdentity, ParseOptions, ParseResult};
 use super::rels::HyperlinkRel;
 
@@ -999,13 +1000,17 @@ fn finish_table(
     text_order: u32,
     current_section_depth: u32,
 ) -> SemanticTreeElement {
-    // Rows joined by `\n`, cells within a row joined by ` | ` (decision 6).
-    let text = acc
+    // Rows joined by `\n`, cells within a row joined by ` | ` (decision 6),
+    // then run through the shared canonical pipe-table formatter (outer
+    // pipes + delimiter row + padded columns) so the body matches the
+    // MD/PDF channels' Table form byte-for-byte (CR-80 #2).
+    let bare = acc
         .rows
         .iter()
         .map(|row| row.join(" | "))
         .collect::<Vec<_>>()
         .join("\n");
+    let text = super::super::canonical::format_pipe_table(&bare);
 
     SemanticTreeElement {
         text: text.clone(),
@@ -1240,27 +1245,6 @@ fn run_bool_on(e: &BytesStart) -> bool {
 /// Wrap run text in canonical emphasis marks per decision 5b. Whitespace-only
 /// or empty text is returned unwrapped (no `****` on a blank run, and we
 /// don't wrap pure-whitespace runs so `**bold** word` stays clean).
-fn wrap_emphasis(text: &str, bold: bool, italic: bool) -> String {
-    if text.is_empty() || text.trim().is_empty() {
-        return text.to_string();
-    }
-    let marks = match (bold, italic) {
-        (true, true) => "***",
-        (true, false) => "**",
-        (false, true) => "*",
-        (false, false) => return text.to_string(),
-    };
-    // Keep leading/trailing whitespace OUTSIDE the emphasis markers. CommonMark
-    // forbids a closing delimiter preceded by whitespace (so `**bold, **` would
-    // not render), and whitespace-outside also stops an adjacent run's markers
-    // from fusing (`**bold,** *italic,*` rather than `**bold, ***italic, *`).
-    // Whitespace is ASCII (single-byte), so these slices are UTF-8-safe.
-    let lead = &text[..text.len() - text.trim_start().len()];
-    let trail = &text[text.trim_end().len()..];
-    let core = text.trim();
-    format!("{lead}{marks}{core}{marks}{trail}")
-}
-
 /// Escape the inline markdown metacharacters that would otherwise be
 /// misparsed as emphasis / code in raw run text — the inline analog of the
 /// C-6 self-reference escape. We escape the emphasis + code delimiters
@@ -1432,22 +1416,28 @@ mod tests {
 
     #[test]
     fn structured_table() {
-        // One `<w:tbl>` → one Table node; cells joined ` | `, rows by newline.
+        // One `<w:tbl>` → one Table node, run through the shared canonical
+        // pipe-table formatter (CR-80 #2): outer pipes, a delimiter row, and
+        // padded columns — byte-parity with the MD/PDF Table form.
         let graph = parse_fixture("structured.docx");
         assert_eq!(count_by_type(&graph, "Table"), 1, "one Table node");
         let table = nodes_in_order(&graph)
             .into_iter()
             .find(|n| n.node_type == "Table")
             .expect("a Table node");
+        let text = &table.content.text;
         assert!(
-            table.content.text.contains("Name | Value"),
-            "header row cells joined by ` | `; got: {:?}",
-            table.content.text
+            text.starts_with("| Name"),
+            "canonical outer pipes on the header; got: {text:?}"
+        );
+        let delim = text.lines().nth(1).unwrap_or_default();
+        assert!(
+            delim.contains('-') && delim.chars().all(|c| matches!(c, '|' | '-' | ':')),
+            "second row is a canonical delimiter; got: {delim:?}"
         );
         assert!(
-            table.content.text.contains("Alpha | 42"),
-            "data row cells joined by ` | `; got: {:?}",
-            table.content.text
+            text.contains("| Alpha"),
+            "data row present in canonical form; got: {text:?}"
         );
     }
 
@@ -1798,25 +1788,6 @@ mod tests {
     }
 
     #[test]
-    fn wrap_emphasis_forms() {
-        assert_eq!(wrap_emphasis("x", false, false), "x");
-        assert_eq!(wrap_emphasis("x", true, false), "**x**");
-        assert_eq!(wrap_emphasis("x", false, true), "*x*");
-        assert_eq!(wrap_emphasis("x", true, true), "***x***");
-        // Whitespace-only runs are never wrapped (no `** **`).
-        assert_eq!(wrap_emphasis(" ", true, false), " ");
-        assert_eq!(wrap_emphasis("", true, true), "");
-        // Leading/trailing whitespace stays OUTSIDE the markers (valid
-        // CommonMark — a closing delimiter may not be preceded by whitespace).
-        assert_eq!(wrap_emphasis("bold, ", true, false), "**bold,** ");
-        assert_eq!(wrap_emphasis(" italic", false, true), " *italic*");
-        assert_eq!(wrap_emphasis("bi, ", true, true), "***bi,*** ");
-        // Adjacent differently-emphasised runs must not fuse their delimiters.
-        let joined = wrap_emphasis("bold, ", true, false) + &wrap_emphasis("italic, ", false, true);
-        assert_eq!(joined, "**bold,** *italic,* ");
-    }
-
-    #[test]
     fn escape_inline_markdown_escapes_emphasis_chars() {
         assert_eq!(escape_inline_markdown("a*b_c`d"), "a\\*b\\_c\\`d");
         assert_eq!(escape_inline_markdown("back\\slash"), "back\\\\slash");
@@ -2060,7 +2031,8 @@ mod tests {
         let els = walk_body_els(doc, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(els.len(), 1);
         assert_eq!(els[0].element_type, SemanticElementType::Table);
-        assert_eq!(els[0].text, "a | b\n1 | 2");
+        // Canonical pipe-table form (CR-80 #2), not the bare ` | ` grid.
+        assert_eq!(els[0].text, "| a   | b   |\n|-----|-----|\n| 1   | 2   |");
     }
 
     #[test]

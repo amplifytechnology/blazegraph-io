@@ -60,6 +60,7 @@ use crate::types::*;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use sha2::{Digest, Sha256};
 
+use super::super::canonical::{format_pipe_table, wrap_emphasis};
 use super::frontmatter::extract_frontmatter;
 use super::types::{ParseError, ParseIdentity, ParseOptions, ParseResult};
 
@@ -71,6 +72,19 @@ use super::types::{ParseError, ParseIdentity, ParseOptions, ParseResult};
 enum InlineMode {
     Heading(HeadingLevel),
     Paragraph,
+}
+
+/// Flush the pending inline text run into `out`, wrapped in the canonical
+/// emphasis delimiters for the current (bold, italic) state. No-op when the
+/// run is empty. Called at every inline boundary (Emphasis/Strong/Link/Code
+/// edges + block close) so each maximal same-formatting run is emitted as one
+/// `wrap_emphasis` unit — keeping whitespace outside the markers and matching
+/// the DOCX channel byte-for-byte.
+fn flush_inline_run(out: &mut String, run: &mut String, bold: bool, italic: bool) {
+    if !run.is_empty() {
+        out.push_str(&wrap_emphasis(run, bold, italic));
+        run.clear();
+    }
 }
 
 /// Parse a plain markdown string (no bgraph fences) into a
@@ -119,6 +133,18 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
     // Stack of link destination URLs — needed because TagEnd::Link
     // doesn't carry the URL; we record it on Start and consume on End.
     let mut link_url_stack: Vec<String> = Vec::new();
+    // Inline emphasis state. Rather than push `*`/`**` at each
+    // Emphasis/Strong boundary (which preserves pulldown's nesting and
+    // can leave whitespace *inside* the markers, e.g. `*italic, **bi,***`),
+    // we accumulate each maximal same-formatting text run in `run_buf`
+    // and emit it through the shared `wrap_emphasis` helper — the SAME
+    // canonical form the DOCX channel produces. Strong/Emphasis nesting
+    // is collapsed to per-run (bold, italic) flags, so a run that is both
+    // becomes `***run***` and adjacent runs split cleanly
+    // (`*italic,* ***bi,***`) with whitespace kept outside the delimiters.
+    let mut bold_depth: u32 = 0;
+    let mut italic_depth: u32 = 0;
+    let mut run_buf = String::new();
     // Tracks the depth of the most recent Section we've emitted, so
     // non-Section leaves (Paragraph, CodeBlock, List, Blockquote,
     // Table) can carry a hierarchy_level that makes
@@ -144,6 +170,9 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                         Some(InlineMode::Heading(l)) => l,
                         _ => panic!("heading end without matching start (parser invariant)"),
                     };
+                    // Flush the final text run (emphasis is balanced/closed by
+                    // here, so bold/italic are 0 — a plain push).
+                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
                     let heading_text = std::mem::take(&mut inline_buf).trim().to_string();
                     // Skip content-free headings (e.g. a `##` spacer or an
                     // image-only heading). An empty Section has no rendered form
@@ -184,6 +213,9 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
             Event::End(TagEnd::Paragraph) => {
                 if nesting == 1 && matches!(inline_mode, Some(InlineMode::Paragraph)) {
                     inline_mode = None;
+                    // Flush the final text run (emphasis is balanced/closed by
+                    // here, so bold/italic are 0 — a plain push).
+                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
                     let para_text = std::mem::take(&mut inline_buf).trim().to_string();
                     // Skip content-free paragraphs (e.g. an image-only paragraph
                     // with empty alt text). An empty body has no rendered form and
@@ -220,27 +252,23 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
             // already resolved the source-side variant; we just emit
             // the canonical form.
             Event::Start(Tag::Emphasis) => {
-                if inline_mode.is_some() {
-                    inline_buf.push('*');
-                }
+                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                italic_depth += 1;
                 nesting += 1;
             }
             Event::End(TagEnd::Emphasis) => {
-                if inline_mode.is_some() {
-                    inline_buf.push('*');
-                }
+                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                italic_depth = italic_depth.saturating_sub(1);
                 nesting = nesting.saturating_sub(1);
             }
             Event::Start(Tag::Strong) => {
-                if inline_mode.is_some() {
-                    inline_buf.push_str("**");
-                }
+                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                bold_depth += 1;
                 nesting += 1;
             }
             Event::End(TagEnd::Strong) => {
-                if inline_mode.is_some() {
-                    inline_buf.push_str("**");
-                }
+                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                bold_depth = bold_depth.saturating_sub(1);
                 nesting = nesting.saturating_sub(1);
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
@@ -250,6 +278,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                 // emit Link outside a block, but cheaper to be safe).
                 link_url_stack.push(dest_url.to_string());
                 if inline_mode.is_some() {
+                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
                     inline_buf.push('[');
                 }
                 nesting += 1;
@@ -257,6 +286,9 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
             Event::End(TagEnd::Link) => {
                 let url = link_url_stack.pop().unwrap_or_default();
                 if inline_mode.is_some() {
+                    // Flush the label run (wrapped per current emphasis state)
+                    // before the closing bracket + destination.
+                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
                     inline_buf.push_str(&format!("]({url})"));
                 }
                 nesting = nesting.saturating_sub(1);
@@ -266,7 +298,13 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
             Event::Start(tag) => {
                 if nesting == 0 {
                     if let Some(element_type) = project_top_level_tag(&tag) {
-                        let source = slice_verbatim(body, range);
+                        let mut source = slice_verbatim(body, range);
+                        // Tables re-canonicalize to the shared pipe-table form
+                        // (CR-80 #2) so the MD channel converges with DOCX/PDF;
+                        // other literal-with-markers blocks stay verbatim (C-7a).
+                        if element_type == SemanticElementType::Table {
+                            source = format_pipe_table(&source);
+                        }
                         let text_order = elements.len() as u32;
                         // Non-Section leaves use a hierarchy_level
                         // that GraphBuilder::find_parent interprets
@@ -308,30 +346,37 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
             // C-7b canonical form (` `code` `).
             Event::Text(s) => {
                 if inline_mode.is_some() {
-                    inline_buf.push_str(&s);
+                    run_buf.push_str(&s);
                 }
             }
             Event::Code(s) => {
                 if inline_mode.is_some() {
+                    // A code span ends the current text run (its backticks
+                    // sit outside any emphasis markers); flush, then emit
+                    // the ` `code` ` C-7b form.
+                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
                     inline_buf.push('`');
                     inline_buf.push_str(&s);
                     inline_buf.push('`');
                 }
             }
             Event::SoftBreak => {
+                // Breaks stay *inside* the current run so an emphasis span
+                // that wraps a soft break remains a single `wrap_emphasis`
+                // unit (whitespace at a run edge is pulled outside the markers).
                 if matches!(inline_mode, Some(InlineMode::Paragraph)) {
                     // Paragraphs preserve soft-wrap as newline. Headings
                     // collapse to space (a heading wrapping mid-line is
                     // typographically a continuation, not a line break).
-                    inline_buf.push('\n');
+                    run_buf.push('\n');
                 } else if matches!(inline_mode, Some(InlineMode::Heading(_))) {
-                    inline_buf.push(' ');
+                    run_buf.push(' ');
                 }
             }
             Event::HardBreak => {
                 if inline_mode.is_some() {
                     // CommonMark hard break = two-space + newline.
-                    inline_buf.push_str("  \n");
+                    run_buf.push_str("  \n");
                 }
             }
 
@@ -646,11 +691,11 @@ mod tests {
         let nodes = nodes_in_order(&graph);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_type, "Table");
-        let text = &nodes[0].content.text;
-        assert!(
-            text.contains("| a | b |") && text.contains("|---|---|"),
-            "Table text should include pipes + alignment row; got: {:?}",
-            text
+        // Re-canonicalized to the shared pipe-table form (CR-80 #2): outer
+        // pipes, a delimiter row, padded columns. Content left-aligned.
+        assert_eq!(
+            nodes[0].content.text,
+            "| a   | b   |\n|-----|-----|\n| 1   | 2   |",
         );
     }
 
@@ -832,6 +877,30 @@ mod tests {
             "Blockquote should preserve raw `_italic_` underscores; got: {:?}",
             nodes[0].content.text,
         );
+    }
+
+    #[test]
+    fn paragraph_emphasis_whitespace_kept_outside_delimiters() {
+        // CR-80 #1: pandoc emits a fused nested span with whitespace inside
+        // the markers (`*italic, **bold-italic,***`). The MD channel must
+        // re-canonicalize to per-run split spans with whitespace outside —
+        // byte-identical to the DOCX channel's `wrap_emphasis` output.
+        let graph =
+            parse_ok("Here is some **bold,** *italic, **bold-italic,*** rest.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(
+            nodes[0].content.text,
+            "Here is some **bold,** *italic,* ***bold-italic,*** rest.",
+        );
+    }
+
+    #[test]
+    fn paragraph_emphasis_spanning_soft_break_stays_one_run() {
+        // A soft break inside an emphasis span must not split it into two
+        // `*..*` spans; it stays a single wrapped run with the newline kept.
+        let graph = parse_ok("*italic\nspanning* a break.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(nodes[0].content.text, "*italic\nspanning* a break.");
     }
 
     #[test]

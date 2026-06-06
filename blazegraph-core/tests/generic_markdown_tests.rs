@@ -235,12 +235,20 @@ fn roundtrip_identity_nested_list() {
 
 #[test]
 fn roundtrip_identity_table() {
-    let input = "# Table\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+    // The generic-MD channel canonicalizes table layout (CR-80 #2): outer
+    // pipes, delimiter row, columns padded to max-content width. Byte-identity
+    // therefore holds for *canonical* input (idempotency) — non-canonical
+    // tables are normalized, which is the cross-channel convergence behavior.
+    let input = "# Table\n\n| a   | b   |\n|-----|-----|\n| 1   | 2   |\n";
     let g1 = parse_generic(input);
     let emitted = emit_generic_md(&g1);
     assert_eq!(emitted, input, "byte-identical round-trip drift");
     let g2 = parse_generic(&emitted);
     assert_semantically_equal(&g1, &g2);
+
+    // And a non-canonical table normalizes to the same canonical form.
+    let messy = parse_generic("# Table\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+    assert_eq!(emit_generic_md(&messy), input, "non-canonical table normalizes");
 }
 
 #[test]
