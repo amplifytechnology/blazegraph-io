@@ -19,6 +19,12 @@
 //! another part inside the package) omits it or sets `Internal` — out of scope
 //! per contract decision 7, so we record the mode and let the body walk skip
 //! non-external ones.
+//!
+//! C5 additionally resolves *header* / *footer* relationships (those whose
+//! `Type` ends in `/header` / `/footer`), mapped `Id → Target` part path. The
+//! body's `<w:sectPr>` carries `<w:headerReference r:id=…>` /
+//! `<w:footerReference r:id=…>`; resolving the `r:id` here yields the
+//! `word/headerN.xml` / `word/footerN.xml` part to read.
 
 use std::collections::HashMap;
 
@@ -55,6 +61,79 @@ impl HyperlinkRel {
 /// The `Type` suffix that identifies a hyperlink relationship. Matched as a
 /// suffix so we're agnostic to the (stable) schema-URL prefix.
 const HYPERLINK_TYPE_SUFFIX: &str = "/hyperlink";
+
+/// The `Type` suffixes for header / footer part relationships (C5). Matched as
+/// suffixes for the same prefix-agnostic reason as the hyperlink suffix.
+const HEADER_TYPE_SUFFIX: &str = "/header";
+const FOOTER_TYPE_SUFFIX: &str = "/footer";
+
+/// Which chrome part a header/footer relationship points to. Drives the node
+/// type the body walk emits for the referenced part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChromeKind {
+    Header,
+    Footer,
+}
+
+/// One resolved header/footer relationship: the part path it targets plus
+/// whether it's a header or footer. The `r:id` on a `<w:headerReference>` /
+/// `<w:footerReference>` resolves to one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ChromeRel {
+    /// `Target` attribute — the part path, relative to `word/` (e.g.
+    /// `header1.xml`). The body resolves it against the `word/` directory.
+    pub(super) target: String,
+    /// Header vs. footer, from the relationship `Type` suffix.
+    pub(super) kind: ChromeKind,
+}
+
+/// Parse `word/_rels/document.xml.rels` into a `rId → ChromeRel` map, keeping
+/// only relationships whose `Type` ends in `/header` or `/footer` (C5).
+///
+/// This is the header/footer twin of [`parse_hyperlink_rels`]: a single rels
+/// part carries every relationship type; the two parsers each filter to their
+/// own. A missing / empty rels part — or a document with no header/footer
+/// parts — yields an empty map. Malformed XML is a hard
+/// [`ParseError::MalformedDocx`].
+pub(super) fn parse_chrome_rels(rels_xml: &str) -> Result<HashMap<String, ChromeRel>, ParseError> {
+    let mut map: HashMap<String, ChromeRel> = HashMap::new();
+    let mut reader = Reader::from_str(rels_xml);
+
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| ParseError::MalformedDocx(format!("document.xml.rels: {e}")))?;
+        match event {
+            Event::Empty(e) | Event::Start(e)
+                if local_name(e.name().as_ref()) == b"Relationship" =>
+            {
+                if let Some((id, rel)) = read_chrome_relationship(&e) {
+                    map.insert(id, rel);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(map)
+}
+
+/// Extract `(Id, ChromeRel)` from one `<Relationship>` element, returning
+/// `None` for non-header/footer relationships and for entries missing `Id` or
+/// `Target`.
+fn read_chrome_relationship(e: &BytesStart) -> Option<(String, ChromeRel)> {
+    let ty = attr_value(e, b"Type")?;
+    let kind = if ty.ends_with(HEADER_TYPE_SUFFIX) {
+        ChromeKind::Header
+    } else if ty.ends_with(FOOTER_TYPE_SUFFIX) {
+        ChromeKind::Footer
+    } else {
+        return None;
+    };
+    let id = attr_value(e, b"Id")?;
+    let target = attr_value(e, b"Target")?;
+    Some((id, ChromeRel { target, kind }))
+}
 
 /// Parse `word/_rels/document.xml.rels` into a `rId → HyperlinkRel` map,
 /// keeping only relationships whose `Type` ends in `/hyperlink`.
@@ -213,5 +292,63 @@ mod tests {
             parse_hyperlink_rels(xml),
             Err(ParseError::MalformedDocx(_))
         ));
+    }
+
+    // ---- C5 header/footer rels --------------------------------------------
+
+    #[test]
+    fn parses_header_and_footer_rels() {
+        // The two chrome rels python-docx emits, alongside non-chrome rels
+        // (styles, hyperlink) that must be ignored by the chrome parser.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+            <Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/>
+            <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+            <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
+        </Relationships>"#;
+        let map = parse_chrome_rels(xml).unwrap();
+        // Only the header + footer rels are kept (styles / hyperlink dropped).
+        assert_eq!(map.len(), 2);
+
+        let h = &map["rId9"];
+        assert_eq!(h.target, "header1.xml");
+        assert_eq!(h.kind, ChromeKind::Header);
+
+        let f = &map["rId10"];
+        assert_eq!(f.target, "footer1.xml");
+        assert_eq!(f.kind, ChromeKind::Footer);
+    }
+
+    #[test]
+    fn chrome_parser_ignores_hyperlink_rels() {
+        // A rels part with only a hyperlink → empty chrome map (and vice
+        // versa: the hyperlink parser ignores chrome rels — both filters are
+        // independent over the one shared part).
+        let xml = r#"<Relationships>
+            <Relationship Id="rId2" Type="http://x/relationships/hyperlink" Target="https://a/" TargetMode="External"/>
+        </Relationships>"#;
+        assert!(parse_chrome_rels(xml).unwrap().is_empty());
+
+        let xml = r#"<Relationships>
+            <Relationship Id="rId9" Type="http://x/relationships/header" Target="header1.xml"/>
+        </Relationships>"#;
+        assert!(parse_hyperlink_rels(xml).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chrome_rel_missing_target_skipped() {
+        let xml = r#"<Relationships>
+            <Relationship Id="rId9" Type="http://x/relationships/header"/>
+            <Relationship Id="rId10" Type="http://x/relationships/footer" Target="footer1.xml"/>
+        </Relationships>"#;
+        let map = parse_chrome_rels(xml).unwrap();
+        assert_eq!(map.len(), 1, "only the well-formed chrome rel survives");
+        assert!(map.contains_key("rId10"));
+    }
+
+    #[test]
+    fn empty_chrome_rels_is_empty_map() {
+        assert!(parse_chrome_rels("").unwrap().is_empty());
     }
 }
