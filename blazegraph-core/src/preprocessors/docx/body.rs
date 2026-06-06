@@ -110,10 +110,16 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     // (C2). Best-effort: a document with no `r:id` hyperlinks (or none at
     // all) has no rels part to read; absence yields an empty map.
     let rels_xml = read_zip_entry(&mut archive, "word/_rels/document.xml.rels").unwrap_or_default();
+    // docProps parts carry the document metadata (C3). Both are best-effort:
+    // a minimal package may omit either, in which case the corresponding
+    // canonical fields / `docx:` slots stay `None`.
+    let core_xml = read_zip_entry(&mut archive, "docProps/core.xml").unwrap_or_default();
+    let app_xml = read_zip_entry(&mut archive, "docProps/app.xml").unwrap_or_default();
 
-    // 2. Styles resolution map + hyperlink relationships map.
+    // 2. Styles resolution map + hyperlink relationships map + docProps.
     let styles = build_styles_map(&styles_xml)?;
     let hyperlink_rels = super::rels::parse_hyperlink_rels(&rels_xml)?;
+    let props = super::props::DocxProps::parse(&core_xml, &app_xml)?;
 
     // 3. Body walk → elements.
     let elements = walk_body(&document_xml, &styles, &hyperlink_rels)?;
@@ -139,9 +145,15 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
         .map_err(|e| ParseError::MalformedDocx(format!("graph build failed: {e}")))?;
 
     // 6. Populate fields the builder doesn't. DOCX is reflowable — no
-    //    per-element bbox exists, so `flow_type = Free`. Metadata is left at
-    //    the builder default; C3 populates it from `docProps/*.xml`.
+    //    per-element bbox exists, so `flow_type = Free`.
     graph.structural_profile.flow_type = FlowType::Free;
+
+    //    Metadata (C3): canonical Dublin-Core fields from `docProps/core.xml`
+    //    + the `docx:` namespace from `app.xml` & core leftovers. The builder
+    //    left `document_metadata` at default.
+    let extractor = super::DocxMetadataExtractor::new(props);
+    graph.document_info.document_metadata =
+        crate::preprocessors::metadata::extract_document_metadata(&extractor, &());
 
     // 7. Canonical post-build sequence (mirrors processor.rs / the MD path).
     graph.compute_structural_profile();
@@ -1212,14 +1224,25 @@ mod tests {
     }
 
     #[test]
-    fn metadata_left_at_builder_default() {
-        // C1 does NOT populate metadata (that's C3). Even though
-        // structured.docx has a core:title, C1 leaves the canonical title
-        // unset because it never reads docProps.
+    fn parse_populates_metadata_from_docprops() {
+        // C3: `parse_docx` now reads `docProps/core.xml` + `app.xml` and wires
+        // the extracted `DocumentMetadata` onto the graph (C1 left it at the
+        // builder default). Spot-check the canonical title + an `app.xml`
+        // `docx:` field end-to-end; the field-by-field mapping is exercised in
+        // `docx::mod`'s `metadata_extracted` against the same fixture.
         let graph = parse_fixture("structured.docx");
-        assert!(
-            graph.document_info.document_metadata.title.is_none(),
-            "C1 leaves title unset (C3 populates from docProps/core.xml)"
+        let meta = &graph.document_info.document_metadata;
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("Structured Sample Document"),
+            "C3 populates the canonical title from docProps/core.xml"
+        );
+        assert_eq!(meta.author.as_deref(), Some("John Smith"));
+        let docx = meta.docx.as_ref().expect("docx: namespace populated by C3");
+        assert_eq!(
+            docx.application.as_deref(),
+            Some("Microsoft Macintosh Word"),
+            "docx.application from docProps/app.xml"
         );
     }
 
