@@ -1194,7 +1194,7 @@ impl RunAssembler {
 /// `<w:pStyle>`. Then:
 /// - `outline_lvl ∈ 0..=8` → Section, `hierarchy_level = outline_lvl + 1`.
 /// - styleId == `"Title"` → Section, level 1.
-/// - style name ∈ {`Quote`, `IntenseQuote`} → Blockquote, level 0.
+/// - style name ∈ {`Quote`, `Intense Quote`} → Blockquote, level 0.
 /// - else → Paragraph, level 0.
 fn classify_paragraph(
     inline_outline_lvl: Option<u8>,
@@ -1217,9 +1217,10 @@ fn classify_paragraph(
         return (SemanticElementType::Section, 1);
     }
 
-    // style name ∈ {Quote, IntenseQuote} → Blockquote.
+    // style name ∈ {Quote, Intense Quote} → Blockquote. Word's display name
+    // for the IntenseQuote styleId is "Intense Quote" (spaced), not the id.
     if let Some(name) = style.and_then(|s| s.name.as_deref()) {
-        if name == "Quote" || name == "IntenseQuote" {
+        if name == "Quote" || name == "Intense Quote" {
             return (SemanticElementType::Blockquote, 0);
         }
     }
@@ -1243,12 +1244,21 @@ fn wrap_emphasis(text: &str, bold: bool, italic: bool) -> String {
     if text.is_empty() || text.trim().is_empty() {
         return text.to_string();
     }
-    match (bold, italic) {
-        (true, true) => format!("***{text}***"),
-        (true, false) => format!("**{text}**"),
-        (false, true) => format!("*{text}*"),
-        (false, false) => text.to_string(),
-    }
+    let marks = match (bold, italic) {
+        (true, true) => "***",
+        (true, false) => "**",
+        (false, true) => "*",
+        (false, false) => return text.to_string(),
+    };
+    // Keep leading/trailing whitespace OUTSIDE the emphasis markers. CommonMark
+    // forbids a closing delimiter preceded by whitespace (so `**bold, **` would
+    // not render), and whitespace-outside also stops an adjacent run's markers
+    // from fusing (`**bold,** *italic,*` rather than `**bold, ***italic, *`).
+    // Whitespace is ASCII (single-byte), so these slices are UTF-8-safe.
+    let lead = &text[..text.len() - text.trim_start().len()];
+    let trail = &text[text.trim_end().len()..];
+    let core = text.trim();
+    format!("{lead}{marks}{core}{marks}{trail}")
 }
 
 /// Escape the inline markdown metacharacters that would otherwise be
@@ -1740,6 +1750,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_intense_quote_is_blockquote() {
+        // styleId is "IntenseQuote" but Word's display name is "Intense Quote".
+        let mut styles = HashMap::new();
+        styles.insert(
+            "IntenseQuote".to_string(),
+            EffectiveStyle {
+                name: Some("Intense Quote".into()),
+                outline_lvl: None,
+            },
+        );
+        let (ty, lvl) = classify_paragraph(None, Some("IntenseQuote"), &styles);
+        assert_eq!(ty, SemanticElementType::Blockquote);
+        assert_eq!(lvl, 0);
+    }
+
+    #[test]
     fn classify_toc_and_normal_are_paragraph() {
         let mut styles = HashMap::new();
         styles.insert(
@@ -1780,6 +1806,14 @@ mod tests {
         // Whitespace-only runs are never wrapped (no `** **`).
         assert_eq!(wrap_emphasis(" ", true, false), " ");
         assert_eq!(wrap_emphasis("", true, true), "");
+        // Leading/trailing whitespace stays OUTSIDE the markers (valid
+        // CommonMark — a closing delimiter may not be preceded by whitespace).
+        assert_eq!(wrap_emphasis("bold, ", true, false), "**bold,** ");
+        assert_eq!(wrap_emphasis(" italic", false, true), " *italic*");
+        assert_eq!(wrap_emphasis("bi, ", true, true), "***bi,*** ");
+        // Adjacent differently-emphasised runs must not fuse their delimiters.
+        let joined = wrap_emphasis("bold, ", true, false) + &wrap_emphasis("italic, ", false, true);
+        assert_eq!(joined, "**bold,** *italic,* ");
     }
 
     #[test]

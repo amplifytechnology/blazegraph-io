@@ -145,24 +145,30 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                         _ => panic!("heading end without matching start (parser invariant)"),
                     };
                     let heading_text = std::mem::take(&mut inline_buf).trim().to_string();
-                    let text_order = elements.len() as u32;
-                    let depth = heading_level_to_depth(level);
-                    elements.push(
-                        SemanticTreeElement {
-                            text: heading_text.clone(),
-                            element_type: SemanticElementType::Section,
-                            hierarchy_level: depth,
-                            text_order,
-                            physical_location: None,
-                            style: None,
-                            token_count: estimate_token_count(&heading_text),
-                            internal_refs: vec![],
-                            external_refs: vec![],
-                            confidence: 0,
-                        }
-                        .validate(),
-                    );
-                    current_section_depth = depth;
+                    // Skip content-free headings (e.g. a `##` spacer or an
+                    // image-only heading). An empty Section has no rendered form
+                    // and violates the C-7a non-empty-body convention; following
+                    // content stays under the last real section.
+                    if !heading_text.is_empty() {
+                        let text_order = elements.len() as u32;
+                        let depth = heading_level_to_depth(level);
+                        elements.push(
+                            SemanticTreeElement {
+                                text: heading_text.clone(),
+                                element_type: SemanticElementType::Section,
+                                hierarchy_level: depth,
+                                text_order,
+                                physical_location: None,
+                                style: None,
+                                token_count: estimate_token_count(&heading_text),
+                                internal_refs: vec![],
+                                external_refs: vec![],
+                                confidence: 0,
+                            }
+                            .validate(),
+                        );
+                        current_section_depth = depth;
+                    }
                 }
                 nesting -= 1;
             }
@@ -179,23 +185,29 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                 if nesting == 1 && matches!(inline_mode, Some(InlineMode::Paragraph)) {
                     inline_mode = None;
                     let para_text = std::mem::take(&mut inline_buf).trim().to_string();
-                    let text_order = elements.len() as u32;
-                    let leaf_level = current_section_depth + 1;
-                    elements.push(
-                        SemanticTreeElement {
-                            text: para_text.clone(),
-                            element_type: SemanticElementType::Paragraph,
-                            hierarchy_level: leaf_level,
-                            text_order,
-                            physical_location: None,
-                            style: None,
-                            token_count: estimate_token_count(&para_text),
-                            internal_refs: vec![],
-                            external_refs: vec![],
-                            confidence: 0,
-                        }
-                        .validate(),
-                    );
+                    // Skip content-free paragraphs (e.g. an image-only paragraph
+                    // with empty alt text). An empty body has no rendered form and
+                    // would violate the C-7a non-empty-body wire convention — fix
+                    // the producer rather than emit an invalid Paragraph.
+                    if !para_text.is_empty() {
+                        let text_order = elements.len() as u32;
+                        let leaf_level = current_section_depth + 1;
+                        elements.push(
+                            SemanticTreeElement {
+                                text: para_text.clone(),
+                                element_type: SemanticElementType::Paragraph,
+                                hierarchy_level: leaf_level,
+                                text_order,
+                                physical_location: None,
+                                style: None,
+                                token_count: estimate_token_count(&para_text),
+                                internal_refs: vec![],
+                                external_refs: vec![],
+                                confidence: 0,
+                            }
+                            .validate(),
+                        );
+                    }
                 }
                 nesting = nesting.saturating_sub(1);
             }
@@ -510,6 +522,41 @@ mod tests {
             nodes[0].parent,
             Some(graph.document_info.root_id),
             "orphan paragraph must attach to Document root"
+        );
+    }
+
+    #[test]
+    fn parse_empty_paragraph_is_skipped_not_emitted() {
+        // An image-only paragraph with empty alt text yields a content-free
+        // paragraph in the event stream. It must be skipped, not emitted as an
+        // empty-body Paragraph (which would panic validate() + violate C-7a).
+        let graph = parse_ok("Real prose.\n\n![](image.png)\n\nMore prose.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "the content-free image paragraph must be skipped, leaving two prose paragraphs"
+        );
+        assert!(
+            nodes.iter().all(|n| !n.content.text.trim().is_empty()),
+            "no emitted node may have an empty body"
+        );
+    }
+
+    #[test]
+    fn parse_empty_heading_is_skipped_not_emitted() {
+        // A content-free heading (image-only here; `##` spacers behave the same)
+        // must be skipped, not emitted as an empty-body Section.
+        let graph = parse_ok("# Real\n\n## ![](image.png)\n\nBody.\n");
+        let nodes = nodes_in_order(&graph);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "the content-free heading must be skipped, leaving one Section + one Paragraph"
+        );
+        assert!(
+            nodes.iter().all(|n| !n.content.text.trim().is_empty()),
+            "no emitted node may have an empty body"
         );
     }
 
