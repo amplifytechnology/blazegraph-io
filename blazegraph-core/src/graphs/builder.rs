@@ -42,7 +42,7 @@ impl GraphBuilder {
         id_gen: &NodeIdGenerator,
         parse_provenance: ParseProvenance,
     ) -> Result<DocumentGraph> {
-        println!(
+        eprintln!(
             "🏗️  Building document graph from {} elements",
             elements.len()
         );
@@ -136,7 +136,7 @@ impl GraphBuilder {
         // without re-reading the source bytes.
         graph.document_info.parse_provenance = Some(parse_provenance);
 
-        println!("✅ Graph built: {} nodes", graph.nodes.len());
+        eprintln!("✅ Graph built: {} nodes", graph.nodes.len());
 
         Ok(graph)
     }
@@ -145,7 +145,7 @@ impl GraphBuilder {
     /// Used by --dump-stages and other paths that don't have source/config
     /// hashes.
     pub fn build_graph(&self, elements: Vec<SemanticTreeElement>) -> Result<DocumentGraph> {
-        println!(
+        eprintln!(
             "🏗️  Building document graph from {} elements",
             elements.len()
         );
@@ -220,7 +220,7 @@ impl GraphBuilder {
         graph.structural_profile.total_nodes = graph.nodes.len();
         graph.structural_profile.document_type = DocumentType::Generic;
 
-        println!("✅ Graph built: {} nodes", graph.nodes.len());
+        eprintln!("✅ Graph built: {} nodes", graph.nodes.len());
 
         Ok(graph)
     }
