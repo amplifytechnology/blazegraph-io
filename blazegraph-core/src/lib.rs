@@ -3,6 +3,12 @@
 // Provides document processing with pluggable preprocessor architecture.
 // Main interface for converting documents to semantic graphs.
 
+/// The blazegraph-core crate version (e.g. `"0.2.2"`), from `CARGO_PKG_VERSION`
+/// at build time. This is the canonical "parser version" for
+/// `ParseProvenance.blazegraph_version`: consumers that produce graphs through
+/// this crate (CLI, API) should stamp this rather than their own crate version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod analytics;
 pub mod cache;
 pub mod classifier;
