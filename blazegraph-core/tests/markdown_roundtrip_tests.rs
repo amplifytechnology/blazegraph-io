@@ -71,7 +71,7 @@ fn build_synthetic_graph(
         .build_graph_deterministic(elements, &id_gen, provenance)
         .expect("synthetic graph builds");
     graph.document_info.document_metadata.title = title.map(str::to_string);
-    graph.document_info.bookmark_data = bookmarks;
+    graph.document_info.outline_data = bookmarks;
     graph.structural_profile.flow_type = FlowType::Free;
     graph.compute_structural_profile();
     graph.compute_breadcrumbs();
@@ -172,7 +172,7 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
         title: sorted.document_info.document_metadata.title,
         ..DocumentMetadata::default()
     };
-    graph.document_info.bookmark_data = sorted.document_info.bookmark_data;
+    graph.document_info.outline_data = sorted.document_info.outline_data;
     graph.structural_profile.flow_type = sorted.structural_profile.flow_type;
 
     // Re-derive analytics + breadcrumbs.
@@ -326,12 +326,12 @@ fn roundtrip_identity_synthetic_with_bookmarks() {
     );
 
     let parsed = assert_roundtrip_identity(&original);
-    // Spot-check: bookmark_data round-tripped through the
-    // `bgraph-bookmarks` fence.
+    // Spot-check: outline_data round-tripped through the
+    // `bgraph-outline` fence.
     let parsed_bm = parsed
         .document_info
-        .bookmark_data
-        .expect("bookmark_data Some after round-trip");
+        .outline_data
+        .expect("outline_data Some after round-trip");
     assert_eq!(parsed_bm.sections.len(), bookmarks.sections.len());
     for (got, expected) in parsed_bm.sections.iter().zip(bookmarks.sections.iter()) {
         assert_eq!(got.title, expected.title);

@@ -64,7 +64,14 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// v2.4.0 (CR-78): additive — the per-element fence gains an optional
 /// `confidence: u8` field on Section nodes (detection-confidence
 /// annotation; omitted when `0`). No consumer reads it yet (Phase A).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.4.0";
+///
+/// v2.5.0 (CR-81 + CR-82): coordinated bump. CR-82 adds the doc-level
+/// `kind` discriminator (default `document`). CR-81 renames the
+/// navigational-outline fence `bgraph-bookmarks` → `bgraph-outline` and
+/// the JSON field `bookmark_data` → `outline_data`, and adds DOCX
+/// Table-of-Contents-SDT outline extraction. Pre-2.5.0 files still parse
+/// (kind defaults, both fence names accepted on read).
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.5.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -195,8 +202,9 @@ mod tests {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
-                bookmark_data: None,
+                outline_data: None,
                 parse_provenance: Some(ParseProvenance {
                     blazegraph_version: "0.6.0".to_string(),
                     source_format: "markdown".to_string(),

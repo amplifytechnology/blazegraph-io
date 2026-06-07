@@ -341,7 +341,7 @@ impl DocumentProcessor {
                 graph.document_info.document_metadata.title = Some(title);
             }
         }
-        graph.document_info.bookmark_data = preprocessor_output.bookmark_data;
+        graph.document_info.outline_data = preprocessor_output.bookmark_data;
         // CR-66 ordering: structural profile is computed twice — once
         // before graph_sanity (so invariant checks can reason from a
         // current node-type / depth-distribution view) and once after
@@ -512,7 +512,7 @@ impl DocumentProcessor {
                 graph.document_info.document_metadata.title = Some(title);
             }
         }
-        graph.document_info.bookmark_data = preprocessor_output.bookmark_data.clone();
+        graph.document_info.outline_data = preprocessor_output.bookmark_data.clone();
         // CR-66 ordering: structural profile is computed twice — once
         // before graph_sanity (so invariant checks can reason from a
         // current node-type / depth-distribution view) and once after

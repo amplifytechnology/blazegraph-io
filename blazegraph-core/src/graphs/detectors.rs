@@ -289,7 +289,7 @@ pub fn flag_section_overlap(
         .collect();
 
     let bookmark_titles: Option<HashSet<String>> = if cfg.bookmark_bypass {
-        graph.document_info.bookmark_data.as_ref().map(|bd| {
+        graph.document_info.outline_data.as_ref().map(|bd| {
             bd.sections
                 .iter()
                 .map(|s| crate::preprocessors::pdf::xhtml_parser::normalize_for_match(&s.title))

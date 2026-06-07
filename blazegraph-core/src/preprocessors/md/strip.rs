@@ -143,7 +143,7 @@ fn strip_all_fences(input: &str) -> Result<String, ParseError> {
 ///
 /// If the doc-level JSON happens to carry a top-level `bookmarks` field
 /// (it does not in the current emitter — bookmarks live in a separate
-/// `bgraph-bookmarks` fence — but this is a forward-compat safety net),
+/// `bgraph-outline` fence — but this is a forward-compat safety net),
 /// that field is dropped. Bookmarks themselves are stripped in the
 /// body-pass (separate fence).
 fn strip_with_frontmatter(input: &str) -> Result<String, ParseError> {
@@ -434,7 +434,7 @@ mod tests {
             "{\"schema\":\"2.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"src-sha\"},\"flow_type\":\"Fixed\",\"title\":\"Sample\",\"config_hash\":\"cfg-sha\",\"graph_sha256\":\"deadbeef\"}",
             "```",
             "",
-            "```bgraph-bookmarks",
+            "```bgraph-outline",
             "{\"sections\":[{\"title\":\"Introduction\",\"order\":0,\"level\":1}]}",
             "```",
             "",
@@ -732,7 +732,7 @@ fn main() {}
     }
 
     /// CR-55 Test 3: bookmarks dropped under default mode.
-    /// The `bgraph-bookmarks` fence content is stripped from the body;
+    /// The `bgraph-outline` fence content is stripped from the body;
     /// no `bookmarks:` key in frontmatter; no orphan blank line.
     #[test]
     fn cr55_test3_bookmarks_dropped_in_default_mode() {
@@ -750,12 +750,12 @@ fn main() {}
             !frontmatter.contains("bookmarks:"),
             "frontmatter must not contain bookmarks key; got:\n{frontmatter}"
         );
-        // No `bgraph-bookmarks` fence body in the document body
+        // No `bgraph-outline` fence body in the document body
         // (sample's bookmarks JSON line carries the literal
         // `"sections":[{"title":"Introduction"`...).
         assert!(
             !out.contains("\"sections\":[{\"title\":\"Introduction\""),
-            "bgraph-bookmarks fence body must be stripped from output"
+            "bgraph-outline fence body must be stripped from output"
         );
         // No no-blank-line orphan double-blanks where the bookmarks
         // fence used to live (between doc-level and first paragraph

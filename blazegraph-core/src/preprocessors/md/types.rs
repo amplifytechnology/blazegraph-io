@@ -94,7 +94,7 @@ pub enum StripMode {
     /// and lift the doc-level `bgraph` block to YAML frontmatter at the
     /// top of the output. Produces docling-comparable plain markdown
     /// with provenance preserved. Body content for every variant
-    /// survives. `bgraph-bookmarks` fence content is dropped (not
+    /// survives. `bgraph-outline` fence content is dropped (not
     /// lifted) — outlines are recoverable from the source `.bgraph.md`.
     BodyWithFrontmatter,
     /// Remove every bgraph fence (doc-level + bookmarks + every
@@ -139,7 +139,7 @@ pub enum ParseError {
     MissingDocLevelBlock,
 
     /// A bgraph fence appeared in an invalid position or with an
-    /// invalid shape (e.g., `bgraph-bookmarks` not immediately after
+    /// invalid shape (e.g., `bgraph-outline` not immediately after
     /// the doc-level block, or a Header/Footer/Margin fence with no
     /// body content).
     #[error("malformed bgraph fence: {0}")]

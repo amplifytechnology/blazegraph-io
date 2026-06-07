@@ -54,11 +54,23 @@ pub enum FlowType {
 pub struct DocumentInfo {
     /// References the Document node in nodes[] (the tree root)
     pub root_id: NodeId,
+    /// Artifact discriminator (CR-82): what this bgraph *is*, orthogonal
+    /// to `source.format` (input format) and `flow_type` (topology).
+    /// `document` for the base parse; future producers emit `summary`,
+    /// `embedding`, etc. Defaults to `document` on read of pre-2.5.0
+    /// files (back-compatible). Part of the canonical graph identity, so
+    /// a `summary` and a `document` with identical content hash apart.
+    #[serde(default = "default_kind")]
+    pub kind: String,
     /// Metadata extracted from the source format (title, author, page count, etc.)
     pub document_metadata: DocumentMetadata,
-    /// PDF bookmarks/table of contents (if available in the source PDF)
+    /// Navigational outline, when the source carries a standardized one
+    /// (PDF `/Outlines` bookmarks; DOCX Table-of-Contents SDT — CR-81).
+    /// `None` otherwise (the slot is conditional). Inner type names keep
+    /// the `Bookmark*` spelling (Tika's term) by design; the wire/JSON
+    /// field is the cross-format-correct `outline_data`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bookmark_data: Option<BookmarkData>,
+    pub outline_data: Option<BookmarkData>,
 
     /// Origin of this graph — the (version, source, config) triple that
     /// reproduces it. Persisted on the graph so the bgraph.md emitter
@@ -871,6 +883,13 @@ pub struct BookmarkSection {
 
 fn default_bookmark_level() -> u32 {
     1
+}
+
+/// Default artifact kind for the base document parse (CR-82). Single
+/// source of truth for the `document` discriminator value, shared by the
+/// `DocumentInfo` serde default and the bgraph.md parse-side default.
+pub fn default_kind() -> String {
+    "document".to_string()
 }
 
 #[derive(Debug, Clone)]

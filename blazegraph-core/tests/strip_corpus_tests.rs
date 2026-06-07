@@ -78,10 +78,10 @@ fn corpus_rfc_quic_default_mode_emits_parseable_frontmatter() {
         !out.contains("```bgraph"),
         "no bgraph fences allowed in default-mode output"
     );
-    // bgraph-bookmarks fence body (a JSON sections array) is gone.
+    // bgraph-outline fence body (a JSON sections array) is gone.
     assert!(
         !out.contains("\"sections\":[{\"title\":\"RFC 9000\""),
-        "bgraph-bookmarks JSON must be stripped from body"
+        "bgraph-outline JSON must be stripped from body"
     );
 }
 

@@ -178,8 +178,9 @@ mod tests {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
-                bookmark_data: None,
+                outline_data: None,
                 parse_provenance: Some(ParseProvenance {
                     blazegraph_version: "0.6.0".to_string(),
                     source_format: "markdown".to_string(),
@@ -239,7 +240,7 @@ mod tests {
     fn canonical_json_keys_are_sorted() {
         // Spot-check: in canonical output the document_info object's
         // first key must be the lex-smallest of its present keys.
-        // Without bookmark_data (skip_serializing_if = None), the
+        // Without outline_data (skip_serializing_if = None), the
         // present keys are: document_metadata, parse_provenance, root_id
         // → smallest is "document_metadata".
         let graph = build_minimal_graph("seed");

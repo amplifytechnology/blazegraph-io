@@ -435,7 +435,7 @@ fn check_and_correct_section_overlap(
 
     // Normalized bookmark titles for the bypass (only if enabled + present).
     let bookmark_titles: Option<HashSet<String>> = if cfg.bookmark_bypass {
-        graph.document_info.bookmark_data.as_ref().map(|bd| {
+        graph.document_info.outline_data.as_ref().map(|bd| {
             bd.sections
                 .iter()
                 .map(|s| normalize_for_match(&s.title))
@@ -1858,7 +1858,7 @@ mod tests {
         assert_eq!(graph.nodes[&section_id].node_type, "Paragraph");
     }
 
-    /// CR-68 Test 2 — same overlap geometry, but bookmark_data contains a title
+    /// CR-68 Test 2 — same overlap geometry, but outline_data contains a title
     /// matching the section's text and bookmark_bypass is on → kept as Section.
     #[test]
     fn test_cr68_bookmark_bypass_protects_matching_section() {
@@ -1868,7 +1868,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 50.0),
         );
         // Outline writes it as "3.1 Approach 1"; normalize_for_match aligns them.
-        graph.document_info.bookmark_data = Some(BookmarkData {
+        graph.document_info.outline_data = Some(BookmarkData {
             sections: vec![BookmarkSection {
                 title: "3.1 Approach 1".into(),
                 order: 0,

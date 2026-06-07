@@ -359,8 +359,9 @@ mod tests {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
-                bookmark_data: None,
+                outline_data: None,
                 parse_provenance: None, // generic emitter doesn't need provenance
                 topology: None,
             },

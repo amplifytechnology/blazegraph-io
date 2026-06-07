@@ -99,7 +99,7 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                         }
                         if bookmarks.is_some() || !parsed_elements.is_empty() {
                             return Err(ParseError::MalformedFence(
-                                "bgraph-metadata fence must appear before bgraph-bookmarks \
+                                "bgraph-metadata fence must appear before bgraph-outline \
                                  and per-element fences"
                                     .to_string(),
                             ));
@@ -109,18 +109,18 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                             .map_err(|source| ParseError::JsonParse { source })?;
                         pending_body = None;
                     }
-                    "bgraph-bookmarks" => {
+                    "bgraph-outline" => {
                         if doc_level.is_none() {
                             return Err(ParseError::MissingDocLevelBlock);
                         }
                         if bookmarks.is_some() {
                             return Err(ParseError::MalformedFence(
-                                "duplicate bgraph-bookmarks fence".to_string(),
+                                "duplicate bgraph-outline fence".to_string(),
                             ));
                         }
                         if !parsed_elements.is_empty() {
                             return Err(ParseError::MalformedFence(
-                                "bgraph-bookmarks fence must appear before per-element fences"
+                                "bgraph-outline fence must appear before per-element fences"
                                     .to_string(),
                             ));
                         }
@@ -266,7 +266,9 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     // inputs), `document_metadata` defaults to `Default::default()`,
     // which is the honest "no extracted metadata" answer.
     graph.document_info.document_metadata = document_metadata;
-    graph.document_info.bookmark_data = bookmarks;
+    // CR-82: round-trip the artifact kind (default `document` when absent).
+    graph.document_info.kind = doc_level.kind.clone();
+    graph.document_info.outline_data = bookmarks;
     // CR-49 (v2.1.0+) added `topology` here.
     // CR-60 (2026-05-22) retracted `source_identity` + `supersedes`
     // per the byte-in/byte-out principle (arch doc 11 + DT-04).
@@ -400,7 +402,7 @@ fn scan_segments(input: &str) -> Result<Vec<Segment>, ParseError> {
 /// leading triple-backticks). Otherwise `None`.
 ///
 /// Recognized tags (v2.1.0+ / CR-57): `bgraph`, `bgraph-metadata`,
-/// `bgraph-bookmarks`, `bgraph-section`, `bgraph-paragraph`,
+/// `bgraph-outline`, `bgraph-section`, `bgraph-paragraph`,
 /// `bgraph-header`, `bgraph-footer`, `bgraph-margin`, `bgraph-code-block`,
 /// `bgraph-list`, `bgraph-block-quote`, `bgraph-table`. Any other
 /// ` ```bgraph* ` line-start is rejected by the caller as a
@@ -417,7 +419,7 @@ pub(super) fn bgraph_fence_open_tag(line: &str) -> Option<String> {
     let info = line.strip_prefix("```")?;
     if info == "bgraph"
         || info == "bgraph-metadata"
-        || info == "bgraph-bookmarks"
+        || info == "bgraph-outline"
         || info == "bgraph-section"
         || info == "bgraph-paragraph"
         || info == "bgraph-header"
@@ -497,6 +499,10 @@ fn collapse_free_buffer(lines: &[&str]) -> String {
 #[derive(Debug, Clone, Deserialize)]
 struct DocLevelBlock {
     schema: String,
+    // CR-82: artifact discriminator. `#[serde(default)]` so pre-2.5.0
+    // files (no `kind`) parse as `document` — back-compatible read.
+    #[serde(default = "crate::types::default_kind")]
+    kind: String,
     blazegraph_version: String,
     source: DocLevelSource,
     flow_type: FlowType,
@@ -701,7 +707,7 @@ mod tests {
             .build_graph_deterministic(elements, &id_gen, provenance)
             .expect("synthetic graph builds");
         graph.document_info.document_metadata.title = title.map(str::to_string);
-        graph.document_info.bookmark_data = bookmarks;
+        graph.document_info.outline_data = bookmarks;
         graph.structural_profile.flow_type = FlowType::Free;
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
@@ -761,8 +767,8 @@ mod tests {
         let parsed_bm = result
             .graph
             .document_info
-            .bookmark_data
-            .expect("bookmark_data is Some");
+            .outline_data
+            .expect("outline_data is Some");
         assert_eq!(parsed_bm.sections.len(), 2);
         assert_eq!(parsed_bm.sections[0].title, "Intro");
         assert_eq!(parsed_bm.sections[0].level, 1);
@@ -771,11 +777,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_bookmarks_fence_absent_yields_none_bookmark_data() {
+    fn parse_bookmarks_fence_absent_yields_none_outline_data() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
         let md = emit_markdown(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
-        assert!(result.graph.document_info.bookmark_data.is_none());
+        assert!(result.graph.document_info.outline_data.is_none());
     }
 
     #[test]

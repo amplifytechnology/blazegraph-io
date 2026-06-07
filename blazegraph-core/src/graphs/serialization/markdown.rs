@@ -74,11 +74,11 @@ pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> S
     // v2.1.0+ (CR-56 § I.3): the `bgraph-metadata` fence is REQUIRED on
     // every emitted bgraph.md, even when all fields are null. Placed
     // immediately after the doc-level `bgraph` block, before any
-    // `bgraph-bookmarks` fence.
+    // `bgraph-outline` fence.
     parts.push(emit_metadata_block(&graph.document_info.document_metadata));
     parts.push(String::new());
 
-    // Optional `bgraph-bookmarks` fence — emitted only when the source
+    // Optional `bgraph-outline` fence — emitted only when the source
     // graph carries an outline. Placed immediately after `bgraph-metadata`
     // so the doc-level identity block stays a single readable JSON line
     // even when the bookmark payload is large (rfc-quic ~14 KB).
@@ -106,14 +106,14 @@ pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> S
     parts.join("\n")
 }
 
-/// Document-level bookmarks block. Tag: `bgraph-bookmarks`. Optional —
-/// returns `None` when `graph.document_info.bookmark_data` is `None`.
+/// Document-level bookmarks block. Tag: `bgraph-outline`. Optional —
+/// returns `None` when `graph.document_info.outline_data` is `None`.
 /// JSON shape mirrors `BookmarkData` exactly (one `serde_json::to_string`
 /// pass, compact, single line).
 fn emit_bookmarks_block(graph: &DocumentGraph) -> Option<String> {
-    let bookmarks = graph.document_info.bookmark_data.as_ref()?;
+    let bookmarks = graph.document_info.outline_data.as_ref()?;
     let json = serde_json::to_string(bookmarks).expect("BookmarkData is always serializable");
-    Some(format!("```bgraph-bookmarks\n{json}\n```"))
+    Some(format!("```bgraph-outline\n{json}\n```"))
 }
 
 /// Document-extracted metadata block. Tag: `bgraph-metadata`. Carries
@@ -146,6 +146,9 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
     #[derive(Serialize)]
     struct DocLevelBlock<'a> {
         schema: &'static str,
+        // CR-82: artifact discriminator, emitted right after `schema`.
+        // Always present (default `document`); part of graph identity.
+        kind: &'a str,
         blazegraph_version: &'a str,
         source: DocLevelSource<'a>,
         flow_type: &'a FlowType,
@@ -164,6 +167,7 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 
     let block = DocLevelBlock {
         schema: BGRAPH_MD_FORMAT_VERSION,
+        kind: &graph.document_info.kind,
         blazegraph_version: &provenance.blazegraph_version,
         source: DocLevelSource {
             format: &provenance.source_format,
@@ -185,7 +189,7 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 ///
 /// Body placement follows spec convention C-3: content fences carry
 /// body on the line(s) preceding the fence; metadata fences (doc-level,
-/// `bgraph-metadata`, `bgraph-bookmarks`) have no body outside. Section
+/// `bgraph-metadata`, `bgraph-outline`) have no body outside. Section
 /// gains an `#`-prefix heading line; all other content variants emit
 /// body verbatim.
 ///
@@ -397,11 +401,12 @@ mod tests {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata {
                     title: Some("Synthetic Test Doc".to_string()),
                     ..DocumentMetadata::default()
                 },
-                bookmark_data: None,
+                outline_data: None,
                 parse_provenance: Some(ParseProvenance {
                     blazegraph_version: "0.6.0".to_string(),
                     source_format: "markdown".to_string(),
@@ -679,20 +684,20 @@ mod tests {
     }
 
     #[test]
-    fn bookmarks_fence_is_omitted_when_bookmark_data_is_none() {
+    fn bookmarks_fence_is_omitted_when_outline_data_is_none() {
         let graph = build_graph(vec![("Section", "Intro", 1, 0)]);
-        // build_graph sets bookmark_data: None.
+        // build_graph sets outline_data: None.
         let md = emit_markdown(&graph);
         assert!(
-            !md.contains("```bgraph-bookmarks"),
-            "bgraph-bookmarks fence should be omitted when bookmark_data is None; got:\n{md}",
+            !md.contains("```bgraph-outline"),
+            "bgraph-outline fence should be omitted when outline_data is None; got:\n{md}",
         );
     }
 
     #[test]
-    fn bookmarks_fence_is_emitted_when_bookmark_data_is_present() {
+    fn bookmarks_fence_is_emitted_when_outline_data_is_present() {
         let mut graph = build_graph(vec![("Section", "Intro", 1, 0)]);
-        graph.document_info.bookmark_data = Some(BookmarkData {
+        graph.document_info.outline_data = Some(BookmarkData {
             sections: vec![
                 BookmarkSection {
                     title: "Introduction".to_string(),
@@ -710,15 +715,15 @@ mod tests {
 
         // Fence appears.
         assert!(
-            md.contains("```bgraph-bookmarks\n"),
-            "bgraph-bookmarks fence should be present when bookmark_data is Some; got:\n{md}",
+            md.contains("```bgraph-outline\n"),
+            "bgraph-outline fence should be present when outline_data is Some; got:\n{md}",
         );
 
         // Fence content parses as JSON with the expected shape.
         let start = md
-            .find("```bgraph-bookmarks\n")
+            .find("```bgraph-outline\n")
             .expect("fence open present")
-            + "```bgraph-bookmarks\n".len();
+            + "```bgraph-outline\n".len();
         let end = md[start..].find("\n```").expect("fence close present") + start;
         let json_line = &md[start..end];
         let parsed: BookmarkData =
@@ -728,7 +733,7 @@ mod tests {
 
         // Placement (v2.1.0+): bookmarks fence sits between the
         // bgraph-metadata block and the first per-element fence.
-        let metadata_close = md.find("```\n\n```bgraph-bookmarks").expect(
+        let metadata_close = md.find("```\n\n```bgraph-outline").expect(
             "bookmarks fence should follow the metadata block, separated by exactly one blank line",
         );
         let first_section = md.find("```bgraph-section").expect("section fence");
@@ -926,12 +931,12 @@ mod tests {
 
     #[test]
     fn convention_c3_bookmarks_metadata_fence_has_no_body_outside() {
-        // C-3 (metadata side): bgraph-bookmarks is a metadata fence;
+        // C-3 (metadata side): bgraph-outline is a metadata fence;
         // no body content precedes it. The line immediately before the
         // fence-open is the blank-line separator from the doc-level
         // block.
         let mut graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
-        graph.document_info.bookmark_data = Some(BookmarkData {
+        graph.document_info.outline_data = Some(BookmarkData {
             sections: vec![BookmarkSection {
                 title: "Intro".to_string(),
                 order: 0,
@@ -942,8 +947,8 @@ mod tests {
         let lines: Vec<&str> = md.lines().collect();
         let bookmarks_idx = lines
             .iter()
-            .position(|l| *l == "```bgraph-bookmarks")
-            .expect("bookmarks fence must be emitted when bookmark_data is Some");
+            .position(|l| *l == "```bgraph-outline")
+            .expect("bookmarks fence must be emitted when outline_data is Some");
         assert!(
             bookmarks_idx > 0,
             "bookmarks fence cannot be the first line"

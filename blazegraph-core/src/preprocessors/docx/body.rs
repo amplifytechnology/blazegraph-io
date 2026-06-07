@@ -136,6 +136,7 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     let BodyWalk {
         mut elements,
         chrome_ref_ids,
+        outline_data,
     } = walk_body(&document_xml, &styles, &hyperlink_rels)?;
 
     // 3b. Header/footer parts (C5): resolve the captured references through the
@@ -167,6 +168,12 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     // 6. Populate fields the builder doesn't. DOCX is reflowable — no
     //    per-element bbox exists, so `flow_type = Free`.
     graph.structural_profile.flow_type = FlowType::Free;
+
+    //    Navigational outline (CR-81): the ToC SDT, when present. DOCX
+    //    section detection is style-based (not bookmark-gated like PDF), so
+    //    this is purely the emitted outline slot — the entries also remain
+    //    as body Paragraphs (double-up).
+    graph.document_info.outline_data = outline_data;
 
     //    Metadata (C3): canonical Dublin-Core fields from `docProps/core.xml`
     //    + the `docx:` namespace from `app.xml` & core leftovers. The builder
@@ -332,6 +339,11 @@ struct ParagraphAccumulator {
     /// not paragraph props).
     seen_ppr_end: bool,
     in_ppr: bool,
+    /// `<w:bookmarkStart w:name>` names seen inside this paragraph (CR-81).
+    /// On a heading, these are the anchor targets a ToC entry's
+    /// `<w:hyperlink w:anchor>` resolves to — the bridge from a ToC entry
+    /// back to its heading level.
+    bookmark_names: Vec<String>,
 }
 
 /// Accumulates a table's rows. Each cell is itself a run-assembled string.
@@ -363,6 +375,11 @@ struct BodyWalk {
     /// `r:id`s of `<w:headerReference>` / `<w:footerReference>` in document
     /// order of first appearance (dedup is by *resolved part*, done later).
     chrome_ref_ids: Vec<String>,
+    /// Navigational outline lifted from the ToC SDT (CR-81), or `None` when
+    /// the document carries no `docPartGallery="Table of Contents"` content
+    /// control. The entries stay in the body too (double-up); this is the
+    /// structured projection.
+    outline_data: Option<BookmarkData>,
 }
 
 /// Walk `<w:body>`'s top-level children (`<w:p>` and `<w:tbl>`) in document
@@ -383,6 +400,15 @@ fn walk_body(
     let mut chrome_ref_ids: Vec<String> = Vec::new();
 
     let mut in_body = false;
+    // CR-81 outline extraction state.
+    // `sdt_stack`: one bool per open `<w:sdt>`, `true` once its
+    // `<w:docPartGallery w:val="Table of Contents"/>` is seen. A paragraph is
+    // a ToC entry when any open SDT frame is `true`.
+    let mut sdt_stack: Vec<bool> = Vec::new();
+    // ToC entries in document order: (visible title, anchor bookmark name).
+    let mut toc_entries: Vec<(String, String)> = Vec::new();
+    // Heading bookmark name → 1-based section level (the resolution target).
+    let mut bookmark_levels: HashMap<String, u32> = HashMap::new();
     // The block currently being accumulated (a top-level `<w:p>` or
     // `<w:tbl>`). `None` between blocks.
     let mut block: Option<Block> = None;
@@ -420,6 +446,14 @@ fn walk_body(
                 // accumulation; the element name never collides with a block /
                 // run element.
                 capture_chrome_ref(name, &e, &mut chrome_ref_ids);
+                // CR-81: SDT context tracking runs alongside block accumulation
+                // (an `<w:sdt>` is transparent to blocks — its inner `<w:p>`
+                // still opens a Paragraph block, so entries double up).
+                match name {
+                    b"sdt" => sdt_stack.push(false),
+                    b"docPartGallery" => mark_toc_gallery(&e, &mut sdt_stack),
+                    _ => {}
+                }
                 match &mut block {
                     // Not inside a block yet — a top-level child opens one.
                     None => match name {
@@ -446,6 +480,11 @@ fn walk_body(
                 // self-closing empty element. Capture it before delegating the
                 // rest to the open block's empty handler.
                 capture_chrome_ref(name, &e, &mut chrome_ref_ids);
+                // CR-81: `<w:docPartGallery w:val="Table of Contents"/>` is the
+                // self-closing form — the usual case.
+                if name == b"docPartGallery" {
+                    mark_toc_gallery(&e, &mut sdt_stack);
+                }
                 match &mut block {
                     Some(Block::Paragraph(acc)) => para_on_empty(acc, &e),
                     Some(Block::Table(acc)) => {
@@ -477,6 +516,10 @@ fn walk_body(
                 }
                 let qname = e.name();
                 let name = local_name(qname.as_ref());
+                // CR-81: close the innermost SDT frame.
+                if name == b"sdt" {
+                    sdt_stack.pop();
+                }
                 match &mut block {
                     None => {
                         if name == b"body" {
@@ -491,9 +534,28 @@ fn walk_body(
                                     styles,
                                     elements.len() as u32,
                                     current_section_depth,
+                                    &mut bookmark_levels,
                                 ) {
                                     if el.element_type == SemanticElementType::Section {
                                         current_section_depth = el.hierarchy_level;
+                                    }
+                                    // CR-81: inside the ToC SDT, this entry's
+                                    // anchored hyperlink is an outline node.
+                                    // The element still flows into the body
+                                    // below (double-up).
+                                    if sdt_stack.iter().any(|&toc| toc) {
+                                        if let Some(r) = el.internal_refs.first() {
+                                            if let InternalRefTarget::Named { name, .. } =
+                                                &r.target
+                                            {
+                                                let title = if r.text.trim().is_empty() {
+                                                    el.text.trim().to_string()
+                                                } else {
+                                                    r.text.clone()
+                                                };
+                                                toc_entries.push((title, name.clone()));
+                                            }
+                                        }
                                     }
                                     elements.push(el);
                                 }
@@ -530,7 +592,46 @@ fn walk_body(
     Ok(BodyWalk {
         elements,
         chrome_ref_ids,
+        outline_data: build_outline(&toc_entries, &bookmark_levels),
     })
+}
+
+/// Set the innermost open SDT frame to "is a Table-of-Contents content
+/// control" when the `<w:docPartGallery>` value says so (CR-81).
+fn mark_toc_gallery(e: &BytesStart, sdt_stack: &mut [bool]) {
+    if attr_value(e, b"w:val").as_deref() == Some("Table of Contents") {
+        if let Some(top) = sdt_stack.last_mut() {
+            *top = true;
+        }
+    }
+}
+
+/// Resolve ToC SDT entries to outline sections (CR-81). Each entry's anchor
+/// is matched to a heading's 1-based section level; levels are then rebased
+/// so the shallowest entry is level 1, matching the PDF `/Outlines` depth
+/// semantic (`order` is the 0-based sequence, also matching PDF). Entries
+/// whose anchor doesn't resolve to a heading are dropped — we only emit
+/// outline nodes we can authoritatively level. Returns `None` when nothing
+/// resolves (no ToC, or a ToC with no resolvable entries).
+fn build_outline(
+    toc_entries: &[(String, String)],
+    bookmark_levels: &HashMap<String, u32>,
+) -> Option<BookmarkData> {
+    let resolved: Vec<(&str, u32)> = toc_entries
+        .iter()
+        .filter_map(|(title, anchor)| bookmark_levels.get(anchor).map(|&lvl| (title.as_str(), lvl)))
+        .collect();
+    let min_level = resolved.iter().map(|(_, lvl)| *lvl).min()?;
+    let sections = resolved
+        .iter()
+        .enumerate()
+        .map(|(i, (title, lvl))| BookmarkSection {
+            title: (*title).to_string(),
+            order: i as u32,
+            level: lvl - min_level + 1,
+        })
+        .collect();
+    Some(BookmarkData { sections })
 }
 
 /// Capture a `<w:headerReference>` / `<w:footerReference>`'s `r:id` into
@@ -594,6 +695,14 @@ fn para_on_empty(acc: &mut ParagraphAccumulator, e: &BytesStart) {
                 acc.inline_outline_lvl = attr_value(e, b"w:val").and_then(|v| v.parse::<u8>().ok());
             }
         }
+        // CR-81: a heading's bookmark anchor (Word/Google-Docs place the
+        // `<w:bookmarkStart>` inside the heading `<w:p>`). Captured so the
+        // ToC SDT's `w:anchor` entries can resolve back to heading levels.
+        b"bookmarkStart" => {
+            if let Some(name) = attr_value(e, b"w:name") {
+                acc.bookmark_names.push(name);
+            }
+        }
         _ => acc.runs.on_empty(e),
     }
 }
@@ -621,6 +730,7 @@ fn finish_paragraph(
     styles: &HashMap<String, EffectiveStyle>,
     text_order: u32,
     current_section_depth: u32,
+    bookmark_levels: &mut HashMap<String, u32>,
 ) -> Option<SemanticTreeElement> {
     let (element_type, mapped_level) =
         classify_paragraph(acc.inline_outline_lvl, acc.style_id.as_deref(), styles);
@@ -633,6 +743,15 @@ fn finish_paragraph(
     } else {
         current_section_depth + 1
     };
+
+    // CR-81: record this heading's bookmark anchors → its 1-based section
+    // level, so ToC SDT entries can resolve their level. (Headings are
+    // never empty, so this runs before the empty-text skip below.)
+    if element_type == SemanticElementType::Section {
+        for name in &acc.bookmark_names {
+            bookmark_levels.insert(name.clone(), hierarchy_level);
+        }
+    }
 
     let (mut text, refs) = acc.runs.finish_with_refs();
     // Trim Section heading text (heading-marker semantics, decision 5);

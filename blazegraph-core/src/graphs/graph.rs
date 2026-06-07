@@ -17,8 +17,9 @@ impl DocumentGraph {
 
         let document_info = DocumentInfo {
             root_id,
+            kind: crate::types::default_kind(),
             document_metadata: DocumentMetadata::default(),
-            bookmark_data: None,
+            outline_data: None,
             parse_provenance: None,
             topology: None,
         };
@@ -37,8 +38,9 @@ impl DocumentGraph {
 
         let document_info = DocumentInfo {
             root_id: Uuid::new_v4(),
+            kind: crate::types::default_kind(),
             document_metadata: DocumentMetadata::default(),
-            bookmark_data: None,
+            outline_data: None,
             parse_provenance: None,
             topology: None,
         };
