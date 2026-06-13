@@ -548,11 +548,15 @@ struct NodeMetadata {
     token_count: usize,
     /// CR-62 (v2.3.0+): per-element refs to other locations within this
     /// document. `#[serde(default)]` so pre-v2.3.0 fixtures parse cleanly.
+    // CR-62: parsed, not yet consumed on the parse-back path.
     #[serde(default)]
+    #[allow(dead_code)]
     internal_refs: Vec<crate::types::InternalRef>,
     /// CR-62 (v2.3.0+): per-element refs to external locations. Same
     /// forward-compat tolerance.
+    // CR-62: parsed, not yet consumed on the parse-back path.
     #[serde(default)]
+    #[allow(dead_code)]
     external_refs: Vec<crate::types::ExternalRef>,
     /// CR-78 (v2.4.0+): per-element detection confidence (Section nodes).
     /// `#[serde(default)]` → `0` for pre-v2.4.0 fixtures and for non-Section
@@ -864,16 +868,15 @@ mod tests {
         // F-11 + single-convention: bgraph-codeblock / bgraph-blockquote
         // (v2.0.0 tag names) must be rejected. The walk picks them up as
         // unrecognized tags via the fence-tag dispatch.
-        let bad_codeblock = format!(
-            "```bgraph\n\
-             {{\"schema\":\"2.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"}},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}}\n\
+        let bad_codeblock = "```bgraph\n\
+             {\"schema\":\"2.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
              ```\n\
              \n\
-             ```bgraph-metadata\n{{}}\n```\n\
+             ```bgraph-metadata\n{}\n```\n\
              \n\
              body\n\
-             ```bgraph-codeblock\n{{\"id\":\"00000000-0000-0000-0000-000000000000\",\"node_type\":\"CodeBlock\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":1}}\n```\n",
-        );
+             ```bgraph-codeblock\n{\"id\":\"00000000-0000-0000-0000-000000000000\",\"node_type\":\"CodeBlock\",\"location\":{\"semantic\":{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]},\"physical\":null},\"text_order\":0,\"token_count\":1}\n```\n"
+            .to_string();
         let result = parse(&bad_codeblock, ParseOptions { accept_drift: true });
         assert!(
             matches!(result, Err(ParseError::MalformedFence(_))),

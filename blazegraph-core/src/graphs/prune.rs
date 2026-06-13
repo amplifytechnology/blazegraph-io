@@ -186,8 +186,7 @@ fn emit_evidence_artifact(
     std::fs::create_dir_all(&dir)?;
     let stem = doc_stem(graph);
     let path = format!("{dir}/{stem}.evidence.json");
-    let json = serde_json::to_string_pretty(&artifact)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&artifact).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
     println!("🧾 CR-71A: evidence artifact → {path}");
     Ok(())

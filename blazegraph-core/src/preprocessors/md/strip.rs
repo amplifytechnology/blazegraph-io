@@ -376,8 +376,8 @@ fn strip_with_node_types(input: &str, tags: &[String]) -> Result<String, ParseEr
                 }
                 (boundary + 1) as usize
             };
-            for k in body_start..=close_idx {
-                delete[k] = true;
+            for slot in &mut delete[body_start..=close_idx] {
+                *slot = true;
             }
         }
         // Advance past the close, regardless of whether we deleted.

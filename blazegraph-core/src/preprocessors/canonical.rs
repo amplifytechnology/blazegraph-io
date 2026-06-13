@@ -185,7 +185,7 @@ fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
         let pad = w.saturating_sub(cell.chars().count());
         out.push(' ');
         out.push_str(cell);
-        out.extend(std::iter::repeat(' ').take(pad));
+        out.extend(std::iter::repeat_n(' ', pad));
         out.push_str(" |");
     }
     out.push('\n');

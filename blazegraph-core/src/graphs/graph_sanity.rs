@@ -677,13 +677,13 @@ fn numbering_level(text: &str) -> Option<u32> {
 /// - `Roman(ord)` — a roman-numeral run followed by `.` or `)` (`I.` → 1,
 ///   `IV.` → 4). Checked AFTER letter so single `I`/`V`/`X` stay letters; a
 ///   multi-glyph roman (`II.`, `IV.`) is unambiguous.
-/// - `NoneScheme` — anything else (unnumbered headings, prose).
+/// - `None` — anything else (unnumbered headings, prose).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scheme {
     Decimal { depth: u32, ordinal: u32 },
     Letter { ordinal: u32 },
     Roman { ordinal: u32 },
-    NoneScheme,
+    None,
 }
 
 /// The ordinal value of a subordinate scheme (letter/roman), if this scheme is
@@ -775,7 +775,7 @@ fn numbering_scheme(text: &str) -> Scheme {
     }
     let token = &text[start..i];
     if token.is_empty() {
-        return Scheme::NoneScheme;
+        return Scheme::None;
     }
     // The token must be terminated by `.` or `)` (optionally trailing space).
     // A bare leading word ("Appendix") is NOT a labelled item.
@@ -784,7 +784,7 @@ fn numbering_scheme(text: &str) -> Scheme {
         .map(|b| *b == b'.' || *b == b')')
         .unwrap_or(false);
     if !terminated {
-        return Scheme::NoneScheme;
+        return Scheme::None;
     }
 
     // Single letter → Letter (A–Z). This deliberately keeps single I/V/X/etc.
@@ -801,7 +801,7 @@ fn numbering_scheme(text: &str) -> Scheme {
     if let Some(v) = roman_value(token) {
         return Scheme::Roman { ordinal: v };
     }
-    Scheme::NoneScheme
+    Scheme::None
 }
 
 /// CR-72 — Sub-depth of a subordinate-scheme prefix relative to its container:
@@ -850,6 +850,9 @@ fn subordinate_sub_depth(text: &str) -> u32 {
 /// level (`container_level + sub_depth`); the container itself keeps its base
 /// level (so the level signal naturally pops it on return to the primary scheme).
 struct RestartRegion {
+    // CR-72: identifies the unnumbered container that introduces the region.
+    // Asserted on by the detector tests; not yet read by production code.
+    #[cfg_attr(not(test), allow(dead_code))]
     container_id: NodeId,
     /// Level override for each region member (subordinate sections AND the
     /// interspersed unnumbered FP sections that get absorbed). Keyed by id.
@@ -878,20 +881,20 @@ fn detect_numbering_restart(
     base_levels: &HashMap<NodeId, u32>,
 ) -> Option<RestartRegion> {
     let mut seen_decimal = false;
-    // Track the most recent unnumbered (NoneScheme) container candidate.
+    // Track the most recent unnumbered (None) container candidate.
     let mut last_unnumbered: Option<NodeId> = None;
 
     let n = ordered_section_ids.len();
     let mut idx = 0;
     while idx < n {
         let id = ordered_section_ids[idx];
-        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::NoneScheme);
+        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::None);
         match scheme {
             Scheme::Decimal { .. } => {
                 seen_decimal = true;
                 last_unnumbered = None;
             }
-            Scheme::NoneScheme => {
+            Scheme::None => {
                 last_unnumbered = Some(id);
             }
             Scheme::Letter { ordinal } | Scheme::Roman { ordinal } => {
@@ -949,7 +952,7 @@ fn try_build_region(
     let mut idx = start_idx;
     while idx < n {
         let id = ordered_section_ids[idx];
-        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::NoneScheme);
+        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::None);
         match scheme {
             Scheme::Decimal { .. } => {
                 // A bare decimal prefix is the primary scheme resuming → the
@@ -982,7 +985,7 @@ fn try_build_region(
                     break;
                 }
             }
-            Scheme::NoneScheme => {
+            Scheme::None => {
                 // Interspersed unnumbered Section absorbed into the region. Its
                 // level is `container_level + its own size-fallback level`, so a
                 // figure-callout FP (large font → fallback level 1) sits at
@@ -2861,12 +2864,12 @@ mod tests {
         assert_eq!(numbering_scheme("II. two"), Scheme::Roman { ordinal: 2 });
         assert_eq!(numbering_scheme("IV. four"), Scheme::Roman { ordinal: 4 });
         // Unnumbered / prose / acronyms.
-        assert_eq!(numbering_scheme("Appendix"), Scheme::NoneScheme);
-        assert_eq!(numbering_scheme("References"), Scheme::NoneScheme);
-        assert_eq!(numbering_scheme("FLOPS. ratio"), Scheme::NoneScheme);
-        assert_eq!(numbering_scheme("Abstract"), Scheme::NoneScheme);
+        assert_eq!(numbering_scheme("Appendix"), Scheme::None);
+        assert_eq!(numbering_scheme("References"), Scheme::None);
+        assert_eq!(numbering_scheme("FLOPS. ratio"), Scheme::None);
+        assert_eq!(numbering_scheme("Abstract"), Scheme::None);
         // A bare leading word (no `.`/`)` terminator) is not a labelled item.
-        assert_eq!(numbering_scheme("Appendix A"), Scheme::NoneScheme);
+        assert_eq!(numbering_scheme("Appendix A"), Scheme::None);
     }
 
     /// CR-72 helper unit — `subordinate_sub_depth` counts the decimal tail.
