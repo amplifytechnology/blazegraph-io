@@ -71,7 +71,21 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// the JSON field `bookmark_data` → `outline_data`, and adds DOCX
 /// Table-of-Contents-SDT outline extraction. Pre-2.5.0 files still parse
 /// (kind defaults, both fence names accepted on read).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.5.0";
+///
+/// v3.0.0 (CR-83): **major** — every node ID's derivation changes. Node
+/// IDs move from positional-in-a-source-hash-namespace
+/// (`UUIDv5(UUIDv5(NS, "{source}:{config}"), text_order)`) to
+/// content+breadcrumb (`UUIDv5(NS, breadcrumb ‖ content ‖ occurrence)`).
+/// The result is document-unique (faithful round-trip) and edit-stable (a
+/// node keeps its ID unless its own content or heading-path changes).
+/// `text_order` stays as a node field (ordering/emission) but is no longer
+/// an ID input. The **read path / walk algorithm is unchanged** — the
+/// structural rule (split at the `` ```bgraph-<tag> `` line) is identical;
+/// only the *values* of the embedded `id` fields change. Files emitted
+/// under 1.x/2.x still parse structurally; their embedded IDs simply
+/// differ from what a fresh 3.0.0 reparse derives. See
+/// `docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment L.
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "3.0.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///

@@ -157,7 +157,7 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
         source_sha256: source_sha256.clone(),
         config_hash: config_hash.clone(),
     };
-    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+    let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived; no doc namespace
 
     // 5. Build the graph. The builder asserts `text_order == vec position`;
     //    we satisfied that in `walk_body` by pushing in order.
@@ -545,8 +545,7 @@ fn walk_body(
                                     // below (double-up).
                                     if sdt_stack.iter().any(|&toc| toc) {
                                         if let Some(r) = el.internal_refs.first() {
-                                            if let InternalRefTarget::Named { name, .. } =
-                                                &r.target
+                                            if let InternalRefTarget::Named { name, .. } = &r.target
                                             {
                                                 let title = if r.text.trim().is_empty() {
                                                     el.text.trim().to_string()
@@ -619,7 +618,11 @@ fn build_outline(
 ) -> Option<BookmarkData> {
     let resolved: Vec<(&str, u32)> = toc_entries
         .iter()
-        .filter_map(|(title, anchor)| bookmark_levels.get(anchor).map(|&lvl| (title.as_str(), lvl)))
+        .filter_map(|(title, anchor)| {
+            bookmark_levels
+                .get(anchor)
+                .map(|&lvl| (title.as_str(), lvl))
+        })
         .collect();
     let min_level = resolved.iter().map(|(_, lvl)| *lvl).min()?;
     let sections = resolved

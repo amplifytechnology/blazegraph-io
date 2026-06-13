@@ -54,7 +54,7 @@ fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph
         source_sha256: "amendment-f-source-sha".to_string(),
         config_hash: "amendment-f-config-hash".to_string(),
     };
-    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+    let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
     let elements: Vec<SemanticTreeElement> = nodes_in
         .iter()
         .map(|(node_type, text, depth, text_order)| {
@@ -248,7 +248,11 @@ fn roundtrip_identity_table() {
 
     // And a non-canonical table normalizes to the same canonical form.
     let messy = parse_generic("# Table\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
-    assert_eq!(emit_generic_md(&messy), input, "non-canonical table normalizes");
+    assert_eq!(
+        emit_generic_md(&messy),
+        input,
+        "non-canonical table normalizes"
+    );
 }
 
 #[test]

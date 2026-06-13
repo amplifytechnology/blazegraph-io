@@ -238,14 +238,13 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
         );
     }
 
-    // NodeIdGenerator from doc-level provenance. CR-47 dropped
-    // `blazegraph_version` from the namespace, so node IDs are
-    // already version-invariant — the parser side and the emitter
-    // side derive identical IDs from `(source_sha256, config_hash)`
-    // regardless of which blazegraph version ran which step. The
-    // `blazegraph_version` field in `doc_level` stays as provenance
-    // documentation only (see CR-47 Amendment G).
-    let id_gen = NodeIdGenerator::new(&doc_level.source.sha256, &doc_level.config_hash);
+    // CR-83: node IDs are content+breadcrumb-derived, no document
+    // namespace. The parser-side and emitter-side derive identical IDs
+    // from the node content + breadcrumb path + occurrence — independent
+    // of source/config/version. `source.sha256` + `config_hash` stay in
+    // `doc_level` as *document* identity (they feed `graph_sha256`), not
+    // node scoping.
+    let id_gen = NodeIdGenerator::new();
 
     let provenance = ParseProvenance {
         blazegraph_version: doc_level.blazegraph_version.clone(),
@@ -280,24 +279,6 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     graph.compute_structural_profile();
     graph.compute_breadcrumbs();
 
-    // Self-consistency check (debug only): verify the IDs the builder
-    // derived match the IDs the emitter embedded. A mismatch here means
-    // the parsed bgraph.md was emitted by a different
-    // (version, source, config) than its metadata claims, or was
-    // hand-tampered. Non-load-bearing for round-trip identity (the
-    // builder's IDs are the truth), but a useful fail-loud signal.
-    #[cfg(debug_assertions)]
-    {
-        for p in &parsed_elements {
-            let derived = id_gen.node_id(p.metadata.text_order);
-            debug_assert_eq!(
-                derived, p.metadata.id,
-                "per-element id mismatch at text_order {}: parsed={}, derived={}",
-                p.metadata.text_order, p.metadata.id, derived
-            );
-        }
-    }
-
     // ----- Phase 5: identity verification. -----
     let recomputed = canonical::graph_sha256(&graph);
     let identity = if recomputed == doc_level.graph_sha256 {
@@ -313,6 +294,31 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
             recomputed,
         });
     };
+
+    // Self-consistency check (debug only): for a VERIFIED (untampered) doc,
+    // each per-element fence's embedded ID must equal the ID the builder
+    // re-derives. For drifted/derivative docs, mismatched embedded IDs are
+    // *expected* — that is the drift — so this applies only when Verified.
+    // (CR-83: IDs are content+breadcrumb-derived. This catches per-element
+    // fence tampering that the doc-level `graph_sha256` recompute — which
+    // hashes the builder's derived IDs, not the embedded ones — cannot see.)
+    #[cfg(debug_assertions)]
+    if matches!(identity, ParseIdentity::Verified) {
+        let by_text_order: std::collections::HashMap<u32, NodeId> = graph
+            .nodes
+            .values()
+            .filter_map(|n| n.text_order.map(|t| (t, n.id)))
+            .collect();
+        for p in &parsed_elements {
+            if let Some(&derived) = by_text_order.get(&p.metadata.text_order) {
+                debug_assert_eq!(
+                    derived, p.metadata.id,
+                    "per-element id mismatch at text_order {}: parsed={}, derived={}",
+                    p.metadata.text_order, p.metadata.id, derived
+                );
+            }
+        }
+    }
 
     Ok(ParseResult { graph, identity })
 }
@@ -608,13 +614,20 @@ fn strip_heading_prefix(body: &str) -> String {
 }
 
 /// Validate that the doc-level `schema` field is a major version this
-/// parser has an arm for. v2.1.0+ (CR-57) accepts only `2.x` — the v1.x
-/// body-inside H/F/M dispatch + v2.0.0 old variant-tag dispatch are
-/// removed per the single-convention contract (CR-56 § I.5 +
-/// no_fictional_users). Future major bumps add accepted prefixes here
-/// in lock-step with the matching parser arms.
+/// parser has an arm for. Accepts `2.x` and `3.x`.
+///
+/// v2.1.0+ (CR-57) dropped v1.x dispatch per the single-convention
+/// contract. CR-83 (v3.0.0) is a major bump for **node-ID derivation
+/// only** — the structural read path (the walk algorithm + per-element
+/// fence shape) is byte-for-byte identical to v2.x, so the *same* parser
+/// arm reads both. A v2.x file parses structurally under this v3 parser;
+/// its embedded `id` values simply differ from what a fresh v3 reparse
+/// derives (the builder's content+breadcrumb IDs are the truth — the
+/// embedded IDs are advisory, see the self-consistency check above).
+/// Future major bumps that *do* change the read path add a new arm here
+/// in lock-step.
 fn validate_schema(schema: &str) -> Result<(), ParseError> {
-    if schema.starts_with("2.") {
+    if schema.starts_with("2.") || schema.starts_with("3.") {
         Ok(())
     } else {
         Err(ParseError::UnsupportedSchema(schema.to_string()))
@@ -670,7 +683,7 @@ mod tests {
             source_sha256: "synthetic-source-sha".to_string(),
             config_hash: "synthetic-config-hash".to_string(),
         };
-        let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+        let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
 
         let elements: Vec<SemanticTreeElement> = nodes_in
             .iter()
@@ -1024,24 +1037,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_schema_accepts_only_v2_x() {
-        // v2.1.0+ (CR-57): single convention. v1.x and v3.x+ are rejected.
-        for ok in ["2.0.0", "2.1.0", "2.42.7", "2.99.0"] {
+    fn validate_schema_accepts_v2_and_v3() {
+        // v2.1.0+ (CR-57) single convention; CR-83 (v3.0.0) shares the
+        // identical read path (only node-ID *values* change), so both
+        // majors parse structurally.
+        for ok in [
+            "2.0.0", "2.1.0", "2.42.7", "2.99.0", "3.0.0", "3.1.0", "3.99.0",
+        ] {
             assert!(
                 validate_schema(ok).is_ok(),
-                "{ok} should be accepted under v2.1.0+ parser"
+                "{ok} should be accepted under the v2/v3-shared-read-path parser"
             );
         }
     }
 
     #[test]
-    fn validate_schema_rejects_v1_and_v3_plus() {
-        for bad in [
-            "0.9.0", "1.0.0", "1.1.0", "1.42.0", "3.0.0", "4.0.0", "10.0.0",
-        ] {
+    fn validate_schema_rejects_v1_and_v4_plus() {
+        // v1.x predates the single convention; v4.x+ is a hypothetical
+        // future read-path break with no arm yet.
+        for bad in ["0.9.0", "1.0.0", "1.1.0", "1.42.0", "4.0.0", "10.0.0"] {
             assert!(
                 matches!(validate_schema(bad), Err(ParseError::UnsupportedSchema(_))),
-                "{bad} should be rejected by v2.1.0+ single-convention parser"
+                "{bad} should be rejected — no parser arm for that major"
             );
         }
     }

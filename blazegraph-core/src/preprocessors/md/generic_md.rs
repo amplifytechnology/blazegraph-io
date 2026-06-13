@@ -172,7 +172,12 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                     };
                     // Flush the final text run (emphasis is balanced/closed by
                     // here, so bold/italic are 0 — a plain push).
-                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                    flush_inline_run(
+                        &mut inline_buf,
+                        &mut run_buf,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                    );
                     let heading_text = std::mem::take(&mut inline_buf).trim().to_string();
                     // Skip content-free headings (e.g. a `##` spacer or an
                     // image-only heading). An empty Section has no rendered form
@@ -215,7 +220,12 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                     inline_mode = None;
                     // Flush the final text run (emphasis is balanced/closed by
                     // here, so bold/italic are 0 — a plain push).
-                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                    flush_inline_run(
+                        &mut inline_buf,
+                        &mut run_buf,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                    );
                     let para_text = std::mem::take(&mut inline_buf).trim().to_string();
                     // Skip content-free paragraphs (e.g. an image-only paragraph
                     // with empty alt text). An empty body has no rendered form and
@@ -252,22 +262,42 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
             // already resolved the source-side variant; we just emit
             // the canonical form.
             Event::Start(Tag::Emphasis) => {
-                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                flush_inline_run(
+                    &mut inline_buf,
+                    &mut run_buf,
+                    bold_depth > 0,
+                    italic_depth > 0,
+                );
                 italic_depth += 1;
                 nesting += 1;
             }
             Event::End(TagEnd::Emphasis) => {
-                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                flush_inline_run(
+                    &mut inline_buf,
+                    &mut run_buf,
+                    bold_depth > 0,
+                    italic_depth > 0,
+                );
                 italic_depth = italic_depth.saturating_sub(1);
                 nesting = nesting.saturating_sub(1);
             }
             Event::Start(Tag::Strong) => {
-                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                flush_inline_run(
+                    &mut inline_buf,
+                    &mut run_buf,
+                    bold_depth > 0,
+                    italic_depth > 0,
+                );
                 bold_depth += 1;
                 nesting += 1;
             }
             Event::End(TagEnd::Strong) => {
-                flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                flush_inline_run(
+                    &mut inline_buf,
+                    &mut run_buf,
+                    bold_depth > 0,
+                    italic_depth > 0,
+                );
                 bold_depth = bold_depth.saturating_sub(1);
                 nesting = nesting.saturating_sub(1);
             }
@@ -278,7 +308,12 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                 // emit Link outside a block, but cheaper to be safe).
                 link_url_stack.push(dest_url.to_string());
                 if inline_mode.is_some() {
-                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                    flush_inline_run(
+                        &mut inline_buf,
+                        &mut run_buf,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                    );
                     inline_buf.push('[');
                 }
                 nesting += 1;
@@ -288,7 +323,12 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                 if inline_mode.is_some() {
                     // Flush the label run (wrapped per current emphasis state)
                     // before the closing bracket + destination.
-                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                    flush_inline_run(
+                        &mut inline_buf,
+                        &mut run_buf,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                    );
                     inline_buf.push_str(&format!("]({url})"));
                 }
                 nesting = nesting.saturating_sub(1);
@@ -354,7 +394,12 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
                     // A code span ends the current text run (its backticks
                     // sit outside any emphasis markers); flush, then emit
                     // the ` `code` ` C-7b form.
-                    flush_inline_run(&mut inline_buf, &mut run_buf, bold_depth > 0, italic_depth > 0);
+                    flush_inline_run(
+                        &mut inline_buf,
+                        &mut run_buf,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                    );
                     inline_buf.push('`');
                     inline_buf.push_str(&s);
                     inline_buf.push('`');
@@ -447,7 +492,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
         source_sha256: source_sha256.clone(),
         config_hash: config_hash.clone(),
     };
-    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+    let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived; no doc namespace
 
     // 4. Build the graph. The builder asserts `text_order == vec
     //    position`; we satisfied that above by pushing in order.
@@ -885,8 +930,7 @@ mod tests {
         // the markers (`*italic, **bold-italic,***`). The MD channel must
         // re-canonicalize to per-run split spans with whitespace outside —
         // byte-identical to the DOCX channel's `wrap_emphasis` output.
-        let graph =
-            parse_ok("Here is some **bold,** *italic, **bold-italic,*** rest.\n");
+        let graph = parse_ok("Here is some **bold,** *italic, **bold-italic,*** rest.\n");
         let nodes = nodes_in_order(&graph);
         assert_eq!(
             nodes[0].content.text,

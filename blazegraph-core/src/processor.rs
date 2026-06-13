@@ -164,14 +164,14 @@ impl DocumentProcessor {
         }
 
         // Build the provenance record that identifies this parse run.
-        // The `(source_sha256, config_hash)` pair feeds
-        // `NodeIdGenerator::new` (CR-47: node IDs depend on source +
-        // config only — `blazegraph_version` no longer enters the
-        // namespace, so node IDs survive parser version bumps).
-        // `parse_provenance` is persisted on the graph so the bgraph.md
-        // emitter (B2) can populate the document-level identity block
-        // without re-reading the source. `blazegraph_version` rides
-        // along as provenance documentation only.
+        // CR-83: `(source_sha256, config_hash)` no longer feed node-ID
+        // derivation — node IDs are content+breadcrumb-derived, not
+        // document-namespace-scoped. These fields remain *document*
+        // discriminators: they live in `ParseProvenance` and the doc-level
+        // fence and thus still feed `graph_sha256`. `parse_provenance` is
+        // persisted on the graph so the bgraph.md emitter (B2) can populate
+        // the document-level identity block without re-reading the source.
+        // `blazegraph_version` rides along as provenance documentation only.
         let config_hash = calculate_config_hash(config)?;
         let provenance = ParseProvenance {
             blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -183,7 +183,7 @@ impl DocumentProcessor {
             source_sha256: pdf_hash.clone(),
             config_hash: config_hash.clone(),
         };
-        let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+        let id_gen = NodeIdGenerator::new();
 
         // --- C2: Preprocessor cache check ---
         let preprocessor_output = if fresh_from.should_use_cache(CachePoint::C2) {

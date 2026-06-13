@@ -41,7 +41,7 @@ fn build_synthetic_graph(
         source_sha256: "roundtrip-source-sha".to_string(),
         config_hash: "roundtrip-config-hash".to_string(),
     };
-    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+    let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
     let elements: Vec<SemanticTreeElement> = nodes_in
         .iter()
         .map(|(node_type, text, depth, text_order)| {
@@ -153,7 +153,7 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
         source_sha256: format!("test-source-sha-{name}"),
         config_hash: "test-config-hash".to_string(),
     };
-    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+    let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
 
     let mut graph = GraphBuilder::new()
         .build_graph_deterministic(elements, &id_gen, provenance)
