@@ -1144,9 +1144,9 @@ mod tests {
                 kind: blazegraph_io_core::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
                 outline_data: None,
+                flow_type: FlowType::default(),
                 topology: None,
             },
-            structural_profile: StructuralProfile::default(),
         }
     }
 

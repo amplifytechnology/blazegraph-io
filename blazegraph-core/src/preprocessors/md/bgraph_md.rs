@@ -277,10 +277,12 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     // per the byte-in/byte-out principle (arch doc 11 + DT-04).
     // Absent in the source bgraph.md → `None` on the reconstructed graph.
     graph.document_info.topology = doc_level.topology.clone();
-    graph.structural_profile.flow_type = doc_level.flow_type.clone();
+    graph.document_info.flow_type = doc_level.flow_type.clone();
 
-    // Canonical post-build sequence (mirrors processor.rs:501-502).
-    graph.compute_structural_profile();
+    // Canonical post-build sequence (mirrors processor.rs). Block A /
+    // A2: no structural-profile reconstruction before the identity
+    // recompute — the profile is json-only and out of the hash, so the
+    // verify path no longer needs it.
     graph.compute_breadcrumbs();
 
     // ----- Phase 5: identity verification. -----
@@ -744,8 +746,7 @@ mod tests {
             .expect("synthetic graph builds");
         graph.document_info.document_metadata.title = title.map(str::to_string);
         graph.document_info.outline_data = bookmarks;
-        graph.structural_profile.flow_type = FlowType::Free;
-        graph.compute_structural_profile();
+        graph.document_info.flow_type = FlowType::Free;
         graph.compute_breadcrumbs();
         graph
     }
@@ -772,10 +773,7 @@ mod tests {
         assert_eq!(prov.source_filename, "synthetic.md");
         assert_eq!(prov.source_sha256, "synthetic-source-sha");
         assert_eq!(prov.config_hash, "synthetic-config-hash");
-        assert!(matches!(
-            result.graph.structural_profile.flow_type,
-            FlowType::Free
-        ));
+        assert!(matches!(result.graph.document_info.flow_type, FlowType::Free));
     }
 
     #[test]

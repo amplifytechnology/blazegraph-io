@@ -353,16 +353,13 @@ impl DocumentProcessor {
             }
         }
         graph.document_info.outline_data = preprocessor_output.bookmark_data;
-        // CR-66 ordering: structural profile is computed twice — once
-        // before graph_sanity (so invariant checks can reason from a
-        // current node-type / depth-distribution view) and once after
-        // (so consumers see post-mutation counts). Breadcrumbs run only
-        // after, since they're a derived output, not a sanity input.
-        graph.compute_structural_profile();
+        // Block A / A2: the structural profile no longer lives on the
+        // graph — it is a json-only aggregate recomputed at
+        // serialization time, so the pre/post-sanity recompute dance
+        // (CR-66) is gone. graph_sanity reads the graph directly.
         // Stage-dump path uses the legacy provenance-free build — no
         // parse-run identity for the evidence artifact stem.
         crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity, None);
-        graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 
         println!("📋 Stage 3: Graph captured ({} nodes)", graph.nodes.len());
@@ -527,14 +524,11 @@ impl DocumentProcessor {
             }
         }
         graph.document_info.outline_data = preprocessor_output.bookmark_data.clone();
-        // CR-66 ordering: structural profile is computed twice — once
-        // before graph_sanity (so invariant checks can reason from a
-        // current node-type / depth-distribution view) and once after
-        // (so consumers see post-mutation counts). Breadcrumbs run only
-        // after, since they're a derived output, not a sanity input.
-        graph.compute_structural_profile();
+        // Block A / A2: the structural profile no longer lives on the
+        // graph — it is a json-only aggregate recomputed at
+        // serialization time, so the pre/post-sanity recompute dance
+        // (CR-66) is gone. graph_sanity reads the graph directly.
         crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity, Some(parse_provenance));
-        graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 
         Ok(graph)

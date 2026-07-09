@@ -209,10 +209,6 @@ impl GraphBuilder {
             graph.document_info.root_id = final_root;
         }
 
-        // Update structural profile node count
-        graph.structural_profile.total_nodes = graph.nodes.len();
-        graph.structural_profile.document_type = DocumentType::Generic;
-
         eprintln!("✅ Graph built: {} nodes", graph.nodes.len());
 
         Ok(graph)
@@ -293,9 +289,6 @@ impl GraphBuilder {
                 node_stack.push(node_id);
             }
         }
-
-        graph.structural_profile.total_nodes = graph.nodes.len();
-        graph.structural_profile.document_type = DocumentType::Generic;
 
         eprintln!("✅ Graph built: {} nodes", graph.nodes.len());
 

@@ -30,7 +30,7 @@
 //!    `text_order = 0..N`.
 //! 4. The vec feeds [`GraphBuilder::build_graph_deterministic`].
 //! 5. `flow_type = Free`, `physical_location = None` (DOCX is reflowable).
-//! 6. `compute_structural_profile` then `compute_breadcrumbs` — same
+//! 6. `compute_breadcrumbs` — same
 //!    post-build sequence as the PDF and markdown channels.
 //!
 //! ## Scope (C1 + C2)
@@ -167,7 +167,7 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
 
     // 6. Populate fields the builder doesn't. DOCX is reflowable — no
     //    per-element bbox exists, so `flow_type = Free`.
-    graph.structural_profile.flow_type = FlowType::Free;
+    graph.document_info.flow_type = FlowType::Free;
 
     //    Navigational outline (CR-81): the ToC SDT, when present. DOCX
     //    section detection is style-based (not bookmark-gated like PDF), so
@@ -183,7 +183,6 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
         crate::preprocessors::metadata::extract_document_metadata(&extractor, &());
 
     // 7. Canonical post-build sequence (mirrors processor.rs / the MD path).
-    graph.compute_structural_profile();
     graph.compute_breadcrumbs();
 
     Ok(ParseResult {
@@ -1621,7 +1620,7 @@ mod tests {
         // DOCX is reflowable: flow_type = Free, no per-element bbox.
         let graph = parse_fixture("structured.docx");
         assert!(
-            matches!(graph.structural_profile.flow_type, FlowType::Free),
+            matches!(graph.document_info.flow_type, FlowType::Free),
             "DOCX is reflowable; flow_type must be Free"
         );
         // physical_location is None on every node (no geometry).

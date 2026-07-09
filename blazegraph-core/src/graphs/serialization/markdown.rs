@@ -167,7 +167,7 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
             filename: &provenance.source_filename,
             sha256: &provenance.source_sha256,
         },
-        flow_type: &graph.structural_profile.flow_type,
+        flow_type: &graph.document_info.flow_type,
         topology: &graph.document_info.topology,
         config_hash: &provenance.config_hash,
         graph_sha256: canonical::graph_sha256(graph),
@@ -418,9 +418,9 @@ mod tests {
                     ..DocumentMetadata::default()
                 },
                 outline_data: None,
+                flow_type: FlowType::default(),
                 topology: None,
             },
-            structural_profile: StructuralProfile::default(),
         }
     }
 

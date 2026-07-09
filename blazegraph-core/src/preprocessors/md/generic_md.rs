@@ -34,7 +34,7 @@
 //! 5. The vec feeds [`GraphBuilder::build_graph_deterministic`].
 //! 6. Title falls back to the first Section's text if frontmatter
 //!    didn't carry one (the filename-stem fallback is the CLI's job).
-//! 7. `compute_structural_profile` then `compute_breadcrumbs` — same
+//! 7. `compute_breadcrumbs` — same
 //!    post-build sequence as the PDF channel and the bgraph.md parser.
 //!
 //! ## ParseIdentity
@@ -510,10 +510,9 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
     // round-trip. Filename-stem fallback is the CLI's job (it has
     // access to the input filename; the lib does not).
     graph.document_info.document_metadata = frontmatter_metadata;
-    graph.structural_profile.flow_type = FlowType::Free;
+    graph.document_info.flow_type = FlowType::Free;
 
     // 6. Canonical post-build sequence (mirrors processor.rs).
-    graph.compute_structural_profile();
     graph.compute_breadcrumbs();
 
     Ok(ParseResult {
@@ -788,7 +787,7 @@ mod tests {
     fn parse_sets_flow_type_to_free() {
         let graph = parse_ok("# Hi\n");
         assert!(
-            matches!(graph.structural_profile.flow_type, FlowType::Free),
+            matches!(graph.document_info.flow_type, FlowType::Free),
             "generic markdown is reflowable; flow_type must be Free",
         );
     }

@@ -92,8 +92,7 @@ fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph
     let mut graph = GraphBuilder::new()
         .build_graph_deterministic(elements, &id_gen)
         .expect("synthetic graph builds");
-    graph.structural_profile.flow_type = FlowType::Free;
-    graph.compute_structural_profile();
+    graph.document_info.flow_type = FlowType::Free;
     graph.compute_breadcrumbs();
     graph
 }

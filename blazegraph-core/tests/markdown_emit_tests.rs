@@ -51,7 +51,6 @@ fn load_fixture_graph(name: &str) -> (DocumentGraph, Value) {
     let graph = DocumentGraph {
         nodes,
         document_info,
-        structural_profile: sorted.structural_profile,
     };
     (graph, raw_value)
 }

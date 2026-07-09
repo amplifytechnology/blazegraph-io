@@ -72,6 +72,18 @@ pub struct DocumentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outline_data: Option<BookmarkData>,
 
+    /// Whether physical location data is meaningful for this document
+    /// (`Fixed` = PDF page geometry; `Free` = reflowable md/docx).
+    ///
+    /// Schema 0.8.0 (Block A / Amendment M): relocated here from
+    /// `StructuralProfile`. It is a doc-level *identity scalar* — set
+    /// once by the source channel, part of the content body, in
+    /// `graph_sha256` — unlike the profile's derived aggregates, which
+    /// left the hash. `#[serde(default)]` (= `Fixed`) keeps pre-0.8.0
+    /// graph.json loadable.
+    #[serde(default)]
+    pub flow_type: FlowType,
+
     // Schema 0.8.0 (Block A / Amendment M): `parse_provenance` no longer
     // lives here. Provenance is *about the parse run*, not *of the
     // document* (content-not-provenance rule, arch-14 §3.1) — keeping it
@@ -210,11 +222,18 @@ pub struct ParseProvenance {
 /// `BTreeMap::new`), and the new enum variants are additive.
 pub const SCHEMA_VERSION: &str = "0.7.0";
 
+/// The in-memory graph — and, definitionally, the **content body**:
+/// `canonical_json(&DocumentGraph)` is the exact input to
+/// `graph_sha256`, hashed whole with no per-field exclusions (Block A /
+/// Amendment M; arch-14 §3.1). Anything that is not content — parse
+/// provenance, derived aggregates (`structural_profile`), emission
+/// metadata (`created_at`, `schema_version`) — lives on
+/// `SortedDocumentGraph` (the envelope/wrapper) or is threaded as an
+/// explicit value, never here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
     pub nodes: HashMap<NodeId, DocumentNode>,
     pub document_info: DocumentInfo,
-    pub structural_profile: StructuralProfile,
 }
 
 /// The serialization-ready output format. Carries a schema version
@@ -246,6 +265,14 @@ pub struct SortedDocumentGraph {
     pub parse_provenance: Option<ParseProvenance>,
     pub nodes: Vec<DocumentNode>,
     pub document_info: DocumentInfo,
+    /// Derived aggregate view of the node set — json-only convenience,
+    /// recomputed at serialization time (`to_sorted_graph`), never part
+    /// of the canonical hash. Schema 0.8.0 (Block A / Amendment M):
+    /// relocated off `DocumentGraph` — it was in `graph_sha256` but
+    /// never in the stored md body, the inverse form of the arch-14 §6
+    /// intersection violation. `flow_type` (the one identity scalar it
+    /// carried) moved to `DocumentInfo`.
+    #[serde(default)]
     pub structural_profile: StructuralProfile,
 }
 
@@ -482,7 +509,9 @@ pub type StyleInfo = StyleMetadata;
 #[serde(default)]
 pub struct StructuralProfile {
     pub document_type: DocumentType,
-    pub flow_type: FlowType,
+    // Schema 0.8.0 (Block A): `flow_type` moved to `DocumentInfo` — it
+    // is a doc-level identity scalar, not a derived aggregate; it stays
+    // in `graph_sha256` while this struct leaves it.
     pub total_nodes: usize,
 
     // Analytics fields

@@ -77,8 +77,7 @@ fn build_synthetic_graph(
         .expect("synthetic graph builds");
     graph.document_info.document_metadata.title = title.map(str::to_string);
     graph.document_info.outline_data = bookmarks;
-    graph.structural_profile.flow_type = FlowType::Free;
-    graph.compute_structural_profile();
+    graph.document_info.flow_type = FlowType::Free;
     graph.compute_breadcrumbs();
     graph
 }
@@ -181,10 +180,9 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
         ..DocumentMetadata::default()
     };
     graph.document_info.outline_data = sorted.document_info.outline_data;
-    graph.structural_profile.flow_type = sorted.structural_profile.flow_type;
+    graph.document_info.flow_type = sorted.document_info.flow_type;
 
-    // Re-derive analytics + breadcrumbs.
-    graph.compute_structural_profile();
+    // Re-derive breadcrumbs.
     graph.compute_breadcrumbs();
 
     graph

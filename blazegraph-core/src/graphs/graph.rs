@@ -20,13 +20,13 @@ impl DocumentGraph {
             kind: crate::types::default_kind(),
             document_metadata: DocumentMetadata::default(),
             outline_data: None,
+            flow_type: FlowType::default(),
             topology: None,
         };
 
         Self {
             nodes: HashMap::new(),
             document_info,
-            structural_profile: StructuralProfile::default(),
         }
     }
 
@@ -40,13 +40,13 @@ impl DocumentGraph {
             kind: crate::types::default_kind(),
             document_metadata: DocumentMetadata::default(),
             outline_data: None,
+            flow_type: FlowType::default(),
             topology: None,
         };
 
         Self {
             nodes: HashMap::new(),
             document_info,
-            structural_profile: StructuralProfile::default(),
         }
     }
 
@@ -97,7 +97,10 @@ impl DocumentGraph {
             parse_provenance: provenance.cloned(),
             nodes: nodes.into_iter().cloned().collect(),
             document_info: self.document_info.clone(),
-            structural_profile: self.structural_profile.clone(),
+            // Json-only derived aggregate, recomputed at serialization
+            // time (Block A / Amendment M) — never on `DocumentGraph`,
+            // never hashed.
+            structural_profile: self.compute_structural_profile(),
         }
     }
 

@@ -55,7 +55,8 @@ impl DocumentGraph {
         SequentialDocument {
             format: "sequential".to_string(),
             segments,
-            structural_profile: self.structural_profile.clone(),
+            // Derived aggregate, recomputed on demand (Block A).
+            structural_profile: self.compute_structural_profile(),
         }
     }
 

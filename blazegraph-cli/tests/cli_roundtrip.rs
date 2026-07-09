@@ -137,8 +137,7 @@ fn build_synthetic_graph() -> DocumentGraph {
         .build_graph_deterministic(elements, &id_gen)
         .expect("synthetic graph builds");
     graph.document_info.document_metadata.title = Some("CLI Round-Trip Sample".to_string());
-    graph.structural_profile.flow_type = FlowType::Free;
-    graph.compute_structural_profile();
+    graph.document_info.flow_type = FlowType::Free;
     graph.compute_breadcrumbs();
     graph
 }
@@ -163,7 +162,6 @@ fn canonicalize_saved_graph(path: &std::path::Path) -> String {
     let graph = DocumentGraph {
         nodes,
         document_info: sorted.document_info,
-        structural_profile: sorted.structural_profile,
     };
     canonical_json(&graph)
 }
