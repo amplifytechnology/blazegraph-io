@@ -149,7 +149,6 @@ mod tests {
                 children: vec![para_id],
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
         nodes.insert(
@@ -175,7 +174,6 @@ mod tests {
                 children: Vec::new(),
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
 

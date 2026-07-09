@@ -21,7 +21,7 @@ use crate::config::{
     TopologyRebalanceConfig,
 };
 use crate::preprocessors::pdf::xhtml_parser::normalize_for_match;
-use crate::types::{BoundingBox, DocumentGraph, NodeId, ParseProvenance};
+use crate::types::{BoundingBox, DocumentGraph, DocumentNode, NodeId, ParseProvenance};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Per-node record of a depth invariant violation.
@@ -123,10 +123,20 @@ impl SanityReport {
 /// longer carried on the graph, so the caller threads it in explicitly —
 /// consumed only for the CR-71A evidence-artifact filename stem. `None`
 /// for legacy/provenance-free build paths.
+///
+/// `section_confidence` (Block A / A3): the CR-78 detection-confidence
+/// signal, keyed by `text_order`. `DocumentNode` no longer carries
+/// `confidence` (it was a schema-ahead identity-form placeholder —
+/// removed from the wire and the hash), so the CR-78 Phase B
+/// `min_confidence` filter consumes it as a transient parse-time
+/// sidecar instead — the same discipline as the CR-71 evidence sidecar.
+/// `None` (or an absent entry) reads as confidence 0, preserving the
+/// pre-0.8.0 filter semantics exactly.
 pub fn apply(
     graph: &mut DocumentGraph,
     config: &GraphSanityConfig,
     provenance: Option<&ParseProvenance>,
+    section_confidence: Option<&std::collections::HashMap<u32, u8>>,
 ) -> SanityReport {
     let mut report = SanityReport::default();
 
@@ -194,9 +204,14 @@ pub fn apply(
     // bookmark / numbered / large-font bonuses.
     let min_conf = config.invariants.min_confidence;
     if min_conf > 0 {
+        let confidence_of = |n: &DocumentNode| -> u8 {
+            n.text_order
+                .and_then(|t| section_confidence.and_then(|m| m.get(&t).copied()))
+                .unwrap_or(0)
+        };
         let mut demoted = 0usize;
         for n in graph.nodes.values_mut() {
-            if n.node_type == "Section" && n.confidence < min_conf {
+            if n.node_type == "Section" && confidence_of(n) < min_conf {
                 n.node_type = "Paragraph".to_string();
                 demoted += 1;
             }
@@ -1523,7 +1538,7 @@ mod tests {
     fn test_cr28_depth_recompute_fixes_drift() {
         // child recorded at depth 3 but is a direct child of root → expected 1
         let (mut graph, _, child_id) = make_two_node_graph(3);
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert_eq!(report.depth_violations.len(), 1);
         assert_eq!(graph.nodes[&child_id].location.semantic.depth, 1);
     }
@@ -1532,7 +1547,7 @@ mod tests {
     #[test]
     fn test_cr28_noop_on_consistent_tree() {
         let (mut graph, _, _) = make_two_node_graph(1);
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report.is_clean(),
             "consistent tree must produce no diagnostics"
@@ -1554,7 +1569,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let report = apply(&mut graph, &cfg, None);
+        let report = apply(&mut graph, &cfg, None, None);
         assert_eq!(report.depth_violations.len(), 1);
         assert!(!report.depth_violations[0].corrected);
         // Original (wrong) depth retained
@@ -1571,7 +1586,7 @@ mod tests {
                                             // Note: NOT added to root.children — this is the "orphan" case
         graph.nodes.insert(orphan_id, orphan);
 
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert_eq!(report.orphan_nodes.len(), 1);
         assert_eq!(report.orphan_nodes[0], orphan_id);
         // Orphan's depth preserved (correction skipped)
@@ -1586,7 +1601,7 @@ mod tests {
             enabled: false,
             invariants: GraphSanityInvariants::default(),
         };
-        let report = apply(&mut graph, &cfg, None);
+        let report = apply(&mut graph, &cfg, None, None);
         assert!(report.is_clean());
         // Wrong depth still in place
         assert_eq!(graph.nodes[&child_id].location.semantic.depth, 3);
@@ -1638,7 +1653,7 @@ mod tests {
         // depth 2 under a doc-title that the test fixture omits. We assert
         // that the paragraph drift is corrected; full chain consistency is
         // exercised by the broader regression suite.
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report
                 .depth_violations
@@ -1710,7 +1725,7 @@ mod tests {
     #[test]
     fn test_cr65_demotes_section_exceeding_threshold() {
         let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 50.0);
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert_eq!(report.section_height_violations.len(), 1);
         assert_eq!(report.section_height_violations[0].node_id, child_id);
         assert!(report.section_height_violations[0].corrected);
@@ -1722,7 +1737,7 @@ mod tests {
     #[test]
     fn test_cr65_respects_tolerance() {
         let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 30.0);
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report.section_height_violations.is_empty(),
             "child within tolerance should not be flagged"
@@ -1736,7 +1751,7 @@ mod tests {
     #[test]
     fn test_cr65_no_title_is_noop() {
         let (mut graph, _, _) = make_two_node_graph(1);
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report.section_height_violations.is_empty(),
             "no depth-1 Section with physical location → no violations"
@@ -1759,7 +1774,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let report = apply(&mut graph, &cfg, None);
+        let report = apply(&mut graph, &cfg, None, None);
         assert_eq!(report.section_height_violations.len(), 1);
         assert!(!report.section_height_violations[0].corrected);
         assert_eq!(
@@ -1773,7 +1788,7 @@ mod tests {
     fn test_cr65_demoted_section_keeps_content_and_id() {
         let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 50.0);
         let original_text = graph.nodes[&child_id].content.text.clone();
-        apply(&mut graph, &full_correct_config(), None);
+        apply(&mut graph, &full_correct_config(), None, None);
         assert!(graph.nodes.contains_key(&child_id), "id must be preserved");
         assert_eq!(
             graph.nodes[&child_id].content.text, original_text,
@@ -1863,7 +1878,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 100.0),
             (1, 0.0, 0.0, 100.0, 50.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.20, true), None);
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert_eq!(report.section_overlap_violations.len(), 1);
         assert_eq!(report.section_overlap_violations[0].node_id, section_id);
         assert!(report.section_overlap_violations[0].corrected);
@@ -1887,7 +1902,7 @@ mod tests {
                 level: 1,
             }],
         });
-        let report = apply(&mut graph, &overlap_config(0.20, true), None);
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "bookmark-matching section must be protected"
@@ -1904,7 +1919,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 100.0),
             (1, 0.0, 0.0, 100.0, 10.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.20, true), None);
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "overlap below threshold must not flag"
@@ -1921,7 +1936,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 100.0),
             (1, 0.0, 0.0, 100.0, 50.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.0, true), None);
+        let report = apply(&mut graph, &overlap_config(0.0, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "threshold 0.0 must early-return (OFF sentinel)"
@@ -1940,7 +1955,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 20.0),
             (1, 0.0, 20.0, 100.0, 80.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.20, true), None);
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "adjacent (touching, non-overlapping) section must be kept"
@@ -2023,7 +2038,7 @@ mod tests {
                 ("Section", 1, 0.0, 50.0, 50.0, 50.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None);
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None, None);
         let v: Vec<_> = report
             .section_overlap_count_violations
             .iter()
@@ -2045,7 +2060,7 @@ mod tests {
                 ("Paragraph", 1, 0.0, 0.0, 30.0, 30.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None);
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None, None);
         assert!(
             report.section_overlap_count_violations.is_empty(),
             "two overlaps is below the count threshold"
@@ -2065,7 +2080,7 @@ mod tests {
                 ("Paragraph", 2, 0.0, 0.0, 100.0, 100.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None);
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None, None);
         assert!(report.section_overlap_count_violations.is_empty());
         assert_eq!(graph.nodes[&section_id].node_type, "Section");
     }
@@ -2084,7 +2099,7 @@ mod tests {
                 ("Paragraph", 1, 90.0, 0.0, 10.0, 10.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.10), None);
+        let report = apply(&mut graph, &overlap_count_config(3, 0.10), None, None);
         assert!(
             report.section_overlap_count_violations.is_empty(),
             "sub-threshold overlaps must not count"
@@ -2104,7 +2119,7 @@ mod tests {
                 ("Section", 1, 0.0, 50.0, 50.0, 50.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(0, 0.0), None);
+        let report = apply(&mut graph, &overlap_count_config(0, 0.0), None, None);
         assert!(
             report.section_overlap_count_violations.is_empty(),
             "count_threshold 0 must early-return (OFF guard)"
@@ -2136,8 +2151,10 @@ mod tests {
     /// the node ids in list order.
     /// CR-78 Phase B — the `min_confidence` filter demotes Sections scoring below
     /// the threshold (mutator slot before the CR-70 rebalance); default 0 is a
-    /// no-op. Confidence is assigned at detection (section_detection_v2); here we
-    /// stamp it directly to isolate the filter.
+    /// no-op. Confidence is assigned at detection (section_detection_v2) and
+    /// arrives as the transient `text_order → confidence` sidecar (Block A /
+    /// A3: nodes no longer carry it); here we build the sidecar directly to
+    /// isolate the filter.
     #[test]
     fn cr78_min_confidence_demotes_below_threshold() {
         let specs = [
@@ -2158,12 +2175,12 @@ mod tests {
                 parent_idx: None,
             },
         ];
+        // make_rebalance_graph assigns text_order by list position.
+        let confidence: std::collections::HashMap<u32, u8> = [(0u32, 6u8), (1u32, 3u8)].into();
 
         // Default (min_confidence = 0) is a no-op: both stay Sections.
         let (mut g0, _r0, ids0) = make_rebalance_graph(&specs);
-        g0.nodes.get_mut(&ids0[0]).unwrap().confidence = 6;
-        g0.nodes.get_mut(&ids0[1]).unwrap().confidence = 3;
-        apply(&mut g0, &rebalance_only_config(3, 4), None);
+        apply(&mut g0, &rebalance_only_config(3, 4), None, Some(&confidence));
         assert_eq!(g0.nodes[&ids0[0]].node_type, "Section");
         assert_eq!(
             g0.nodes[&ids0[1]].node_type, "Section",
@@ -2172,11 +2189,9 @@ mod tests {
 
         // min_confidence = 4: the conf-3 section demotes, the conf-6 survives.
         let (mut g1, _r1, ids1) = make_rebalance_graph(&specs);
-        g1.nodes.get_mut(&ids1[0]).unwrap().confidence = 6;
-        g1.nodes.get_mut(&ids1[1]).unwrap().confidence = 3;
         let mut cfg = rebalance_only_config(3, 4);
         cfg.invariants.min_confidence = 4;
-        apply(&mut g1, &cfg, None);
+        apply(&mut g1, &cfg, None, Some(&confidence));
         assert_eq!(
             g1.nodes[&ids1[0]].node_type, "Section",
             "conf 6 >= 4 survives"
@@ -2309,7 +2324,7 @@ mod tests {
             },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         assert_eq!(
             graph.nodes[&ids[0]].location.semantic.depth, 1,
@@ -2378,7 +2393,7 @@ mod tests {
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
         let mut cfg = rebalance_only_config(4, 5);
         cfg.invariants.topology_rebalance.document_title_nesting = true;
-        apply(&mut graph, &cfg, None);
+        apply(&mut graph, &cfg, None, None);
 
         assert_eq!(
             graph.nodes[&ids[0]].parent,
@@ -2409,7 +2424,7 @@ mod tests {
 
         // Flag off → flat level-1 siblings (the pre-Sb8 shape).
         let (mut g2, root2, ids2) = make_rebalance_graph(&specs);
-        apply(&mut g2, &rebalance_only_config(4, 5), None);
+        apply(&mut g2, &rebalance_only_config(4, 5), None, None);
         assert_eq!(g2.nodes[&ids2[0]].parent, Some(root2));
         assert_eq!(
             g2.nodes[&ids2[1]].parent,
@@ -2471,7 +2486,7 @@ mod tests {
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
         let mut cfg = rebalance_only_config(4, 5);
         cfg.invariants.topology_rebalance.document_title_nesting = true;
-        apply(&mut graph, &cfg, None);
+        apply(&mut graph, &cfg, None, None);
 
         // Two top-level siblings: the title and the Appendix.
         assert_eq!(
@@ -2519,7 +2534,7 @@ mod tests {
             },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(
@@ -2577,7 +2592,7 @@ mod tests {
             },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
@@ -2636,7 +2651,7 @@ mod tests {
         // Precondition: the demoted node has a child (the stale spurious level).
         assert!(!graph.nodes[&ids[1]].children.is_empty());
 
-        let report = apply(&mut graph, &rebalance_only_config(3, 4), None);
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // The demoted node is now a leaf...
         assert!(
@@ -2689,7 +2704,7 @@ mod tests {
             },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
@@ -2739,10 +2754,10 @@ mod tests {
             },
         ];
         let (mut graph, _root, _ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // Second run: no topology changes.
-        let report = apply(&mut graph, &rebalance_only_config(3, 4), None);
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
         {
             let tr = report
                 .topology_rebalance
@@ -2797,7 +2812,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let report = apply(&mut graph, &cfg, None);
+        let report = apply(&mut graph, &cfg, None, None);
         let tr = report
             .topology_rebalance
             .expect("report present in check mode");
@@ -3068,7 +3083,7 @@ mod tests {
             },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        let report = apply(&mut graph, &rebalance_only_config(3, 4), None);
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // 1., 2., Appendix are level-1 siblings under root.
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
@@ -3152,7 +3167,7 @@ mod tests {
             },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // Appendix is the container; A, FigFP(FLOPS), B all sit under it.
         assert_eq!(
@@ -3247,7 +3262,7 @@ mod tests {
             },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // Appendix is the level-1 container.
         assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1);
@@ -3327,7 +3342,7 @@ mod tests {
             check: false,
             correct: false,
         };
-        apply(&mut graph, &cfg, None);
+        apply(&mut graph, &cfg, None, None);
 
         // Without the rule, A and B fall to the size fallback (level 1) and sit
         // as level-1 siblings of Appendix under root.
@@ -3398,9 +3413,9 @@ mod tests {
             },
         ];
         let (mut graph, _root, _ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4), None);
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
-        let report = apply(&mut graph, &rebalance_only_config(3, 4), None);
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
         let tr = report
             .topology_rebalance
             .as_ref()
@@ -3507,7 +3522,7 @@ mod tests {
             },
         };
 
-        let report = apply(&mut graph, &cfg, None);
+        let report = apply(&mut graph, &cfg, None, None);
 
         // Accepted regression: NOTHING demoted — both stay Section.
         assert_eq!(graph.nodes[&title_id].node_type, "Section");
@@ -3527,7 +3542,7 @@ mod tests {
     #[test]
     fn test_cr71a_default_config_does_not_run_prune() {
         let (mut graph, _, _) = make_two_node_graph(1);
-        let report = apply(&mut graph, &full_correct_config(), None);
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(report.section_prune.is_none(), "prune step off by default");
     }
 }

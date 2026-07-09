@@ -152,10 +152,9 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
                 token_count: n.token_count,
                 internal_refs: vec![],
                 external_refs: vec![],
-                // CR-78: carry the fixture node's confidence so a regenerated
-                // (v2.4.0) fixture round-trips faithfully. Pre-CR-78 fixtures
-                // carry 0 (the serde default).
-                confidence: n.confidence,
+                // Block A / A3: DocumentNode no longer carries confidence;
+                // the element-side field stays parser-internal (neutral 0).
+                confidence: 0,
             }
         })
         .collect();
@@ -257,49 +256,37 @@ fn roundtrip_identity_synthetic_small() {
 }
 
 #[test]
-fn roundtrip_identity_confidence_field_survives() {
-    // CR-78 (v2.4.0): a Section node carrying a non-zero `confidence` must
-    // round-trip byte-identically through emit → parse. (Unlike the refs vecs
-    // — which the parser drops because the round-trip tests only ever exercise
-    // empty refs — confidence is non-zero on real Sections, so it must be
-    // threaded back on parse for the canonical hash to match.)
-    let mut original = build_synthetic_graph(
+fn legacy_confidence_key_in_fence_is_tolerated_and_dropped() {
+    // v4.0.0 (Block A / Amendment M): `confidence` left the wire. A legacy
+    // fence carrying the key must still parse (serde drops unknown fields);
+    // the reconstructed graph simply doesn't carry it, and — because the
+    // canonical form no longer includes it — the recomputed hash equals the
+    // hash of the same content without the key. We prove tolerance by
+    // splicing the legacy key into an emitted fence and re-parsing with
+    // accept_drift off: the spliced key changes no canonical bytes, so
+    // identity still Verifies.
+    let original = build_synthetic_graph(
         vec![
             ("Section", "Introduction", 1, 0),
             ("Paragraph", "Hello world.", 1, 1),
         ],
-        Some("Confidence Round-trip Doc"),
+        Some("Confidence Tolerance Doc"),
         None,
     );
-    // Stamp a confidence on the Section node, then recompute the hash so the
-    // doc-level block embeds the post-stamp graph_sha256.
-    let section_id = original
-        .nodes
-        .values()
-        .find(|n| n.node_type == "Section")
-        .expect("synthetic graph has a Section")
-        .id;
-    original.nodes.get_mut(&section_id).unwrap().confidence = 7;
-
-    // `assert_roundtrip_identity` asserts graph_sha256(original) ==
-    // graph_sha256(parsed); the embedded confidence is part of the canonical
-    // hash, so a Verified identity already proves the field survived.
-    let parsed = assert_roundtrip_identity(&original, &synthetic_provenance());
-
-    // Spot-check the value directly: the parsed Section keeps confidence 7;
-    // the Paragraph stays 0 (omitted from the wire, defaulted on parse).
-    let parsed_section = parsed
-        .nodes
-        .values()
-        .find(|n| n.node_type == "Section")
-        .expect("parsed graph has a Section");
-    assert_eq!(parsed_section.confidence, 7);
-    let parsed_para = parsed
-        .nodes
-        .values()
-        .find(|n| n.node_type == "Paragraph")
-        .expect("parsed graph has a Paragraph");
-    assert_eq!(parsed_para.confidence, 0);
+    let md = emit_markdown(&original, &synthetic_provenance());
+    // Splice a legacy confidence key into the Section fence JSON.
+    let spliced = md.replace(
+        "\"node_type\":\"Section\"",
+        "\"node_type\":\"Section\",\"confidence\":7",
+    );
+    assert_ne!(md, spliced, "splice must have taken effect");
+    let result = parse_markdown(&spliced, ParseOptions::default())
+        .expect("legacy confidence key parses cleanly");
+    assert!(
+        matches!(result.identity, ParseIdentity::Verified),
+        "legacy confidence key must not perturb the content-only identity; got {:?}",
+        result.identity
+    );
 }
 
 #[test]

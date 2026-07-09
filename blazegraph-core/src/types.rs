@@ -304,22 +304,17 @@ pub struct DocumentNode {
     /// CR-62 (v2.3.0+): references to external locations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_refs: Vec<ExternalRef>,
-    /// CR-78 (v2.4.0+): detection confidence for Section nodes
-    /// (`size_spine + Σ marker_bonuses`; see `ParsedPdfElement.confidence`).
-    /// `0` for non-Section nodes (and for any pre-v2.4.0 graph), and omitted
-    /// from the wire when `0` so those nodes stay byte-identical — the same
-    /// "skip when empty" discipline CR-62 used for the refs vecs. Phase A is
-    /// annotation-only; no consumer reads this yet.
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
-    pub confidence: u8,
-}
-
-/// `skip_serializing_if` predicate for [`DocumentNode::confidence`] (and the
-/// bgraph.md per-element fence emitter): omit the field from the wire (and the
-/// canonical hash) when it is `0`, so non-Section nodes and pre-CR-78 graphs
-/// serialize byte-identically to v2.3.0.
-pub(crate) fn is_zero_u8(v: &u8) -> bool {
-    *v == 0
+    // Schema 0.8.0 (Block A / Amendment M): the CR-78 `confidence`
+    // schema-ahead placeholder is REMOVED outright — no
+    // `skip_serializing_if` slot kept. A placeholder that is
+    // empty-now/populated-later silently churns `graph_sha256` at the
+    // empty→populated moment (absent-from-canonical-bytes →
+    // present-in-canonical-bytes) with no declared bump, so
+    // schema-ahead into the identity form is retired. The upstream
+    // ingredients (`ParsedPdfElement.confidence` →
+    // `SemanticTreeElement.confidence`) stay as the parser-internal
+    // signal; when a real consumer lands, the field enters via its own
+    // honest major bump.
 }
 
 impl DocumentNode {
@@ -344,7 +339,6 @@ impl DocumentNode {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
-            confidence: 0,
         }
     }
 
@@ -369,7 +363,6 @@ impl DocumentNode {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
-            confidence: 0,
         }
     }
 
@@ -1062,8 +1055,11 @@ pub struct SemanticTreeElement {
     /// CR-78 (v2.4.0+): detection confidence for spans promoted to Section
     /// (size spine R1=3/R2=2/R3=1 + marker bonuses: bookmark +3, numbered +2,
     /// isolated +1, bold +1). `0` for non-Section elements. Threaded from the
-    /// rule engine's `ParsedPdfElement.confidence` and projected onto
-    /// `DocumentNode.confidence`. Phase A is annotation-only.
+    /// rule engine's `ParsedPdfElement.confidence`. **Parser-internal
+    /// only** since schema 0.8.0 (Block A / Amendment M): it no longer
+    /// flows onto `DocumentNode` or the wire — kept as the upstream
+    /// ingredient for when a confidence signal earns a real, consumed
+    /// home via its own honest major bump.
     #[serde(default)]
     pub confidence: u8,
 }
@@ -1296,8 +1292,9 @@ pub struct ParsedPdfElement {
     /// detection time in `rules::section_detection_v2`. `0` for non-Section
     /// elements (no consumer reads it there). Carried through clustering as
     /// the max across merged fragments, then projected onto
-    /// `SemanticTreeElement.confidence` → `DocumentNode.confidence`.
-    /// Phase A is annotation-only: nothing reads this to gate admission.
+    /// `SemanticTreeElement.confidence` — where the flow now stops
+    /// (schema 0.8.0 / Block A: no longer stamped on `DocumentNode` or
+    /// the wire). Nothing reads this to gate admission.
     #[serde(default)]
     pub confidence: u8,
 }

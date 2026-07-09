@@ -335,6 +335,14 @@ impl DocumentProcessor {
         // Stage 3: ParsedPdfElement → SemanticTreeElement (channel exit)
         let semantic_elements = project_to_semantic_tree(parsed_elements.clone());
 
+        // Block A / A3: transient confidence sidecar for graph_sanity
+        // (see rules_and_graph).
+        let section_confidence: std::collections::HashMap<u32, u8> = semantic_elements
+            .iter()
+            .filter(|e| e.confidence > 0)
+            .map(|e| (e.text_order, e.confidence))
+            .collect();
+
         // Stage 4: SemanticTreeElement → DocumentGraph
         let mut graph = self.graph_builder.build_graph(semantic_elements)?;
 
@@ -359,7 +367,12 @@ impl DocumentProcessor {
         // (CR-66) is gone. graph_sanity reads the graph directly.
         // Stage-dump path uses the legacy provenance-free build — no
         // parse-run identity for the evidence artifact stem.
-        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity, None);
+        crate::graphs::graph_sanity::apply(
+            &mut graph,
+            &config.graph_sanity,
+            None,
+            Some(&section_confidence),
+        );
         graph.compute_breadcrumbs();
 
         println!("📋 Stage 3: Graph captured ({} nodes)", graph.nodes.len());
@@ -501,6 +514,17 @@ impl DocumentProcessor {
             project_to_semantic_tree(parsed_elements)
         });
 
+        // Block A / A3: the CR-78 detection-confidence signal no longer
+        // rides on DocumentNode (it left the wire + the hash). Capture it
+        // as a transient text_order-keyed sidecar for the CR-78 Phase B
+        // min_confidence filter in graph_sanity before the elements move
+        // into the builder. Non-zero entries only (absent == 0).
+        let section_confidence: std::collections::HashMap<u32, u8> = semantic_elements
+            .iter()
+            .filter(|e| e.confidence > 0)
+            .map(|e| (e.text_order, e.confidence))
+            .collect();
+
         // Graph construction (deterministic UUIDv5 node IDs). Block A:
         // the builder no longer takes provenance — the graph is content
         // only; provenance stays a value in this scope and is threaded
@@ -528,7 +552,12 @@ impl DocumentProcessor {
         // graph — it is a json-only aggregate recomputed at
         // serialization time, so the pre/post-sanity recompute dance
         // (CR-66) is gone. graph_sanity reads the graph directly.
-        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity, Some(parse_provenance));
+        crate::graphs::graph_sanity::apply(
+            &mut graph,
+            &config.graph_sanity,
+            Some(parse_provenance),
+            Some(&section_confidence),
+        );
         graph.compute_breadcrumbs();
 
         Ok(graph)

@@ -226,13 +226,10 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                 token_count: p.metadata.token_count,
                 internal_refs: vec![],
                 external_refs: vec![],
-                // CR-78 (v2.4.0): thread the parsed confidence back so the
-                // reconstructed graph re-emits byte-identically. (Unlike
-                // internal/external refs — which the parser currently drops
-                // because the round-trip tests only exercise empty refs —
-                // confidence is non-zero on real Section nodes, so it MUST
-                // round-trip to keep the canonical hash stable.)
-                confidence: p.metadata.confidence,
+                // Block A / A3: `confidence` left the wire (v4.0.0); the
+                // reconstructed element carries the neutral 0 — it no
+                // longer feeds the node or the hash.
+                confidence: 0,
             }
             .validate(),
         );
@@ -568,13 +565,11 @@ struct NodeMetadata {
     #[serde(default)]
     #[allow(dead_code)]
     external_refs: Vec<crate::types::ExternalRef>,
-    /// CR-78 (v2.4.0+): per-element detection confidence (Section nodes).
-    /// `#[serde(default)]` → `0` for pre-v2.4.0 fixtures and for non-Section
-    /// nodes (the emitter omits the field when `0`). Threaded back onto the
-    /// reconstructed `SemanticTreeElement.confidence` so re-emit is byte-
-    /// symmetric (the CR-57 round-trip invariant) for non-zero scores.
-    #[serde(default)]
-    confidence: u8,
+    // v4.0.0 (Block A / Amendment M): `confidence` left the wire. A
+    // legacy (≤3.x) input carrying it parses fine — serde drops unknown
+    // fields — but the value is discarded; it no longer round-trips
+    // (and a ≤3.x stamped graph_sha256 would not verify under the v4
+    // content-only recompute anyway).
     /// CR-45: per-element verbatim Tika style projection. `#[serde(default)]`
     /// makes the field tolerant of fixtures / hand-edited inputs that
     /// omit it (forward-compat with the spec's "tolerate absent optional
