@@ -232,6 +232,71 @@ mod tests {
         assert_ne!(graph_sha256(&g_a), graph_sha256(&g_b));
     }
 
+    /// Block A / Amendment M gate test — the direct proof the
+    /// content-body line was drawn correctly. Builds a graph through
+    /// the real deterministic builder (the production path) and asserts
+    /// on the canonical form itself:
+    ///
+    /// - **absent**: `parse_provenance` (envelope — content-not-
+    ///   provenance rule, arch-14 §3.1), `structural_profile` (json-only
+    ///   derived aggregate — intersection rule, arch-14 §6),
+    ///   `confidence` (schema-ahead placeholder, removed).
+    /// - **present**: `flow_type` (identity scalar, relocated onto
+    ///   `document_info`) and `token_count` (deterministic `words/4`,
+    ///   deliberately in identity — DT-01).
+    #[test]
+    fn canonical_form_is_the_content_body_amendment_m() {
+        use crate::graphs::builder::GraphBuilder;
+        use crate::graphs::node_id::NodeIdGenerator;
+
+        let elements = vec![
+            SemanticTreeElement {
+                text: "Intro".to_string(),
+                element_type: SemanticElementType::Section,
+                hierarchy_level: 1,
+                text_order: 0,
+                physical_location: None,
+                style: None,
+                token_count: 1,
+                internal_refs: vec![],
+                external_refs: vec![],
+                // Non-zero upstream ingredient: must NOT surface in the
+                // canonical form (the old CR-78 path would have).
+                confidence: 6,
+            },
+            SemanticTreeElement {
+                text: "Hello world.".to_string(),
+                element_type: SemanticElementType::Paragraph,
+                hierarchy_level: 1,
+                text_order: 1,
+                physical_location: None,
+                style: None,
+                token_count: 2,
+                internal_refs: vec![],
+                external_refs: vec![],
+                confidence: 0,
+            },
+        ];
+        let graph = GraphBuilder::new()
+            .build_graph_deterministic(elements, &NodeIdGenerator::new())
+            .expect("graph builds");
+
+        let canonical = canonical_json(&graph);
+
+        for evicted in ["\"parse_provenance\"", "\"structural_profile\"", "\"confidence\""] {
+            assert!(
+                !canonical.contains(evicted),
+                "canonical form must not contain {evicted} — it is not content; got:\n{canonical}",
+            );
+        }
+        for kept in ["\"flow_type\"", "\"token_count\""] {
+            assert!(
+                canonical.contains(kept),
+                "canonical form must contain {kept} — it is content; got:\n{canonical}",
+            );
+        }
+    }
+
     #[test]
     fn canonical_json_keys_are_sorted() {
         // Spot-check: in canonical output the document_info object's

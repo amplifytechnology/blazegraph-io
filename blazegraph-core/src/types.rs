@@ -220,7 +220,33 @@ pub struct ParseProvenance {
 /// Backwards-compatible: existing 0.6.0 graphs deserialize cleanly
 /// because all new fields default (`Option::None` / `Vec::new` /
 /// `BTreeMap::new`), and the new enum variants are additive.
-pub const SCHEMA_VERSION: &str = "0.7.0";
+///
+/// 0.8.0 — Block A / Amendment M: **identity became the content body**
+/// (the inaugural content-only edition; bgraph.md v4.0.0 is the wire
+/// side of the same bump). `canonical_json(&DocumentGraph)` now covers
+/// exactly the content body — nothing that is not content is hashed,
+/// nothing that is content is excluded:
+///   1. `DocumentInfo.parse_provenance` → `SortedDocumentGraph`
+///      (wrapper). Provenance is about the parse run, not of the
+///      document; it is threaded as an explicit value through the
+///      emit/serialize paths.
+///   2. `DocumentGraph.structural_profile` removed — the profile is a
+///      json-only derived aggregate, recomputed at serialization time
+///      on the wrapper. `flow_type` (its one identity scalar)
+///      relocated to `DocumentInfo` (default `Fixed`).
+///   3. `DocumentNode.confidence` (CR-78 schema-ahead placeholder)
+///      removed outright — no placeholder slot; schema-ahead into the
+///      identity form is retired. Upstream parser-internal ingredients
+///      stay.
+///   4. `token_count` deliberately stays in the body → in identity
+///      (deterministic `words/4`; DT-01).
+///
+/// Breaking on the wrapper shape (fields moved), tolerant on read:
+/// pre-0.8.0 graph.json deserializes cleanly (moved fields are dropped
+/// as unknowns / defaulted), but `graph_sha256` re-baselines for every
+/// document. Node IDs do NOT change (the CR-83 key never referenced
+/// the evicted fields).
+pub const SCHEMA_VERSION: &str = "0.8.0";
 
 /// The in-memory graph — and, definitionally, the **content body**:
 /// `canonical_json(&DocumentGraph)` is the exact input to

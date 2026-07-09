@@ -85,7 +85,23 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// under 1.x/2.x still parse structurally; their embedded IDs simply
 /// differ from what a fresh 3.0.0 reparse derives. See
 /// `docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment L.
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "3.0.0";
+///
+/// v4.0.0 (Block A / Amendment M): **major** — the inaugural
+/// **content-only edition: identity became the content body.**
+/// `graph_sha256` is redefined from "canonical json incl. provenance"
+/// to the hash of the content body alone: `parse_provenance` and
+/// `structural_profile` leave the hash (envelope / json-wrapper
+/// concerns), the CR-78 `confidence` placeholder leaves the wire
+/// entirely, `flow_type` relocates onto `DocumentInfo`, and
+/// `token_count` stays (deterministic `words/4`, a function of the
+/// text alone — DT-01). Node IDs are **unchanged** (the Amendment L
+/// key never referenced the evicted fields); only the doc-level
+/// `graph_sha256` re-baselines. The walk algorithm is byte-identical
+/// to v2/v3, so 2.x/3.x files still parse structurally — but their
+/// stamped hashes were computed under the old definition and will not
+/// verify under the v4 recompute (use `--accept-drift` or regenerate).
+/// See `docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment M.
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "4.0.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///

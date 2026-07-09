@@ -623,20 +623,23 @@ fn strip_heading_prefix(body: &str) -> String {
 }
 
 /// Validate that the doc-level `schema` field is a major version this
-/// parser has an arm for. Accepts `2.x` and `3.x`.
+/// parser has an arm for. Accepts `2.x`, `3.x`, and `4.x`.
 ///
 /// v2.1.0+ (CR-57) dropped v1.x dispatch per the single-convention
 /// contract. CR-83 (v3.0.0) is a major bump for **node-ID derivation
-/// only** — the structural read path (the walk algorithm + per-element
-/// fence shape) is byte-for-byte identical to v2.x, so the *same* parser
-/// arm reads both. A v2.x file parses structurally under this v3 parser;
-/// its embedded `id` values simply differ from what a fresh v3 reparse
-/// derives (the builder's content+breadcrumb IDs are the truth — the
-/// embedded IDs are advisory, see the self-consistency check above).
-/// Future major bumps that *do* change the read path add a new arm here
-/// in lock-step.
+/// only**, and Amendment M (v4.0.0) for the **identity definition
+/// only** (`graph_sha256` = content body; `confidence` off the wire) —
+/// in both cases the structural read path (the walk algorithm + fence
+/// shape) is byte-for-byte identical to v2.x, so the *same* parser arm
+/// reads all three. A 2.x/3.x file parses structurally under this v4
+/// parser, but its stamped `graph_sha256` was computed under the old
+/// (provenance-inclusive) definition, so strict-mode identity will not
+/// verify — that is the honest fail-closed answer; cross-version
+/// verification is the museum's job (design-flow Block C), not this
+/// arm's. Future major bumps that *do* change the read path add a new
+/// arm here in lock-step.
 fn validate_schema(schema: &str) -> Result<(), ParseError> {
-    if schema.starts_with("2.") || schema.starts_with("3.") {
+    if schema.starts_with("2.") || schema.starts_with("3.") || schema.starts_with("4.") {
         Ok(())
     } else {
         Err(ParseError::UnsupportedSchema(schema.to_string()))
@@ -1053,25 +1056,26 @@ mod tests {
     }
 
     #[test]
-    fn validate_schema_accepts_v2_and_v3() {
-        // v2.1.0+ (CR-57) single convention; CR-83 (v3.0.0) shares the
-        // identical read path (only node-ID *values* change), so both
-        // majors parse structurally.
+    fn validate_schema_accepts_v2_through_v4() {
+        // v2.1.0+ (CR-57) single convention; CR-83 (v3.0.0) changed only
+        // node-ID *values*; Amendment M (v4.0.0) changed only the identity
+        // *definition* — all three majors share the identical structural
+        // read path.
         for ok in [
-            "2.0.0", "2.1.0", "2.42.7", "2.99.0", "3.0.0", "3.1.0", "3.99.0",
+            "2.0.0", "2.1.0", "2.42.7", "2.99.0", "3.0.0", "3.1.0", "3.99.0", "4.0.0", "4.1.0",
         ] {
             assert!(
                 validate_schema(ok).is_ok(),
-                "{ok} should be accepted under the v2/v3-shared-read-path parser"
+                "{ok} should be accepted under the v2/v3/v4-shared-read-path parser"
             );
         }
     }
 
     #[test]
-    fn validate_schema_rejects_v1_and_v4_plus() {
-        // v1.x predates the single convention; v4.x+ is a hypothetical
+    fn validate_schema_rejects_v1_and_v5_plus() {
+        // v1.x predates the single convention; v5.x+ is a hypothetical
         // future read-path break with no arm yet.
-        for bad in ["0.9.0", "1.0.0", "1.1.0", "1.42.0", "4.0.0", "10.0.0"] {
+        for bad in ["0.9.0", "1.0.0", "1.1.0", "1.42.0", "5.0.0", "10.0.0"] {
             assert!(
                 matches!(validate_schema(bad), Err(ParseError::UnsupportedSchema(_))),
                 "{bad} should be rejected — no parser arm for that major"
