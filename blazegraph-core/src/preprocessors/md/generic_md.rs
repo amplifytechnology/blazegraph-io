@@ -497,7 +497,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
     // 4. Build the graph. The builder asserts `text_order == vec
     //    position`; we satisfied that above by pushing in order.
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(elements, &id_gen, provenance)
+        .build_graph_deterministic(elements, &id_gen)
         .map_err(|e| ParseError::MalformedFence(format!("graph build failed: {e}")))?;
 
     // 5. Populate fields the builder doesn't.
@@ -519,6 +519,9 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
     Ok(ParseResult {
         graph,
         identity: ParseIdentity::Verified,
+        // Block A / Amendment M: provenance rides beside the graph,
+        // never on it.
+        provenance,
     })
 }
 
@@ -793,12 +796,9 @@ mod tests {
     #[test]
     fn parse_sets_parse_provenance_with_source_sha256() {
         let input = "# Hi\n";
-        let graph = parse_ok(input);
-        let prov = graph
-            .document_info
-            .parse_provenance
-            .as_ref()
-            .expect("provenance present");
+        // Block A: provenance rides on the ParseResult, not the graph.
+        let result = parse(input, ParseOptions::default()).expect("parses");
+        let prov = &result.provenance;
         assert_eq!(prov.source_format, "markdown");
         assert_eq!(prov.config_hash, "none");
         // sha256 of "# Hi\n" — deterministic.

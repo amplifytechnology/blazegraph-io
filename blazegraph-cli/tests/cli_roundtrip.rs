@@ -41,18 +41,23 @@ fn unique_temp_dir(test_name: &str) -> PathBuf {
     dir
 }
 
-/// Build a small synthetic graph through the deterministic builder.
-/// Mirrors `markdown_roundtrip_tests::build_synthetic_graph` but kept
-/// self-contained so this file doesn't depend on the core crate's
-/// integration-test helpers.
-fn build_synthetic_graph() -> DocumentGraph {
-    let provenance = ParseProvenance {
+/// Synthetic provenance for emit calls (Block A: provenance is an
+/// explicit emit argument, not graph state).
+fn synthetic_provenance() -> ParseProvenance {
+    ParseProvenance {
         blazegraph_version: "0.6.0-cli-test".to_string(),
         source_format: "markdown".to_string(),
         source_filename: "cli-roundtrip.md".to_string(),
         source_sha256: "cli-test-source-sha".to_string(),
         config_hash: "cli-test-config-hash".to_string(),
-    };
+    }
+}
+
+/// Build a small synthetic graph through the deterministic builder.
+/// Mirrors `markdown_roundtrip_tests::build_synthetic_graph` but kept
+/// self-contained so this file doesn't depend on the core crate's
+/// integration-test helpers.
+fn build_synthetic_graph() -> DocumentGraph {
     let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
     let elements = vec![
         SemanticTreeElement {
@@ -129,7 +134,7 @@ fn build_synthetic_graph() -> DocumentGraph {
         },
     ];
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(elements, &id_gen, provenance)
+        .build_graph_deterministic(elements, &id_gen)
         .expect("synthetic graph builds");
     graph.document_info.document_metadata.title = Some("CLI Round-Trip Sample".to_string());
     graph.structural_profile.flow_type = FlowType::Free;
@@ -183,7 +188,7 @@ fn cli_roundtrip_markdown_to_graph_canonical_bytes_match() {
     let roundtrip_json = dir.join("roundtrip.json");
 
     let original = build_synthetic_graph();
-    let md = emit_markdown(&original);
+    let md = emit_markdown(&original, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -232,7 +237,7 @@ fn cli_emit_markdown_output_format_writes_bgraph_md() {
     let output_md = dir.join("output.bgraph.md");
 
     let original = build_synthetic_graph();
-    let md = emit_markdown(&original);
+    let md = emit_markdown(&original, &synthetic_provenance());
     std::fs::write(&input_md, &md).expect("write input md");
 
     let output = Command::new(BIN)
@@ -270,7 +275,7 @@ fn cli_strict_mode_errors_on_drift() {
     let fixture_md = dir.join("tampered.bgraph.md");
 
     let original = build_synthetic_graph();
-    let mut md = emit_markdown(&original);
+    let mut md = emit_markdown(&original, &synthetic_provenance());
     // Tamper: corrupt the embedded graph_sha256 so parse hits
     // HashMismatch.
     md = md.replace(
@@ -316,7 +321,7 @@ fn cli_accept_drift_returns_derivative_with_warning() {
     let output_json = dir.join("drifted.json");
 
     let original = build_synthetic_graph();
-    let mut md = emit_markdown(&original);
+    let mut md = emit_markdown(&original, &synthetic_provenance());
     md = md.replace(
         "\"graph_sha256\":\"",
         "\"graph_sha256\":\"00000000000000000000000000000000",
@@ -359,7 +364,7 @@ fn cli_strip_body_only_removes_all_bgraph_fences() {
     let stripped = dir.join("stripped.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -414,7 +419,7 @@ fn cli_strip_default_mode_emits_frontmatter() {
     let stripped = dir.join("stripped.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -465,7 +470,7 @@ fn cli_strip_node_types_filters_headers() {
     let stripped = dir.join("stripped.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -504,7 +509,7 @@ fn cli_strip_rejects_unknown_node_type() {
     let dir = unique_temp_dir("strip-bad-type");
     let fixture_md = dir.join("fixture.bgraph.md");
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -537,7 +542,7 @@ fn cli_strip_rejects_bgraph_as_node_type() {
     let dir = unique_temp_dir("strip-bgraph-type");
     let fixture_md = dir.join("fixture.bgraph.md");
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -565,7 +570,7 @@ fn cli_strip_to_stdout_when_no_output_path() {
     let fixture_md = dir.join("fixture.bgraph.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -743,11 +748,11 @@ fn parse_docx_fixture_produces_graph() {
     // The DOCX channel stamps `source_format = "docx"`, and the CLI
     // overwrites the lib-empty `source_filename` with the input
     // basename.
+    // Block A: provenance lives on the SortedDocumentGraph wrapper.
     let prov = sorted
-        .document_info
         .parse_provenance
         .as_ref()
-        .expect("docx graph carries parse provenance");
+        .expect("docx graph.json carries parse provenance on the wrapper");
     assert_eq!(prov.source_format, "docx", "source_format must be docx");
     assert_eq!(
         prov.source_filename, "structured.docx",

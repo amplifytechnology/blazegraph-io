@@ -362,7 +362,6 @@ mod tests {
                 kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
                 outline_data: None,
-                parse_provenance: None, // generic emitter doesn't need provenance
                 topology: None,
             },
             structural_profile: StructuralProfile::default(),

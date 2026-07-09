@@ -219,18 +219,18 @@ mod tests {
                 kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
                 outline_data: None,
-                parse_provenance: Some(ParseProvenance {
-                    blazegraph_version: "0.6.0".to_string(),
-                    source_format: "markdown".to_string(),
-                    source_filename: "x.md".to_string(),
-                    source_sha256: "abc".to_string(),
-                    config_hash: "def".to_string(),
-                }),
                 topology: None,
             },
             structural_profile: StructuralProfile::default(),
         };
-        let md = emit_markdown(&graph);
+        let provenance = ParseProvenance {
+            blazegraph_version: "0.6.0".to_string(),
+            source_format: "markdown".to_string(),
+            source_filename: "x.md".to_string(),
+            source_sha256: "abc".to_string(),
+            config_hash: "def".to_string(),
+        };
+        let md = emit_markdown(&graph, &provenance);
         assert!(
             is_bgraph_md(&md),
             "emitter output should sniff as bgraph.md"

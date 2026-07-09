@@ -20,7 +20,6 @@ impl DocumentGraph {
             kind: crate::types::default_kind(),
             document_metadata: DocumentMetadata::default(),
             outline_data: None,
-            parse_provenance: None,
             topology: None,
         };
 
@@ -41,7 +40,6 @@ impl DocumentGraph {
             kind: crate::types::default_kind(),
             document_metadata: DocumentMetadata::default(),
             outline_data: None,
-            parse_provenance: None,
             topology: None,
         };
 
@@ -60,14 +58,23 @@ impl DocumentGraph {
             .unwrap_or(0)
     }
 
-    pub fn save_to_json(&self, path: &str) -> Result<()> {
-        let sorted_graph = self.to_sorted_graph();
+    /// Serialize to graph.json on disk. `provenance` is threaded
+    /// explicitly (Block A / Amendment M): it lands on the
+    /// `SortedDocumentGraph` wrapper, outside the canonical hash.
+    /// `None` for legacy build paths (random-UUIDv4 `build_graph`,
+    /// stage dumps) that have no parse-run identity to record.
+    pub fn save_to_json(&self, path: &str, provenance: Option<&ParseProvenance>) -> Result<()> {
+        let sorted_graph = self.to_sorted_graph(provenance);
         let json = serde_json::to_string_pretty(&sorted_graph)?;
         std::fs::write(path, json)?;
         Ok(())
     }
 
-    pub fn to_sorted_graph(&self) -> SortedDocumentGraph {
+    /// Project into the on-disk wrapper shape. Provenance is an explicit
+    /// argument — `DocumentGraph` deliberately carries no provenance
+    /// (content-not-provenance rule), so the wrapper is the only place
+    /// the parse-run identity is written.
+    pub fn to_sorted_graph(&self, provenance: Option<&ParseProvenance>) -> SortedDocumentGraph {
         // Collect all nodes and sort by text_order, with root node first
         let mut nodes: Vec<&DocumentNode> = self.nodes.values().collect();
         nodes.sort_by(|a, b| {
@@ -87,6 +94,7 @@ impl DocumentGraph {
             // see canonical-input invariant in
             // docs/P2/core/architecture/08-bgraph-md-format.md.
             created_at: Utc::now(),
+            parse_provenance: provenance.cloned(),
             nodes: nodes.into_iter().cloned().collect(),
             document_info: self.document_info.clone(),
             structural_profile: self.structural_profile.clone(),

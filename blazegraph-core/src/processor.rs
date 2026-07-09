@@ -131,6 +131,12 @@ impl DocumentProcessor {
 
     /// Process document with cache point awareness (CR-11).
     /// This is the primary entry point for CLI usage.
+    ///
+    /// Returns the graph together with the `ParseProvenance` for this
+    /// parse run (Block A / Amendment M): provenance is derived at the
+    /// entry point from the source bytes + config — independent of any
+    /// cache hit — and rides beside the graph as an explicit value.
+    /// `DocumentGraph` itself carries content only.
     pub fn process_document_with_cache(
         &mut self,
         input_path: &str,
@@ -138,7 +144,7 @@ impl DocumentProcessor {
         fresh_from: FreshFrom,
         cache_defaults: &CacheDefaults,
         enable_profiling: bool,
-    ) -> Result<DocumentGraph> {
+    ) -> Result<(DocumentGraph, ParseProvenance)> {
         let mut profiler = StepProfiler::new(enable_profiling);
         let start_time = Instant::now();
 
@@ -148,30 +154,17 @@ impl DocumentProcessor {
 
         println!("📄 Processing: {}", input_path);
 
-        // --- C3: Graph cache check ---
-        if fresh_from.should_use_cache(CachePoint::C3)
-            && cache_defaults.should_write(CachePoint::C3)
-        {
-            let config_hash = calculate_config_hash(config)?;
-            let cache_key = GraphCacheKey::new(pdf_hash.clone(), config_hash);
-            if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
-                println!(
-                    "🎯 C3 graph cache hit ({:.3}s)",
-                    start_time.elapsed().as_secs_f64()
-                );
-                return Ok(cached.graph);
-            }
-        }
-
         // Build the provenance record that identifies this parse run.
         // CR-83: `(source_sha256, config_hash)` no longer feed node-ID
         // derivation — node IDs are content+breadcrumb-derived, not
         // document-namespace-scoped. These fields remain *document*
-        // discriminators: they live in `ParseProvenance` and the doc-level
-        // fence and thus still feed `graph_sha256`. `parse_provenance` is
-        // persisted on the graph so the bgraph.md emitter (B2) can populate
-        // the document-level identity block without re-reading the source.
-        // `blazegraph_version` rides along as provenance documentation only.
+        // discriminators recorded in the doc-level envelope fence and the
+        // graph.json wrapper. Block A: provenance is NOT stamped on the
+        // graph (it is not content, so it must not feed `graph_sha256`);
+        // it is constructed here — before any cache check, since it is a
+        // pure function of (source bytes, config, build) — and returned
+        // beside the graph. `blazegraph_version` rides along as
+        // provenance documentation only.
         let config_hash = calculate_config_hash(config)?;
         let provenance = ParseProvenance {
             blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -183,6 +176,21 @@ impl DocumentProcessor {
             source_sha256: pdf_hash.clone(),
             config_hash: config_hash.clone(),
         };
+
+        // --- C3: Graph cache check ---
+        if fresh_from.should_use_cache(CachePoint::C3)
+            && cache_defaults.should_write(CachePoint::C3)
+        {
+            let cache_key = GraphCacheKey::new(pdf_hash.clone(), config_hash.clone());
+            if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
+                println!(
+                    "🎯 C3 graph cache hit ({:.3}s)",
+                    start_time.elapsed().as_secs_f64()
+                );
+                return Ok((cached.graph, provenance));
+            }
+        }
+
         let id_gen = NodeIdGenerator::new();
 
         // --- C2: Preprocessor cache check ---
@@ -216,7 +224,7 @@ impl DocumentProcessor {
             &preprocessor_output,
             config,
             &id_gen,
-            provenance,
+            &provenance,
             &pdf_hash,
             &mut profiler,
         )?;
@@ -226,11 +234,14 @@ impl DocumentProcessor {
         }
         println!("⏱️  Total: {:.0}ms", start_time.elapsed().as_millis());
 
-        Ok(graph)
+        Ok((graph, provenance))
     }
 
     /// Simple document processing function using default config (no cache awareness)
-    pub fn process_document(&mut self, input_path: &str) -> Result<DocumentGraph> {
+    pub fn process_document(
+        &mut self,
+        input_path: &str,
+    ) -> Result<(DocumentGraph, ParseProvenance)> {
         let default_config = ParsingConfig::default();
         self.process_document_with_cache(
             input_path,
@@ -246,7 +257,7 @@ impl DocumentProcessor {
         &mut self,
         input_path: &str,
         config_path: &str,
-    ) -> Result<DocumentGraph> {
+    ) -> Result<(DocumentGraph, ParseProvenance)> {
         let config = ParsingConfig::load_from_file(config_path)?;
         self.process_document_with_cache(
             input_path,
@@ -348,7 +359,9 @@ impl DocumentProcessor {
         // (so consumers see post-mutation counts). Breadcrumbs run only
         // after, since they're a derived output, not a sanity input.
         graph.compute_structural_profile();
-        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
+        // Stage-dump path uses the legacy provenance-free build — no
+        // parse-run identity for the evidence artifact stem.
+        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity, None);
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 
@@ -427,7 +440,7 @@ impl DocumentProcessor {
         preprocessor_output: &PreprocessorOutput,
         config: &ParsingConfig,
         id_gen: &NodeIdGenerator,
-        parse_provenance: ParseProvenance,
+        parse_provenance: &ParseProvenance,
         pdf_hash: &str,
         profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
@@ -491,13 +504,14 @@ impl DocumentProcessor {
             project_to_semantic_tree(parsed_elements)
         });
 
-        // Graph construction (deterministic UUIDv5 node IDs)
+        // Graph construction (deterministic UUIDv5 node IDs). Block A:
+        // the builder no longer takes provenance — the graph is content
+        // only; provenance stays a value in this scope and is threaded
+        // where needed (evidence artifact below; emit/serialize by our
+        // caller).
         let mut graph = profiler.time_step("Graph Construction", || {
-            self.graph_builder.build_graph_deterministic(
-                semantic_elements,
-                id_gen,
-                parse_provenance,
-            )
+            self.graph_builder
+                .build_graph_deterministic(semantic_elements, id_gen)
         })?;
 
         // Post-processing: metadata, analysis, breadcrumbs. CR-57: direct
@@ -519,7 +533,7 @@ impl DocumentProcessor {
         // (so consumers see post-mutation counts). Breadcrumbs run only
         // after, since they're a derived output, not a sanity input.
         graph.compute_structural_profile();
-        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity);
+        crate::graphs::graph_sanity::apply(&mut graph, &config.graph_sanity, Some(parse_provenance));
         graph.compute_structural_profile();
         graph.compute_breadcrumbs();
 

@@ -83,7 +83,16 @@ impl DocumentGraph {
         }
     }
 
-    pub fn save_with_format(&self, path: &str, format: &str) -> Result<()> {
+    /// Save in the named output format. `provenance` is threaded
+    /// explicitly (Block A / Amendment M) and only consumed by the
+    /// default graph.json arm, where it lands on the wrapper; the
+    /// sequential/flat shapes carry no parse-run identity.
+    pub fn save_with_format(
+        &self,
+        path: &str,
+        format: &str,
+        provenance: Option<&ParseProvenance>,
+    ) -> Result<()> {
         match format {
             "sequential" => {
                 let sequential = self.to_sequential_format();
@@ -96,7 +105,7 @@ impl DocumentGraph {
                 std::fs::write(path, json)?;
             }
             _ => {
-                self.save_to_json(path)?;
+                self.save_to_json(path, provenance)?;
             }
         }
         Ok(())

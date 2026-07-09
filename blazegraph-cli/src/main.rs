@@ -4,8 +4,8 @@ use std::path::Path;
 
 // Import from blazegraph-io-core
 use blazegraph_io_core::{
-    CacheDefaults, CachePoint, DocumentGraph, DocumentProcessor, FreshFrom, ParsingConfig,
-    PipelineStages,
+    CacheDefaults, CachePoint, DocumentGraph, DocumentProcessor, FreshFrom, ParseProvenance,
+    ParsingConfig, PipelineStages,
 };
 
 /// Default config embedded at compile time — guarantees every install has working defaults.
@@ -428,7 +428,7 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
         &cache_defaults,
         args.profile,
     ) {
-        Ok(graph) => {
+        Ok((graph, provenance)) => {
             println!("✅ Successfully processed document");
             println!("📊 Graph: {} nodes", graph.nodes.len());
 
@@ -436,9 +436,11 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
             // always populates `node.style_info` for library consumers;
             // only the bgraph.md serializer gates emission, threaded
             // through `save_graph` → `EmitOptions::include_style_info`.
+            // Block A: provenance rides beside the graph as a value.
             let output_path = resolve_output_path(&args);
             save_graph(
                 &graph,
+                &provenance,
                 &output_path,
                 &args.output_format,
                 args.include_style_info,
@@ -516,7 +518,7 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
         }
     }
 
-    emit_parsed_graph(&args, result.graph)
+    emit_parsed_graph(&args, result.graph, result.provenance)
 }
 
 // =========================================================================
@@ -542,20 +544,21 @@ fn run_parse_docx(args: ParseArgs) -> Result<()> {
     };
     let result = parse_docx(&bytes, opts).map_err(|e| anyhow!("\n❌ DOCX parse failed: {e}\n"))?;
 
-    let mut graph = result.graph;
+    let graph = result.graph;
+    let mut provenance = result.provenance;
 
     // The lib leaves `source_filename` empty — same convention as the
     // markdown channel; the CLI owns the filename. Overwrite the
-    // provenance's `source_filename` with the input basename.
-    if let Some(prov) = graph.document_info.parse_provenance.as_mut() {
-        prov.source_filename = Path::new(&args.input)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&args.input)
-            .to_string();
-    }
+    // provenance's `source_filename` with the input basename. Block A
+    // bonus: provenance is envelope-only now, so this CLI-side override
+    // can no longer perturb `graph_sha256`.
+    provenance.source_filename = Path::new(&args.input)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&args.input)
+        .to_string();
 
-    emit_parsed_graph(&args, graph)
+    emit_parsed_graph(&args, graph, provenance)
 }
 
 /// Shared emit/output tail for the markdown and DOCX channels: log the
@@ -567,7 +570,11 @@ fn run_parse_docx(args: ParseArgs) -> Result<()> {
 /// canonical graph first, and the emit format is chosen by `-f` alone
 /// (the B6 routing rule). The PDF channel keeps its own success-branch
 /// tail because it carries extra concerns (JVM fast-exit, stage dump).
-fn emit_parsed_graph(args: &ParseArgs, graph: DocumentGraph) -> Result<()> {
+fn emit_parsed_graph(
+    args: &ParseArgs,
+    graph: DocumentGraph,
+    provenance: ParseProvenance,
+) -> Result<()> {
     println!("📊 Graph: {} nodes", graph.nodes.len());
 
     // CR-59 (v2.1.0+): style emission is opt-in. Pipeline keeps
@@ -576,6 +583,7 @@ fn emit_parsed_graph(args: &ParseArgs, graph: DocumentGraph) -> Result<()> {
     let output_path = resolve_output_path(args);
     save_graph(
         &graph,
+        &provenance,
         &output_path,
         &args.output_format,
         args.include_style_info,
@@ -938,7 +946,8 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
 
     // Stage 3: Final graph
     let graph_path = format!("{}/stage3_graph.json", output_dir);
-    stages.graph.save_with_format(&graph_path, "graph")?;
+    // Stage-dump graphs come from the legacy provenance-free build path.
+    stages.graph.save_with_format(&graph_path, "graph", None)?;
     println!("  💾 {} ({} nodes)", graph_path, stages.graph.nodes.len());
 
     // Summary file
@@ -960,6 +969,7 @@ fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
 
 fn save_graph(
     graph: &DocumentGraph,
+    provenance: &ParseProvenance,
     output_path: &str,
     format: &str,
     include_style_info: bool,
@@ -1004,26 +1014,26 @@ fn save_graph(
             };
             let md =
                 blazegraph_io_core::graphs::serialization::markdown::emit_markdown_with_options(
-                    graph, opts,
+                    graph, provenance, opts,
                 );
             std::fs::write(output_path, md)?;
             println!("💾 bgraph.md saved to: {}", output_path);
         }
         "sequential" => {
-            graph.save_with_format(output_path, "sequential")?;
+            graph.save_with_format(output_path, "sequential", Some(provenance))?;
             println!("💾 Sequential format saved to: {}", output_path);
         }
         "flat" => {
-            graph.save_with_format(output_path, "flat")?;
+            graph.save_with_format(output_path, "flat", Some(provenance))?;
             println!("💾 Flat format saved to: {}", output_path);
         }
         "graph" => {
-            graph.save_with_format(output_path, "graph")?;
+            graph.save_with_format(output_path, "graph", Some(provenance))?;
             println!("💾 Graph saved to: {}", output_path);
         }
         other => {
             println!("⚠️  Unknown output format '{other}', using default graph format");
-            graph.save_with_format(output_path, "graph")?;
+            graph.save_with_format(output_path, "graph", Some(provenance))?;
             println!("💾 Graph saved to: {}", output_path);
         }
     }
@@ -1134,7 +1144,6 @@ mod tests {
                 kind: blazegraph_io_core::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
                 outline_data: None,
-                parse_provenance: None,
                 topology: None,
             },
             structural_profile: StructuralProfile::default(),

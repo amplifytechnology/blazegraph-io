@@ -246,6 +246,10 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     // node scoping.
     let id_gen = NodeIdGenerator::new();
 
+    // Block A / Amendment M: the reconstructed provenance rides beside
+    // the graph (on `ParseResult`), never on it — the identity recompute
+    // below hashes the content body only, on both the emit and parse
+    // sides.
     let provenance = ParseProvenance {
         blazegraph_version: doc_level.blazegraph_version.clone(),
         source_format: doc_level.source.format.clone(),
@@ -255,7 +259,7 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     };
 
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(semantic_elements, &id_gen, provenance)
+        .build_graph_deterministic(semantic_elements, &id_gen)
         .map_err(|e| ParseError::MalformedFence(format!("graph build failed: {e}")))?;
 
     // ----- Phase 4: populate fields the builder does not. -----
@@ -320,7 +324,11 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
         }
     }
 
-    Ok(ParseResult { graph, identity })
+    Ok(ParseResult {
+        graph,
+        identity,
+        provenance,
+    })
 }
 
 // =========================================================================
@@ -671,6 +679,24 @@ mod tests {
 
     // --- shared fixture builders --------------------------------------
 
+    /// Synthetic provenance for emit/round-trip tests. Threaded
+    /// explicitly into every emit call (Block A: provenance is an
+    /// argument, not graph state).
+    fn synthetic_provenance() -> ParseProvenance {
+        ParseProvenance {
+            blazegraph_version: "0.6.0".to_string(),
+            source_format: "markdown".to_string(),
+            source_filename: "synthetic.md".to_string(),
+            source_sha256: "synthetic-source-sha".to_string(),
+            config_hash: "synthetic-config-hash".to_string(),
+        }
+    }
+
+    /// Emit with the shared synthetic provenance + default options.
+    fn emit(graph: &DocumentGraph) -> String {
+        emit_markdown(graph, &synthetic_provenance())
+    }
+
     /// Build a synthetic graph for round-trip tests. `nodes_in` is
     /// `(node_type, text, depth, text_order)`. The graph is built via
     /// `GraphBuilder::build_graph_deterministic` so IDs / paths /
@@ -680,13 +706,6 @@ mod tests {
         title: Option<&str>,
         bookmarks: Option<BookmarkData>,
     ) -> DocumentGraph {
-        let provenance = ParseProvenance {
-            blazegraph_version: "0.6.0".to_string(),
-            source_format: "markdown".to_string(),
-            source_filename: "synthetic.md".to_string(),
-            source_sha256: "synthetic-source-sha".to_string(),
-            config_hash: "synthetic-config-hash".to_string(),
-        };
         let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
 
         let elements: Vec<SemanticTreeElement> = nodes_in
@@ -721,7 +740,7 @@ mod tests {
             .collect();
 
         let mut graph = GraphBuilder::new()
-            .build_graph_deterministic(elements, &id_gen, provenance)
+            .build_graph_deterministic(elements, &id_gen)
             .expect("synthetic graph builds");
         graph.document_info.document_metadata.title = title.map(str::to_string);
         graph.document_info.outline_data = bookmarks;
@@ -742,11 +761,12 @@ mod tests {
         // v2.1.0 (CR-56 § I.4): `title` lives in the bgraph-metadata
         // fence, not the doc-level block. Round-trip still recovers it.
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], Some("Title"), None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let info = &result.graph.document_info;
         assert_eq!(info.document_metadata.title.as_deref(), Some("Title"));
-        let prov = info.parse_provenance.as_ref().expect("provenance");
+        // Block A: provenance rides on the ParseResult, not the graph.
+        let prov = &result.provenance;
         assert_eq!(prov.blazegraph_version, "0.6.0");
         assert_eq!(prov.source_format, "markdown");
         assert_eq!(prov.source_filename, "synthetic.md");
@@ -779,7 +799,7 @@ mod tests {
             Some("Doc"),
             Some(bookmarks.clone()),
         );
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses with bookmarks");
         let parsed_bm = result
             .graph
@@ -796,7 +816,7 @@ mod tests {
     #[test]
     fn parse_bookmarks_fence_absent_yields_none_outline_data() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         assert!(result.graph.document_info.outline_data.is_none());
     }
@@ -804,7 +824,7 @@ mod tests {
     #[test]
     fn parse_section_pairs_with_preceding_heading() {
         let graph = build_synthetic_graph(vec![("Section", "Introduction", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         // The Section node should carry "Introduction" as its content.
         let section = result
@@ -819,7 +839,7 @@ mod tests {
     #[test]
     fn parse_paragraph_pairs_with_preceding_text() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Hello world.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let para = result
             .graph
@@ -836,7 +856,7 @@ mod tests {
         // fence, same shape as Paragraph.
         let graph =
             build_synthetic_graph(vec![("Header", "Running header text", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let header = result
             .graph
@@ -900,7 +920,7 @@ mod tests {
         // Build a real bgraph.md, then surgically replace one
         // node_type with garbage so we hit UnknownNodeType.
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let tampered = md.replace("\"node_type\":\"Paragraph\"", "\"node_type\":\"Gibberish\"");
         let result = parse(&tampered, ParseOptions { accept_drift: true });
         assert!(matches!(result, Err(ParseError::UnknownNodeType(_))));
@@ -915,7 +935,7 @@ mod tests {
             None,
             None,
         );
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let para = result
             .graph
@@ -929,7 +949,7 @@ mod tests {
     #[test]
     fn parse_strict_mode_rejects_drift() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Original.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         // Mutate the body so graph_sha256 changes.
         let tampered = md.replace("Original.", "Tampered.");
         let result = parse(&tampered, ParseOptions::default());
@@ -939,7 +959,7 @@ mod tests {
     #[test]
     fn parse_accept_drift_mode_returns_derivative() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Original.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let tampered = md.replace("Original.", "Tampered.");
         let result =
             parse(&tampered, ParseOptions { accept_drift: true }).expect("parses with drift");
@@ -967,7 +987,7 @@ mod tests {
             Some("Doc"),
             None,
         );
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         assert_eq!(canonical(&result.graph), canonical(&original));
@@ -1014,7 +1034,7 @@ mod tests {
             Some("Sample Document"),
             Some(bookmarks),
         );
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         eprintln!("--- BEGIN bgraph.md sample ---");
         eprintln!("{md}");
         eprintln!("--- END bgraph.md sample ---");
@@ -1073,7 +1093,7 @@ mod tests {
         let raw_codeblock = "```rust\nfn main() {}\n```";
         let original =
             build_synthetic_graph(vec![("CodeBlock", raw_codeblock, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         // The reconstructed CodeBlock's body should equal the
@@ -1091,7 +1111,7 @@ mod tests {
     fn parse_list_fence_recovers_multi_item_body() {
         let raw_list = "- one\n- two\n- three";
         let original = build_synthetic_graph(vec![("List", raw_list, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         let list = result
@@ -1107,7 +1127,7 @@ mod tests {
     fn parse_list_fence_handles_nested_indented_continuation() {
         let raw_list = "- top\n  - nested\n  - also nested\n- top two";
         let original = build_synthetic_graph(vec![("List", raw_list, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         let list = result
             .graph
@@ -1123,7 +1143,7 @@ mod tests {
         let raw_quote = "> a quote\n> still quoted";
         let original =
             build_synthetic_graph(vec![("Blockquote", raw_quote, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         let bq = result
             .graph
@@ -1138,7 +1158,7 @@ mod tests {
     fn parse_table_fence_recovers_gfm_body_with_alignment_row() {
         let raw_table = "| h1 | h2 |\n|---|---|\n| a | b |";
         let original = build_synthetic_graph(vec![("Table", raw_table, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         let tbl = result
             .graph
@@ -1158,12 +1178,12 @@ mod tests {
         let raw_table = "| col a | col b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
         let original =
             build_synthetic_graph(vec![("Table", raw_table, 1, 0)], Some("CR-79 Table"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("table node round-trips");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         assert_eq!(canonical(&result.graph), canonical(&original));
         // Second emit is byte-identical (idempotent emit on a parsed graph).
-        let md2 = emit_markdown(&result.graph);
+        let md2 = emit_markdown(&result.graph, &result.provenance);
         assert_eq!(md, md2, "second emit must be byte-identical");
     }
 
@@ -1199,7 +1219,7 @@ mod tests {
 
         // Round-trip: the escaped body lets the scanner see only the
         // real bgraph-paragraph fence as a fence open.
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default())
             .expect("self-referential paragraph round-trips cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
@@ -1221,13 +1241,13 @@ mod tests {
             None,
         );
         original.document_info.topology = Some("stream".to_string());
-        let md1 = emit_markdown(&original);
+        let md1 = emit(&original);
         let result = parse(&md1, ParseOptions::default()).expect("round-trips");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         let info = &result.graph.document_info;
         assert_eq!(info.topology.as_deref(), Some("stream"));
         // Second emit must be byte-identical to the first.
-        let md2 = emit_markdown(&result.graph);
+        let md2 = emit_markdown(&result.graph, &result.provenance);
         assert_eq!(md1, md2, "second emit must be byte-identical to the first");
     }
 
@@ -1245,7 +1265,7 @@ mod tests {
         // as a fence, but the dispatch arm in `parse` no longer accepts
         // it and falls through to MalformedFence).
         let base = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&base);
+        let md = emit(&base);
         // Splice a `bgraph-message` fence into a synthetic shape. Use a
         // hand-built fence with the minimum JSON the parser would have
         // tried to dispatch on.
@@ -1264,7 +1284,7 @@ mod tests {
         // A bgraph.md without `topology` parses cleanly; the
         // reconstructed graph carries `None`.
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let info = &result.graph.document_info;
         assert!(info.topology.is_none());
@@ -1287,7 +1307,7 @@ mod tests {
             Some("Mixed"),
             None,
         );
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         assert_eq!(canonical(&result.graph), canonical(&original));

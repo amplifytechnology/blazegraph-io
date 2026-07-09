@@ -12,7 +12,7 @@
 
 use crate::config::SectionPruneConfig;
 use crate::graphs::detectors::SectionEvidence;
-use crate::types::{DocumentGraph, NodeId};
+use crate::types::{DocumentGraph, NodeId, ParseProvenance};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -58,6 +58,7 @@ pub fn prune_sections(
     evidence: &SectionEvidence,
     report: &mut crate::graphs::graph_sanity::SanityReport,
     cfg: &SectionPruneConfig,
+    provenance: Option<&ParseProvenance>,
 ) {
     let mut bad_fonts: Vec<String> = evidence.bad_fonts.iter().cloned().collect();
     bad_fonts.sort();
@@ -66,7 +67,7 @@ pub fn prune_sections(
     // Debug artifact reflects the observed flagged set (emitted pre-demotion —
     // node_type isn't part of it). Default off; never part of bgraph.
     if cfg.emit_evidence_artifact {
-        if let Err(e) = emit_evidence_artifact(graph, evidence) {
+        if let Err(e) = emit_evidence_artifact(graph, evidence, provenance) {
             eprintln!("⚠️  CR-71: failed to write evidence artifact: {e}");
         }
     }
@@ -127,17 +128,18 @@ struct EvidenceArtifact {
 ///
 /// PATH CONVENTION (a flagged fork — see the CR-71A report): `graph_sanity::apply`
 /// has access to neither the storage handle nor the cache dir / pdf hash (and
-/// the CR forbids a `processor.rs` change to thread them in). So the artifact is
-/// derived from what the graph itself carries: the cache root is taken from
-/// `BLAZEGRAPH_CACHE_DIR` (the same env var the CLI / sb_eval.sh use), defaulting
-/// to `cache`, and the filename stem from `document_info.parse_provenance
-/// .source_filename`. Result: `{cache}/evidence/<source-stem>.evidence.json`,
+/// the CR forbids a `processor.rs` change to thread them in). So: the cache root
+/// is taken from `BLAZEGRAPH_CACHE_DIR` (the same env var the CLI / sb_eval.sh
+/// use), defaulting to `cache`, and the filename stem from the threaded-in
+/// `ParseProvenance.source_filename` (Block A moved provenance off the graph;
+/// it now arrives as an explicit argument). Result: `{cache}/evidence/<source-stem>.evidence.json`,
 /// a separate file landing next to the `cache/` tree the Python prototype reads.
 /// When no provenance is present (legacy/MD graphs), the source hash or a fixed
 /// `unknown` stem is used. Never part of bgraph.
 fn emit_evidence_artifact(
     graph: &DocumentGraph,
     evidence: &SectionEvidence,
+    provenance: Option<&ParseProvenance>,
 ) -> std::io::Result<()> {
     // Stable, deterministic ordering of flagged sections (by text_order).
     let mut flagged: Vec<(NodeId, u32)> = evidence
@@ -184,7 +186,7 @@ fn emit_evidence_artifact(
     let cache_root = std::env::var("BLAZEGRAPH_CACHE_DIR").unwrap_or_else(|_| "cache".to_string());
     let dir = format!("{cache_root}/evidence");
     std::fs::create_dir_all(&dir)?;
-    let stem = doc_stem(graph);
+    let stem = doc_stem(provenance);
     let path = format!("{dir}/{stem}.evidence.json");
     let json = serde_json::to_string_pretty(&artifact).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
@@ -192,11 +194,11 @@ fn emit_evidence_artifact(
     Ok(())
 }
 
-/// File stem for the evidence artifact, derived from provenance. Prefers the
+/// File stem for the evidence artifact, derived from provenance (threaded
+/// in by the caller — Block A moved provenance off the graph). Prefers the
 /// source filename (basename without extension), then the source hash, then a
 /// fixed `unknown`. Sanitized to a filesystem-safe token.
-fn doc_stem(graph: &DocumentGraph) -> String {
-    let prov = graph.document_info.parse_provenance.as_ref();
+fn doc_stem(prov: Option<&ParseProvenance>) -> String {
     let raw = prov
         .map(|p| {
             // Strip directory + a single trailing extension from the filename.
@@ -364,7 +366,7 @@ mod tests {
             emit_evidence_artifact: false,
         };
 
-        prune_sections(&mut graph, &evidence, &mut report, &cfg);
+        prune_sections(&mut graph, &evidence, &mut report, &cfg, None);
 
         let after = serde_json::to_string(&graph).unwrap();
         assert_eq!(before, after, "no-op prune must not change the graph");
@@ -397,7 +399,7 @@ mod tests {
             emit_evidence_artifact: false,
         };
 
-        prune_sections(&mut graph, &evidence, &mut report, &cfg);
+        prune_sections(&mut graph, &evidence, &mut report, &cfg, None);
 
         // geo + font >= 2 demotes FLOPS; the main-font Times headers stay.
         assert_eq!(

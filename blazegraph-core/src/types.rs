@@ -72,20 +72,14 @@ pub struct DocumentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outline_data: Option<BookmarkData>,
 
-    /// Origin of this graph — the (version, source, config) triple that
-    /// reproduces it. Persisted on the graph so the bgraph.md emitter
-    /// (and any future round-trip consumer) has the load-bearing
-    /// identity inputs without re-deriving them.
-    ///
-    /// `None` for legacy graphs loaded from pre-0.6.0 graph.json files
-    /// and for graphs built via the legacy `GraphBuilder::build_graph`
-    /// path (random UUIDv4 IDs, no hash inputs anyway).
-    /// `Some(_)` for any graph built fresh through
-    /// `GraphBuilder::build_graph_deterministic`.
-    /// Schema 0.6.0 (B2 of MD+DOCX flow).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parse_provenance: Option<ParseProvenance>,
-
+    // Schema 0.8.0 (Block A / Amendment M): `parse_provenance` no longer
+    // lives here. Provenance is *about the parse run*, not *of the
+    // document* (content-not-provenance rule, arch-14 §3.1) — keeping it
+    // on `DocumentInfo` put it inside `canonical_json(&DocumentGraph)`
+    // and thus inside `graph_sha256`, so every build/config change
+    // churned identity without the content changing. It now rides on
+    // `SortedDocumentGraph` (the on-disk wrapper) and is threaded as an
+    // explicit value through the emit/serialize paths.
     /// Parsing-semantics signal. Bgraph.md v2.1.0+ (CR-49):
     ///
     /// - `"tree"` — spacelike content (documents, notes, derived corpus.md
@@ -239,6 +233,17 @@ pub struct SortedDocumentGraph {
     /// sentinel rather than the misleading `Utc::now()`.
     #[serde(default = "default_created_at")]
     pub created_at: DateTime<Utc>,
+    /// Origin of this graph — the (version, source, config) triple that
+    /// reproduces it. Lives on the wrapper (not on `DocumentGraph`) so
+    /// it stays *outside* `canonical_json` / `graph_sha256`: provenance
+    /// is about the parse run, not of the document (content-not-
+    /// provenance rule — Block A / Amendment M, schema 0.8.0). Threaded
+    /// as an explicit value from the build/parse path via
+    /// `to_sorted_graph`. `#[serde(default)]` keeps pre-0.8.0 fixtures
+    /// (which carried it on `document_info`) loadable — the stale copy
+    /// inside `document_info` is silently dropped as an unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_provenance: Option<ParseProvenance>,
     pub nodes: Vec<DocumentNode>,
     pub document_info: DocumentInfo,
     pub structural_profile: StructuralProfile,

@@ -7,7 +7,7 @@
 //!
 //! Wire-format definition: `docs/P2/core/architecture/08-bgraph-md-format.md`.
 
-use crate::types::DocumentGraph;
+use crate::types::{DocumentGraph, ParseProvenance};
 
 /// Options controlling markdown parse behavior.
 ///
@@ -38,6 +38,13 @@ pub struct ParseResult {
     pub graph: DocumentGraph,
     /// Round-trip identity status for this parse.
     pub identity: ParseIdentity,
+    /// The parse-run provenance for this graph (Block A / Amendment M):
+    /// reconstructed from the doc-level envelope block (bgraph.md) or
+    /// derived from the source bytes (generic md / DOCX). Rides beside
+    /// the graph, never on it — `DocumentGraph` is the canonical-hash
+    /// input and carries content only. Consumers thread this into
+    /// `emit_markdown` / `to_sorted_graph`.
+    pub provenance: ParseProvenance,
 }
 
 /// Round-trip identity status for a parsed graph.

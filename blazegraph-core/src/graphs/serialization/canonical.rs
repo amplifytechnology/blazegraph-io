@@ -39,11 +39,16 @@ use sha2::{Digest, Sha256};
 /// `serde_json::Value`, then walk the `Value` tree producing JSON with
 /// object keys sorted lexicographically.
 ///
-/// Note: `parse_provenance` is a sub-object inside `document_info` and
-/// is included in the canonical output. The bgraph.md `graph_sha256`
-/// field is *not* part of `DocumentGraph` (it's only stamped into the
-/// emitted markdown's document-level block), so canonical_json has no
-/// per-field exclusion list.
+/// Content-body invariant (Block A / Amendment M, arch-14 §3.1):
+/// `DocumentGraph` *is* the content body — provenance, derived
+/// aggregates (`structural_profile`), and envelope fields
+/// (`graph_sha256` itself, `schema_version`, `created_at`) live on the
+/// `SortedDocumentGraph` wrapper or are threaded as explicit values,
+/// never on this type. The body is hashed whole: canonical_json has no
+/// per-field exclusion list, and must never grow one — a field stored
+/// in the body but excluded from the hash would break `bytes ==
+/// identity` for every content-addressed consumer downstream (the
+/// CAS/URD composability argument, arch-11).
 pub fn canonical_json(graph: &DocumentGraph) -> String {
     let value = serde_json::to_value(graph).expect("DocumentGraph is always JSON-serializable");
     let mut out = String::new();
@@ -181,13 +186,6 @@ mod tests {
                 kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
                 outline_data: None,
-                parse_provenance: Some(ParseProvenance {
-                    blazegraph_version: "0.6.0".to_string(),
-                    source_format: "markdown".to_string(),
-                    source_filename: "synthetic.md".to_string(),
-                    source_sha256: format!("{seed}-src"),
-                    config_hash: format!("{seed}-cfg"),
-                }),
                 topology: None,
             },
             structural_profile: StructuralProfile::default(),
@@ -241,7 +239,7 @@ mod tests {
         // Spot-check: in canonical output the document_info object's
         // first key must be the lex-smallest of its present keys.
         // Without outline_data (skip_serializing_if = None), the
-        // present keys are: document_metadata, parse_provenance, root_id
+        // present keys are: document_metadata, kind, root_id
         // → smallest is "document_metadata".
         let graph = build_minimal_graph("seed");
         let canonical = canonical_json(&graph);

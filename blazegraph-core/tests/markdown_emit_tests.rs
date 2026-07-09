@@ -16,10 +16,19 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_fixtures/snapshots")
 }
 
-/// Load a stage3 fixture, augmenting it with synthetic
-/// `parse_provenance` so the emitter can run. Pre-0.6.0 fixtures lack
-/// the field; the additive serde-default keeps deserialization clean,
-/// but the emitter requires Some(_) at emit time.
+/// Synthetic provenance so the emitter can run against fixtures (Block
+/// A: provenance is an explicit emit argument, not graph state).
+fn fixture_provenance(name: &str) -> ParseProvenance {
+    ParseProvenance {
+        blazegraph_version: "0.6.0-test".to_string(),
+        source_format: "pdf".to_string(),
+        source_filename: format!("{name}.pdf"),
+        source_sha256: format!("test-source-sha-{name}"),
+        config_hash: "test-config-hash".to_string(),
+    }
+}
+
+/// Load a stage3 fixture.
 fn load_fixture_graph(name: &str) -> (DocumentGraph, Value) {
     let path = fixtures_dir().join(name).join("stage3_graph.json");
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| {
@@ -38,16 +47,7 @@ fn load_fixture_graph(name: &str) -> (DocumentGraph, Value) {
     for node in sorted.nodes {
         nodes.insert(node.id, node);
     }
-    let mut document_info = sorted.document_info;
-    // Synthesize a provenance triple from fixture-stable data so the
-    // emitter has something deterministic to embed.
-    document_info.parse_provenance = Some(ParseProvenance {
-        blazegraph_version: "0.6.0-test".to_string(),
-        source_format: "pdf".to_string(),
-        source_filename: format!("{name}.pdf"),
-        source_sha256: format!("test-source-sha-{name}"),
-        config_hash: "test-config-hash".to_string(),
-    });
+    let document_info = sorted.document_info;
     let graph = DocumentGraph {
         nodes,
         document_info,
@@ -59,7 +59,7 @@ fn load_fixture_graph(name: &str) -> (DocumentGraph, Value) {
 #[test]
 fn emit_matches_node_counts_for_shannon_fixture() {
     let (graph, raw) = load_fixture_graph("claude_shannon_paper");
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &fixture_provenance("claude_shannon_paper"));
 
     // First line should be the document-level fence open.
     let first_line = md.lines().next().expect("non-empty output");

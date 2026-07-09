@@ -29,18 +29,23 @@ fn fixtures_dir() -> PathBuf {
 /// Build a synthetic graph through the same path the PDF channel uses,
 /// so its IDs / paths / breadcrumbs match what the reverse parser
 /// derives.
-fn build_synthetic_graph(
-    nodes_in: Vec<(&str, &str, u32, u32)>,
-    title: Option<&str>,
-    bookmarks: Option<BookmarkData>,
-) -> DocumentGraph {
-    let provenance = ParseProvenance {
+/// Synthetic provenance for emit calls (Block A: provenance is an
+/// explicit emit argument, not graph state).
+fn synthetic_provenance() -> ParseProvenance {
+    ParseProvenance {
         blazegraph_version: "0.6.0-roundtrip".to_string(),
         source_format: "markdown".to_string(),
         source_filename: "roundtrip.md".to_string(),
         source_sha256: "roundtrip-source-sha".to_string(),
         config_hash: "roundtrip-config-hash".to_string(),
-    };
+    }
+}
+
+fn build_synthetic_graph(
+    nodes_in: Vec<(&str, &str, u32, u32)>,
+    title: Option<&str>,
+    bookmarks: Option<BookmarkData>,
+) -> DocumentGraph {
     let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
     let elements: Vec<SemanticTreeElement> = nodes_in
         .iter()
@@ -68,7 +73,7 @@ fn build_synthetic_graph(
         })
         .collect();
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(elements, &id_gen, provenance)
+        .build_graph_deterministic(elements, &id_gen)
         .expect("synthetic graph builds");
     graph.document_info.document_metadata.title = title.map(str::to_string);
     graph.document_info.outline_data = bookmarks;
@@ -93,6 +98,16 @@ fn build_synthetic_graph(
 /// once before emit, we get a fair comparison: the canonical bytes of
 /// the rebuilt original are byte-for-byte the canonical bytes of the
 /// parsed reconstruction.
+fn fixture_provenance(name: &str) -> ParseProvenance {
+    ParseProvenance {
+        blazegraph_version: "0.6.0-test".to_string(),
+        source_format: "pdf".to_string(),
+        source_filename: format!("{name}.pdf"),
+        source_sha256: format!("test-source-sha-{name}"),
+        config_hash: "test-config-hash".to_string(),
+    }
+}
+
 fn load_fixture_graph(name: &str) -> DocumentGraph {
     let path = fixtures_dir().join(name).join("stage3_graph.json");
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| {
@@ -146,17 +161,10 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
         })
         .collect();
 
-    let provenance = ParseProvenance {
-        blazegraph_version: "0.6.0-test".to_string(),
-        source_format: "pdf".to_string(),
-        source_filename: format!("{name}.pdf"),
-        source_sha256: format!("test-source-sha-{name}"),
-        config_hash: "test-config-hash".to_string(),
-    };
     let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
 
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(elements, &id_gen, provenance)
+        .build_graph_deterministic(elements, &id_gen)
         .expect("fixture graph rebuilds deterministically");
 
     // Carry over the fixture's *title* and bookmarks and flow_type.
@@ -184,8 +192,11 @@ fn load_fixture_graph(name: &str) -> DocumentGraph {
 
 /// Round-trip the graph and assert canonical-byte equality.
 /// Returns the parsed graph on success.
-fn assert_roundtrip_identity(graph: &DocumentGraph) -> DocumentGraph {
-    let md = emit_markdown(graph);
+fn assert_roundtrip_identity(
+    graph: &DocumentGraph,
+    provenance: &ParseProvenance,
+) -> DocumentGraph {
+    let md = emit_markdown(graph, provenance);
     // Run with `accept_drift = true` so a hash mismatch produces a
     // canonical-bytes diff (more useful than a bare HashMismatch
     // error). The post-assertions still enforce `Verified` identity
@@ -244,7 +255,7 @@ fn roundtrip_identity_synthetic_small() {
         Some("Synthetic Test Doc"),
         None,
     );
-    assert_roundtrip_identity(&original);
+    assert_roundtrip_identity(&original, &synthetic_provenance());
 }
 
 #[test]
@@ -275,7 +286,7 @@ fn roundtrip_identity_confidence_field_survives() {
     // `assert_roundtrip_identity` asserts graph_sha256(original) ==
     // graph_sha256(parsed); the embedded confidence is part of the canonical
     // hash, so a Verified identity already proves the field survived.
-    let parsed = assert_roundtrip_identity(&original);
+    let parsed = assert_roundtrip_identity(&original, &synthetic_provenance());
 
     // Spot-check the value directly: the parsed Section keeps confidence 7;
     // the Paragraph stays 0 (omitted from the wire, defaulted on parse).
@@ -325,7 +336,7 @@ fn roundtrip_identity_synthetic_with_bookmarks() {
         Some(bookmarks.clone()),
     );
 
-    let parsed = assert_roundtrip_identity(&original);
+    let parsed = assert_roundtrip_identity(&original, &synthetic_provenance());
     // Spot-check: outline_data round-tripped through the
     // `bgraph-outline` fence.
     let parsed_bm = parsed
@@ -358,7 +369,7 @@ fn roundtrip_identity_synthetic_nested_sections() {
         Some("Nested Test"),
         None,
     );
-    assert_roundtrip_identity(&original);
+    assert_roundtrip_identity(&original, &synthetic_provenance());
 }
 
 #[test]
@@ -367,7 +378,7 @@ fn empty_graph_emits_and_parses() {
     // nodes. The emitter writes just the doc-level block; the parser
     // must reconstruct an equivalent root-only graph.
     let original = build_synthetic_graph(vec![], None, None);
-    assert_roundtrip_identity(&original);
+    assert_roundtrip_identity(&original, &synthetic_provenance());
 }
 
 #[test]
@@ -391,7 +402,7 @@ fn code_block_in_body_round_trips() {
     // mutating the source `text` field, which we'd do once the rules
     // engine starts producing such content. For now the regression
     // shield is that a plain paragraph round-trips cleanly.)
-    assert_roundtrip_identity(&original);
+    assert_roundtrip_identity(&original, &synthetic_provenance());
 }
 
 // =========================================================================
@@ -401,7 +412,7 @@ fn code_block_in_body_round_trips() {
 #[test]
 fn drift_detection_strict_errors() {
     let original = build_synthetic_graph(vec![("Paragraph", "Original body.", 1, 0)], None, None);
-    let md = emit_markdown(&original);
+    let md = emit_markdown(&original, &synthetic_provenance());
     // Mutate the body. Note: the JSON metadata still says
     // token_count = 2 (matching the original), so the recomputed
     // canonical bytes diverge only by content.text. The recomputed
@@ -417,7 +428,7 @@ fn drift_detection_strict_errors() {
 #[test]
 fn drift_detection_accept_drift_returns_derivative() {
     let original = build_synthetic_graph(vec![("Paragraph", "Original body.", 1, 0)], None, None);
-    let md = emit_markdown(&original);
+    let md = emit_markdown(&original, &synthetic_provenance());
     let original_hash = graph_sha256(&original);
     let tampered = md.replace("Original body.", "Tampered body.");
 
@@ -481,7 +492,7 @@ fn roundtrip_identity_shannon_fixture() {
     // parser will derive. The round-trip then verifies canonical-byte
     // identity end-to-end on a real-shape graph (94 body nodes).
     let original = load_fixture_graph("claude_shannon_paper");
-    assert_roundtrip_identity(&original);
+    assert_roundtrip_identity(&original, &fixture_provenance("claude_shannon_paper"));
 }
 
 #[test]
@@ -489,7 +500,7 @@ fn roundtrip_identity_euclid_fixture() {
     // 389 body nodes — larger stress test for the line-scan + builder
     // pipeline.
     let original = load_fixture_graph("elements_of_euclid");
-    assert_roundtrip_identity(&original);
+    assert_roundtrip_identity(&original, &fixture_provenance("elements_of_euclid"));
 }
 
 // =========================================================================
@@ -502,7 +513,7 @@ fn bgraph_md_parse_direct_entry_point_works() {
     // detection. Exercising it covers the case where a caller knows
     // the input is bgraph.md.
     let original = build_synthetic_graph(vec![("Paragraph", "Hello.", 1, 0)], None, None);
-    let md = emit_markdown(&original);
+    let md = emit_markdown(&original, &synthetic_provenance());
     let result = bgraph_md::parse(&md, ParseOptions::default()).expect("parses");
     assert!(matches!(result.identity, ParseIdentity::Verified));
     assert_eq!(canonical_json(&original), canonical_json(&result.graph));

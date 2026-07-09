@@ -39,15 +39,15 @@ impl GraphBuilder {
     /// within-document uniqueness, and folding it in would couple every
     /// node ID to the title — an edit that should be document-level only).
     ///
-    /// `parse_provenance` is persisted on
-    /// `graph.document_info.parse_provenance` so downstream consumers
-    /// (notably the bgraph.md emitter) can reproduce the graph and
-    /// emit round-trippable identity fields without re-deriving them.
+    /// Provenance is deliberately **not** a parameter and **not**
+    /// stamped onto the graph (Block A / Amendment M): `DocumentGraph`
+    /// is the canonical-hash input and carries only content. The build
+    /// path holds its `ParseProvenance` as a plain value and threads it
+    /// explicitly into the emit/serialize calls that need it.
     pub fn build_graph_deterministic(
         &self,
         elements: Vec<SemanticTreeElement>,
         id_gen: &NodeIdGenerator,
-        parse_provenance: ParseProvenance,
     ) -> Result<DocumentGraph> {
         eprintln!(
             "🏗️  Building document graph from {} elements",
@@ -212,11 +212,6 @@ impl GraphBuilder {
         // Update structural profile node count
         graph.structural_profile.total_nodes = graph.nodes.len();
         graph.structural_profile.document_type = DocumentType::Generic;
-
-        // Persist origin so the bgraph.md emitter (B2) and any future
-        // round-trip consumer can reproduce the graph deterministically
-        // without re-reading the source bytes.
-        graph.document_info.parse_provenance = Some(parse_provenance);
 
         eprintln!("✅ Graph built: {} nodes", graph.nodes.len());
 

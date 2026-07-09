@@ -162,7 +162,7 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     // 5. Build the graph. The builder asserts `text_order == vec position`;
     //    we satisfied that in `walk_body` by pushing in order.
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(elements, &id_gen, provenance)
+        .build_graph_deterministic(elements, &id_gen)
         .map_err(|e| ParseError::MalformedDocx(format!("graph build failed: {e}")))?;
 
     // 6. Populate fields the builder doesn't. DOCX is reflowable — no
@@ -189,6 +189,9 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     Ok(ParseResult {
         graph,
         identity: ParseIdentity::Verified,
+        // Block A / Amendment M: provenance rides beside the graph,
+        // never on it.
+        provenance,
     })
 }
 
@@ -1629,11 +1632,10 @@ mod tests {
                 n.id
             );
         }
-        let prov = graph
-            .document_info
-            .parse_provenance
-            .as_ref()
-            .expect("provenance present");
+        // Block A: provenance rides on the ParseResult, not the graph.
+        let result = parse_docx(&fixture_bytes("structured.docx"), ParseOptions::default())
+            .expect("fixture parses");
+        let prov = &result.provenance;
         assert_eq!(prov.source_format, "docx");
         assert_eq!(prov.config_hash, "none");
         let expected = sha256_hex(&fixture_bytes("structured.docx"));
@@ -2251,8 +2253,9 @@ mod tests {
         use crate::preprocessors::md::strip::strip;
         use crate::preprocessors::md::types::StripMode;
 
-        let graph = parse_fixture("with_headers.docx");
-        let md = emit_markdown(&graph);
+        let result = parse_docx(&fixture_bytes("with_headers.docx"), ParseOptions::default())
+            .expect("fixture parses");
+        let md = emit_markdown(&result.graph, &result.provenance);
         // The bgraph.md emitter tags chrome nodes with the strippable fences.
         assert!(
             md.contains("```bgraph-header"),
