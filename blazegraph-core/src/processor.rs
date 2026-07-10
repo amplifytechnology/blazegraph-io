@@ -575,8 +575,11 @@ impl DocumentProcessor {
         let rekeyed = profiler.time_step("Node ID Re-key (post-sanity)", || {
             crate::graphs::builder::rekey_node_ids(&mut graph)
         });
-        if rekeyed > 0 {
-            println!("🔑 CR-84: {rekeyed} node IDs re-keyed to post-sanity topology");
+        if rekeyed.ids_moved > 0 || rekeyed.paths_moved > 0 {
+            println!(
+                "🔑 CR-84: finalized to post-sanity topology — {} node IDs re-keyed, {} paths re-derived",
+                rekeyed.ids_moved, rekeyed.paths_moved
+            );
         }
 
         Ok(graph)

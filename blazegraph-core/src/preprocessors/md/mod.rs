@@ -108,10 +108,13 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// derivation walk in `graphs::builder`), so the emitted IDs equal
 /// what the reverse parser re-derives from the emitted tree — the
 /// round-trip contract CR-83 promised but sanity-mutated (PDF)
-/// documents violated. **Node-canon impact:** IDs move *only* for
-/// documents where `graph_sanity` mutated topology (PDF rebalance /
-/// demotions); MD, DOCX, and clean PDFs emit byte-identical IDs v4→v5
-/// (the re-key is idempotent on settled topology). Also: per-element
+/// documents violated. The same pass finalizes `location.semantic.path`
+/// (the other build-time structural derivation sanity mutated out from
+/// under — hashed content, so it must be derivable too). **Node-canon
+/// impact:** IDs move *only* for documents where `graph_sanity` mutated
+/// topology (PDF rebalance / demotions); MD, DOCX, and clean PDFs emit
+/// byte-identical IDs v4→v5 (the re-key is idempotent on settled
+/// topology). Also: per-element
 /// `internal_refs` / `external_refs` are now retained on reverse parse
 /// (they were parse-and-dropped; always in the forward hash — a
 /// faithfulness fix riding this bump). The walk algorithm is

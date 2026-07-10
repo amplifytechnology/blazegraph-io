@@ -535,11 +535,23 @@ fn derive_walk_ids<'a>(rows: impl Iterator<Item = IdWalkRow<'a>>) -> Vec<NodeId>
 /// document title (a document-constant that is intentionally not part of
 /// the ID key — see the note on `build_graph_deterministic`).
 ///
-/// Idempotent: on a graph whose IDs already match its settled topology
-/// (MD/DOCX builds, clean PDFs, an already-re-keyed graph) the walk
-/// reproduces the same IDs and the pass is a no-op. Returns the number
-/// of node IDs that moved (0 for the no-op case).
-pub fn rekey_node_ids(graph: &mut DocumentGraph) -> usize {
+/// **Also finalizes `location.semantic.path`** (CR-84, found during
+/// implementation): `path` is the *other* build-time structural
+/// derivation (1-based child index joined by `.`) that `graph_sanity`
+/// mutates out from under — on attention.pdf, 103 stored paths diverged
+/// from what the reverse parse re-derives, independently of the 89 IDs
+/// (pre-existing at v4, masked by the ID divergence in the Block A
+/// diagnosis). It is hashed content, so the round-trip contract requires
+/// it derivable from the emitted structure too. Recomputed top-down from
+/// the settled tree with the builder's exact rule; runs unconditionally
+/// (paths can shift even when no ID moves — sibling index shifts).
+///
+/// Idempotent: on a graph whose IDs and paths already match its settled
+/// topology (MD/DOCX builds, clean PDFs, an already-re-keyed graph) the
+/// walk reproduces the same values and the pass is a no-op. Returns the
+/// number of node IDs and stored paths that moved (both 0 for the no-op
+/// case).
+pub fn rekey_node_ids(graph: &mut DocumentGraph) -> RekeyOutcome {
     // Project the settled graph into the walk's row order: body nodes
     // (text_order = Some) ascending. The Document root (text_order =
     // None) is not walked — its ID is the node-set fingerprint (DT-10).
@@ -566,36 +578,85 @@ pub fn rekey_node_ids(graph: &mut DocumentGraph) -> usize {
         .collect();
     mapping.insert(old_root, new_root);
 
-    let moved = mapping.iter().filter(|(old, new)| old != new).count();
-    if moved == 0 {
-        return 0;
-    }
+    let ids_moved = mapping.iter().filter(|(old, new)| old != new).count();
+    if ids_moved > 0 {
+        let remap = |id: &NodeId| -> NodeId {
+            *mapping
+                .get(id)
+                .unwrap_or_else(|| panic!("rekey_node_ids: dangling node reference {id}"))
+        };
 
-    let remap = |id: &NodeId| -> NodeId {
-        *mapping
-            .get(id)
-            .unwrap_or_else(|| panic!("rekey_node_ids: dangling node reference {id}"))
-    };
-
-    let old_nodes = std::mem::take(&mut graph.nodes);
-    let mut new_nodes: std::collections::HashMap<NodeId, DocumentNode> =
-        std::collections::HashMap::with_capacity(old_nodes.len());
-    for (old_id, mut node) in old_nodes {
-        node.id = remap(&old_id);
-        node.parent = node.parent.as_ref().map(&remap);
-        for child in node.children.iter_mut() {
-            *child = remap(child);
+        let old_nodes = std::mem::take(&mut graph.nodes);
+        let mut new_nodes: std::collections::HashMap<NodeId, DocumentNode> =
+            std::collections::HashMap::with_capacity(old_nodes.len());
+        for (old_id, mut node) in old_nodes {
+            node.id = remap(&old_id);
+            node.parent = node.parent.as_ref().map(&remap);
+            for child in node.children.iter_mut() {
+                *child = remap(child);
+            }
+            let clobbered = new_nodes.insert(node.id, node);
+            debug_assert!(
+                clobbered.is_none(),
+                "rekey_node_ids: two nodes remapped onto one ID — the occurrence \
+                 ledger guarantees walk-unique IDs, so this is a bug"
+            );
         }
-        let clobbered = new_nodes.insert(node.id, node);
-        debug_assert!(
-            clobbered.is_none(),
-            "rekey_node_ids: two nodes remapped onto one ID — the occurrence \
-             ledger guarantees walk-unique IDs, so this is a bug"
-        );
+        graph.nodes = new_nodes;
+        graph.document_info.root_id = new_root;
     }
-    graph.nodes = new_nodes;
-    graph.document_info.root_id = new_root;
-    moved
+
+    let paths_moved = finalize_paths(graph);
+    RekeyOutcome {
+        ids_moved,
+        paths_moved,
+    }
+}
+
+/// What [`rekey_node_ids`] did: how many node IDs were re-keyed and how
+/// many stored `location.semantic.path` values were re-derived. Both `0`
+/// ⇔ the graph's topology was already settled (the idempotent no-op).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RekeyOutcome {
+    pub ids_moved: usize,
+    pub paths_moved: usize,
+}
+
+/// CR-84: re-derive every node's `location.semantic.path` from the
+/// settled tree, using the builder's exact rule
+/// (`generate_hierarchical_path`): a node's path is its parent's path
+/// plus `.` plus its 1-based index among the parent's children (root
+/// children are the bare index; the Document root keeps its empty
+/// path). Returns how many stored paths changed.
+fn finalize_paths(graph: &mut DocumentGraph) -> usize {
+    let root_id = graph.document_info.root_id;
+    let mut changed = 0usize;
+    let mut queue: std::collections::VecDeque<(NodeId, String)> = graph
+        .nodes
+        .get(&root_id)
+        .map(|root| {
+            root.children
+                .iter()
+                .enumerate()
+                .map(|(i, child)| (*child, format!("{}", i + 1)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    while let Some((id, path)) = queue.pop_front() {
+        let Some(node) = graph.nodes.get_mut(&id) else {
+            debug_assert!(false, "finalize_paths: dangling child reference {id}");
+            continue;
+        };
+        if node.location.semantic.path != path {
+            node.location.semantic.path = path.clone();
+            changed += 1;
+        }
+        for (i, child) in node.children.iter().enumerate() {
+            queue.push_back((*child, format!("{path}.{}", i + 1)));
+        }
+    }
+    changed
 }
 
 /// Map `SemanticElementType` to the string the serialized graph carries
@@ -670,11 +731,22 @@ mod tests {
             .collect()
     }
 
+    /// `text_order → semantic path` — for the path-finalize assertions.
+    fn paths_by_order(g: &DocumentGraph) -> std::collections::HashMap<u32, String> {
+        g.nodes
+            .values()
+            .filter_map(|n| {
+                n.text_order
+                    .map(|t| (t, n.location.semantic.path.clone()))
+            })
+            .collect()
+    }
+
     /// CR-84 idempotence: on a graph whose topology is exactly what the
     /// builder produced (the settled case — MD/DOCX, clean PDFs, and the
-    /// reverse-parse path), the re-key derives identical IDs and is a
-    /// no-op. This is the property that bounds the v5 node-canon impact
-    /// to sanity-mutated documents.
+    /// reverse-parse path), the re-key derives identical IDs and paths
+    /// and is a no-op. This is the property that bounds the v5
+    /// node-canon impact to sanity-mutated documents.
     #[test]
     fn rekey_is_noop_on_settled_topology() {
         let mut g = build(&[
@@ -684,12 +756,15 @@ mod tests {
             ("Paragraph", "World.", 2),
         ]);
         let before_ids = ids_by_order(&g);
+        let before_paths = paths_by_order(&g);
         let before_root = g.document_info.root_id;
 
-        let moved = rekey_node_ids(&mut g);
+        let outcome = rekey_node_ids(&mut g);
 
-        assert_eq!(moved, 0, "settled topology must re-key as a no-op");
+        assert_eq!(outcome.ids_moved, 0, "settled topology: no ID moves");
+        assert_eq!(outcome.paths_moved, 0, "settled topology: no path moves");
         assert_eq!(ids_by_order(&g), before_ids);
+        assert_eq!(paths_by_order(&g), before_paths);
         assert_eq!(g.document_info.root_id, before_root);
     }
 
@@ -736,8 +811,11 @@ mod tests {
         g.nodes.get_mut(&a_id).unwrap().children.retain(|c| *c != b_id);
         g.nodes.get_mut(&root_id).unwrap().children.push(b_id);
 
-        let moved = rekey_node_ids(&mut g);
-        assert!(moved > 0, "a real topology mutation must move IDs");
+        let outcome = rekey_node_ids(&mut g);
+        assert!(
+            outcome.ids_moved > 0,
+            "a real topology mutation must move IDs"
+        );
 
         // The settled shape, built fresh (this is what the reverse
         // parser does with the emitted depths).
@@ -751,6 +829,11 @@ mod tests {
             ids_by_order(&g),
             ids_by_order(&fresh),
             "re-keyed IDs must equal a fresh derivation from the settled topology"
+        );
+        assert_eq!(
+            paths_by_order(&g),
+            paths_by_order(&fresh),
+            "finalized paths must equal a fresh derivation from the settled topology"
         );
         assert_eq!(
             g.document_info.root_id, fresh.document_info.root_id,
@@ -779,7 +862,9 @@ mod tests {
 
         // Idempotence: a second re-key of the now-finalized graph is a
         // no-op.
-        assert_eq!(rekey_node_ids(&mut g), 0, "re-key must be idempotent");
+        let second = rekey_node_ids(&mut g);
+        assert_eq!(second.ids_moved, 0, "re-key must be idempotent (ids)");
+        assert_eq!(second.paths_moved, 0, "re-key must be idempotent (paths)");
     }
 
     /// DT-10 generalization: after a re-key the root is the fingerprint

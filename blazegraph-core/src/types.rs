@@ -252,11 +252,14 @@ pub struct ParseProvenance {
 /// deterministic path re-keys every node ID from the post-`graph_sanity`
 /// topology (`graphs::builder::rekey_node_ids`), restoring the CR-83
 /// derivability contract: emitted IDs equal what a reverse parse of the
-/// emitted tree derives. No struct shape changes; node-canon impact is
-/// bounded to documents whose topology `graph_sanity` mutated (PDF
-/// rebalance / demotions) — MD, DOCX, and clean-PDF IDs are byte-
-/// identical to 0.8.0. Reverse parse additionally retains per-element
-/// refs (CR-84 component 3, a faithfulness fix).
+/// emitted tree derives. The pass also re-derives
+/// `location.semantic.path` from the settled tree (the other build-time
+/// structural derivation sanity mutated out from under). No struct
+/// shape changes; node-canon impact is bounded to documents whose
+/// topology `graph_sanity` mutated (PDF rebalance / demotions) — MD,
+/// DOCX, and clean-PDF IDs are byte-identical to 0.8.0. Reverse parse
+/// additionally retains per-element refs (CR-84 component 3, a
+/// faithfulness fix).
 pub const SCHEMA_VERSION: &str = "0.9.0";
 
 /// The in-memory graph — and, definitionally, the **content body**:
