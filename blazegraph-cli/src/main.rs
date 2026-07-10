@@ -120,6 +120,11 @@ struct ParseArgs {
     /// populated for library consumers). Pass this flag to round-trip a
     /// PDF-source graph with style preserved in the emitted bgraph.md.
     /// PDF channel only.
+    ///
+    /// CR-84 / CR-86: **debug/inspection-only.** This flag exists so
+    /// `style_info` can be inspected on the wire; it is not the
+    /// production emit path (default emit omits style). The style
+    /// half of the round-trip question is deferred to CR-86.
     #[arg(long)]
     include_style_info: bool,
 

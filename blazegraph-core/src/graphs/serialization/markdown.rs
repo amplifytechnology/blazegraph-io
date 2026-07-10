@@ -32,6 +32,11 @@ pub struct EmitOptions {
     /// (default), the `style` field is omitted unconditionally. Round-
     /// trip identity holds in both modes; the parser tolerates either
     /// shape on input.
+    ///
+    /// CR-84 / CR-86: **debug/inspection-only.** This gate exists so
+    /// `style_info` can be inspected on the wire; the production emit
+    /// path is the default (style omitted). The style round-trip
+    /// question is CR-86's, deferred.
     pub include_style_info: bool,
 }
 
