@@ -224,8 +224,16 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                 // the field on inputs that carry it.
                 style: p.metadata.style.clone(),
                 token_count: p.metadata.token_count,
-                internal_refs: vec![],
-                external_refs: vec![],
+                // CR-84 (component 3 — refs round-trip faithfulness):
+                // per-element refs were parsed then dropped since CR-62
+                // ("parsed, not yet consumed"), so a forward emit that
+                // carried refs never reverse-parsed to the same
+                // canonical_json. Retain them onto the reconstructed
+                // element; the builder copies them onto the node. Refs
+                // were always in the forward hash — this is a
+                // faithfulness fix, not a canon change.
+                internal_refs: p.metadata.internal_refs.clone(),
+                external_refs: p.metadata.external_refs.clone(),
                 // Block A / A3: `confidence` left the wire (v4.0.0); the
                 // reconstructed element carries the neutral 0 — it no
                 // longer feeds the node or the hash.
@@ -555,15 +563,14 @@ struct NodeMetadata {
     token_count: usize,
     /// CR-62 (v2.3.0+): per-element refs to other locations within this
     /// document. `#[serde(default)]` so pre-v2.3.0 fixtures parse cleanly.
-    // CR-62: parsed, not yet consumed on the parse-back path.
+    /// CR-84: retained onto the reconstructed node (refs round-trip
+    /// faithfulness) — no longer parse-and-drop.
     #[serde(default)]
-    #[allow(dead_code)]
     internal_refs: Vec<crate::types::InternalRef>,
     /// CR-62 (v2.3.0+): per-element refs to external locations. Same
-    /// forward-compat tolerance.
-    // CR-62: parsed, not yet consumed on the parse-back path.
+    /// forward-compat tolerance. CR-84: retained onto the reconstructed
+    /// node.
     #[serde(default)]
-    #[allow(dead_code)]
     external_refs: Vec<crate::types::ExternalRef>,
     // v4.0.0 (Block A / Amendment M): `confidence` left the wire. A
     // legacy (≤3.x) input carrying it parses fine — serde drops unknown
@@ -1182,6 +1189,78 @@ mod tests {
         // Second emit is byte-identical (idempotent emit on a parsed graph).
         let md2 = emit_markdown(&result.graph, &result.provenance);
         assert_eq!(md, md2, "second emit must be byte-identical");
+    }
+
+    /// CR-84 (component 3): per-element `internal_refs` / `external_refs`
+    /// round-trip — emitted refs are retained onto the reconstructed node
+    /// (not parse-and-dropped), so the reverse `canonical_json` matches
+    /// the forward one and strict identity verifies.
+    #[test]
+    fn parse_round_trip_retains_refs_verified() {
+        let mut original = build_synthetic_graph(
+            vec![
+                ("Section", "Intro", 1, 0),
+                ("Paragraph", "See [1] and the site.", 1, 1),
+            ],
+            Some("Refs Doc"),
+            None,
+        );
+        // Attach refs to the paragraph node (the builder path would have
+        // carried them from the channel; refs were always in the forward
+        // hash).
+        let para_id = original
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Paragraph")
+            .map(|n| n.id)
+            .expect("paragraph present");
+        let para = original.nodes.get_mut(&para_id).unwrap();
+        para.internal_refs = vec![InternalRef {
+            text: "[1]".to_string(),
+            source_page: Some(1),
+            source_bbox: None,
+            target: InternalRefTarget::Named {
+                name: "cite.example2026".to_string(),
+                page: Some(9),
+                point: None,
+            },
+        }];
+        para.external_refs = vec![ExternalRef {
+            text: "the site".to_string(),
+            source_page: Some(1),
+            source_bbox: None,
+            target: ExternalRefTarget::Uri {
+                url: "https://example.com".to_string(),
+            },
+        }];
+
+        let md = emit(&original);
+        assert!(
+            md.contains("\"internal_refs\""),
+            "emitted bgraph.md must carry the refs; got:\n{md}"
+        );
+
+        let result = parse(&md, ParseOptions::default())
+            .expect("refs-carrying bgraph.md round-trips strictly");
+        assert!(
+            matches!(result.identity, ParseIdentity::Verified),
+            "identity must verify — refs are in the forward hash, so \
+             dropping them on parse would HashMismatch; got {:?}",
+            result.identity
+        );
+        assert_eq!(canonical(&result.graph), canonical(&original));
+
+        // The refs landed on the reconstructed node, not just the hash.
+        let reparsed_para = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Paragraph")
+            .expect("paragraph present");
+        assert_eq!(reparsed_para.internal_refs.len(), 1);
+        assert_eq!(reparsed_para.internal_refs[0].text, "[1]");
+        assert_eq!(reparsed_para.external_refs.len(), 1);
+        assert_eq!(reparsed_para.external_refs[0].text, "the site");
     }
 
     #[test]
