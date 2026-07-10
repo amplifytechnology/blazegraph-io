@@ -101,7 +101,25 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// stamped hashes were computed under the old definition and will not
 /// verify under the v4 recompute (use `--accept-drift` or regenerate).
 /// See `docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment M.
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "4.0.0";
+///
+/// v5.0.0 (CR-84): **major** — **node identity is finalized after
+/// topology settles.** The forward deterministic path re-keys every
+/// node ID from the post-`graph_sanity` topology (the shared
+/// derivation walk in `graphs::builder`), so the emitted IDs equal
+/// what the reverse parser re-derives from the emitted tree — the
+/// round-trip contract CR-83 promised but sanity-mutated (PDF)
+/// documents violated. **Node-canon impact:** IDs move *only* for
+/// documents where `graph_sanity` mutated topology (PDF rebalance /
+/// demotions); MD, DOCX, and clean PDFs emit byte-identical IDs v4→v5
+/// (the re-key is idempotent on settled topology). Also: per-element
+/// `internal_refs` / `external_refs` are now retained on reverse parse
+/// (they were parse-and-dropped; always in the forward hash — a
+/// faithfulness fix riding this bump). The walk algorithm is
+/// byte-identical to v2/v3/v4, so older files still parse
+/// structurally; sanity-mutated v4 PDFs' stamped IDs/hashes will not
+/// verify under v5 (that is the honest answer — regenerate or
+/// `--accept-drift`).
+pub const BGRAPH_MD_FORMAT_VERSION: &str = "5.0.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
