@@ -374,6 +374,10 @@ impl DocumentProcessor {
             Some(&section_confidence),
         );
         graph.compute_breadcrumbs();
+        // CR-84: no post-sanity re-key here — this is the debug/evidence
+        // path built on `build_graph` (random UUIDv4 IDs, no content
+        // derivation) and it never feeds an identity-bearing emit; the
+        // re-key belongs to the deterministic path in `rules_and_graph`.
 
         println!("📋 Stage 3: Graph captured ({} nodes)", graph.nodes.len());
 
@@ -559,6 +563,21 @@ impl DocumentProcessor {
             Some(&section_confidence),
         );
         graph.compute_breadcrumbs();
+
+        // CR-84: node identity is finalized as late as possible — after
+        // every topology-mutating pass — and derived from the final
+        // emitted structure. `graph_sanity` may have re-parented /
+        // re-depthed nodes (CR-70 rebalance, demotions) without re-keying
+        // them; this re-runs the builder's shared ID-derivation walk over
+        // the settled topology so the emitted IDs equal what the reverse
+        // parser re-derives from the emitted tree (the round-trip
+        // contract). No-op when sanity didn't move topology (idempotent).
+        let rekeyed = profiler.time_step("Node ID Re-key (post-sanity)", || {
+            crate::graphs::builder::rekey_node_ids(&mut graph)
+        });
+        if rekeyed > 0 {
+            println!("🔑 CR-84: {rekeyed} node IDs re-keyed to post-sanity topology");
+        }
 
         Ok(graph)
     }
