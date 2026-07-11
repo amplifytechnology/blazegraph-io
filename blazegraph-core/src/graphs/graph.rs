@@ -88,7 +88,13 @@ impl DocumentGraph {
         });
 
         SortedDocumentGraph {
-            schema_version: SCHEMA_VERSION.to_string(),
+            // CR-87: json and md advertise the **one** serialization-
+            // neutral schema/format version. `schema_version` here == the
+            // md doc-level `schema` field == `BGRAPH_FORMAT_VERSION`.
+            // (Was `SCHEMA_VERSION = 0.9.0`, a mislabel; harmonized onto
+            // the honest `5.x` lineage. Wrapper field — outside
+            // `graph_sha256`.)
+            schema_version: crate::BGRAPH_FORMAT_VERSION.to_string(),
             // Wall-clock time at which this graph was serialized to disk.
             // Lives on the wrapper so `DocumentGraph` stays time-free —
             // see canonical-input invariant in

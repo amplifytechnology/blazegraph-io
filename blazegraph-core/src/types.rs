@@ -165,102 +165,15 @@ pub struct ParseProvenance {
     /// (hex-encoded).
     pub config_hash: String,
 }
-/// The schema version stamped on every graph output.
-/// Bump this when the output shape changes.
-///
-/// 0.4.0 — Block 05 of the document-analytics flow: dropped `document_info.document_analysis`.
-/// Analytics live in pipeline memory + sidecar dumps under `cache/stat/<name>/<hash>.json`,
-/// not in the graph output schema.
-///
-/// 0.5.0 — Block 06b reading-order resort: dropped legacy `Placement.band`,
-/// `Placement.column`, `Placement.nr_band_columns` (zeroed out since the
-/// Block 1 layout-reasoning consolidation); added `Placement.region_label`
-/// for region tree leaf annotation produced by `analytics::reading_order::tag_and_resort`.
-///
-/// 0.5.1 — Block 07 header/footer/margin classification: added `Header`,
-/// `Footer`, `Margin` variants to `ParsedElementType` (and matching
-/// `GroupType` variants). Element type is assigned at the
-/// `PdfTextElement` → `ParsedPdfElement` boundary from `region_label`
-/// (`H-*` → Header, `F-*` → Footer, `None` → Margin, body leaf labels →
-/// Paragraph). Section detection skips Header / Footer / Margin.
-///
-/// 0.6.0 — B2 of MD+DOCX flow:
-///   1. Added `DocumentInfo.parse_provenance: Option<ParseProvenance>`
-///      so the bgraph.md emitter can produce real (not placeholder)
-///      doc-level identity fields and downstream round-trip consumers
-///      can re-derive deterministic node IDs without re-reading the
-///      source bytes.
-///   2. Moved `created_at` from `StructuralProfile` to
-///      `SortedDocumentGraph` (the on-disk wrapper). `DocumentGraph`
-///      is now time-free, which is the canonical-input invariant
-///      required for `canonical_json(&DocumentGraph)` to be byte-
-///      deterministic across runs of the same logical graph.
-///
-/// Backwards-compatible: existing 0.5.1 graphs deserialize cleanly
-/// with `parse_provenance = None` and `SortedDocumentGraph.created_at`
-/// defaulting to the Unix epoch (clearly "no real value").
-///
-/// 0.7.0 — B6 of MD+DOCX flow:
-///   1. Added `CodeBlock`, `List`, `Blockquote`, `Table` variants to
-///      `SemanticElementType` (and their string counterparts in
-///      `DocumentNode.node_type`). These are produced by the markdown
-///      channel; the PDF channel never produces them. The union schema
-///      absorbs this asymmetry by design — graphs from one channel are
-///      a subset of `SemanticElementType` and that is a feature.
-///   2. Added canonical frontmatter fields to `DocumentMetadata`:
-///      `date: Option<String>`, `tags: Vec<String>` (default empty),
-///      `draft: Option<bool>`. These are the starting point for
-///      normalizing metadata across MD / PDF / DOCX.
-///   3. Added `DocumentMetadata.extras: BTreeMap<String,
-///      serde_json::Value>` — an opaque pass-through bucket for
-///      non-canonical frontmatter keys. YAML values are converted to
-///      JSON values at the frontmatter-parse boundary so the schema
-///      does not depend on the YAML library.
-///
-/// Backwards-compatible: existing 0.6.0 graphs deserialize cleanly
-/// because all new fields default (`Option::None` / `Vec::new` /
-/// `BTreeMap::new`), and the new enum variants are additive.
-///
-/// 0.8.0 — Block A / Amendment M: **identity became the content body**
-/// (the inaugural content-only edition; bgraph.md v4.0.0 is the wire
-/// side of the same bump). `canonical_json(&DocumentGraph)` now covers
-/// exactly the content body — nothing that is not content is hashed,
-/// nothing that is content is excluded:
-///   1. `DocumentInfo.parse_provenance` → `SortedDocumentGraph`
-///      (wrapper). Provenance is about the parse run, not of the
-///      document; it is threaded as an explicit value through the
-///      emit/serialize paths.
-///   2. `DocumentGraph.structural_profile` removed — the profile is a
-///      json-only derived aggregate, recomputed at serialization time
-///      on the wrapper. `flow_type` (its one identity scalar)
-///      relocated to `DocumentInfo` (default `Fixed`).
-///   3. `DocumentNode.confidence` (CR-78 schema-ahead placeholder)
-///      removed outright — no placeholder slot; schema-ahead into the
-///      identity form is retired. Upstream parser-internal ingredients
-///      stay.
-///   4. `token_count` deliberately stays in the body → in identity
-///      (deterministic `words/4`; DT-01).
-///
-/// Breaking on the wrapper shape (fields moved), tolerant on read:
-/// pre-0.8.0 graph.json deserializes cleanly (moved fields are dropped
-/// as unknowns / defaulted), but `graph_sha256` re-baselines for every
-/// document. Node IDs do NOT change (the CR-83 key never referenced
-/// the evicted fields).
-///
-/// 0.9.0 — CR-84 (bgraph.md v5.0.0 is the wire side of the same bump):
-/// **node identity finalizes after topology settles.** The forward
-/// deterministic path re-keys every node ID from the post-`graph_sanity`
-/// topology (`graphs::builder::rekey_node_ids`), restoring the CR-83
-/// derivability contract: emitted IDs equal what a reverse parse of the
-/// emitted tree derives. The pass also re-derives
-/// `location.semantic.path` from the settled tree (the other build-time
-/// structural derivation sanity mutated out from under). No struct
-/// shape changes; node-canon impact is bounded to documents whose
-/// topology `graph_sanity` mutated (PDF rebalance / demotions) — MD,
-/// DOCX, and clean-PDF IDs are byte-identical to 0.8.0. Reverse parse
-/// additionally retains per-element refs (CR-84 component 3, a
-/// faithfulness fix).
-pub const SCHEMA_VERSION: &str = "0.9.0";
+// CR-87 (version-axis harmonization): the standalone `SCHEMA_VERSION`
+// const (last value `0.9.0`) is **retired**. The json wrapper's
+// `schema_version` and the bgraph.md doc-level `schema` field now carry
+// the **one** serialization-neutral schema/format version —
+// [`crate::BGRAPH_FORMAT_VERSION`] (`5.x`). The old json-only `0.x`
+// lineage (0.4.0 → 0.9.0) was a mislabel diverging from the honest,
+// consumer-visible `5.x` format history; it is preserved in git and in
+// the version-model arch doc (arch-15). See `graph.rs::to_sorted_graph`
+// (the stamp site) and the drift-guard test in `graphs::serialization`.
 
 /// The in-memory graph — and, definitionally, the **content body**:
 /// `canonical_json(&DocumentGraph)` is the exact input to

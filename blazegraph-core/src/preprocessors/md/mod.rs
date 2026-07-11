@@ -46,17 +46,41 @@ pub mod types;
 /// [`crate::preprocessors::md::strip`] and
 /// [`crate::preprocessors::md::types`] at module-root for downstream
 /// pinning. The re-export pattern follows the
-/// [`BGRAPH_MD_FORMAT_VERSION`] precedent.
+/// [`BGRAPH_FORMAT_VERSION`] precedent.
 pub use strip::strip;
 pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode};
 
-/// Current bgraph.md wire-format version targeted by the emitter.
-/// Follows X.Y.Z semantics formalized in spec § Versioning policy.
+/// The **schema/format version** — the single, serialization-neutral
+/// version of the emitted artifact. Stamped identically in **both**
+/// serializations: the bgraph.md doc-level `schema` field *and* the
+/// json wrapper's `SortedDocumentGraph.schema_version` (CR-87). The
+/// canonical graph is one thing; md and json are two faithful
+/// serializations of it (arch-14 §2/§6), so they advertise **one**
+/// version. Re-exported at crate root as [`crate::BGRAPH_FORMAT_VERSION`]
+/// so json-side and downstream consumers reach it without importing
+/// through a preprocessor module.
 ///
-/// Distinct from [`crate::types::SCHEMA_VERSION`] (in-memory graph
-/// schema), which moves at a different cadence. Downstream consumers
-/// pinning to the wire-format axis (URD's compile-time adapter assert,
-/// future tooling) target this constant.
+/// This is the **schema/format axis** of the version model (arch-15):
+/// "can my code read this shape?" — the structural contract, distinct
+/// from the **code axis** ([`crate::VERSION`], byte-stability /
+/// attribution) and the **preprocessor axis**
+/// ([`crate::cache::versions::PREPROCESSOR_INTERFACE_VERSION`], debug).
+///
+/// Follows X.Y.Z semantics = the *scale of node-ID churn* a consumer
+/// should expect (MAJOR: derivation rule changed, all IDs move; MINOR:
+/// additive structure, some IDs move; PATCH: affected nodes only). It
+/// is **not** the content discriminator — `graph_sha256` moves on any
+/// content change; this version tells a consumer how much to
+/// diff/migrate. See arch-15 § Version model.
+///
+/// CR-87 harmonized the json side onto this `5.x` lineage (json's
+/// `schema_version` went `0.9.0 → 5.0.0`, adopting the honest,
+/// consumer-visible history); the retired `SCHEMA_VERSION = 0.9.0`
+/// const was a mislabel. `graph_sha256` is unchanged — this const is a
+/// wrapper/envelope field, outside the hash.
+///
+/// Downstream consumers pinning to the format axis (URD's compile-time
+/// adapter assert, future tooling) target this constant.
 ///
 /// The parser at [`bgraph_md::parse`] accepts every previous major's
 /// shape as well, per the dual-support contract (spec § Amendment H).
@@ -122,7 +146,7 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// structurally; sanity-mutated v4 PDFs' stamped IDs/hashes will not
 /// verify under v5 (that is the honest answer — regenerate or
 /// `--accept-drift`).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "5.0.0";
+pub const BGRAPH_FORMAT_VERSION: &str = "5.0.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -323,13 +347,13 @@ mod tests {
     /// non-empty numeric segments — without locking in the exact
     /// value, which moves with each Amendment.
     #[test]
-    fn bgraph_md_format_version_is_valid_semver() {
-        let v = BGRAPH_MD_FORMAT_VERSION;
+    fn bgraph_format_version_is_valid_semver() {
+        let v = BGRAPH_FORMAT_VERSION;
         let parts: Vec<&str> = v.split('.').collect();
         assert_eq!(
             parts.len(),
             3,
-            "BGRAPH_MD_FORMAT_VERSION must be `major.minor.patch`; got {v:?}",
+            "BGRAPH_FORMAT_VERSION must be `major.minor.patch`; got {v:?}",
         );
         for (i, part) in parts.iter().enumerate() {
             assert!(

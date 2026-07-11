@@ -3,14 +3,16 @@
 //! Wire-format spec is the source of truth:
 //! `docs/P2/core/architecture/08-bgraph-md-format.md`. The emitted
 //! `schema` field is sourced from
-//! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`].
+//! [`crate::preprocessors::md::BGRAPH_FORMAT_VERSION`] — the same
+//! serialization-neutral const the json wrapper stamps into
+//! `schema_version` (CR-87).
 //!
 //! Public surface: [`emit_markdown`] (default options) and
 //! [`emit_markdown_with_options`] (opt-in flags). Everything else is
 //! private.
 
 use super::canonical;
-use crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION;
+use crate::preprocessors::md::BGRAPH_FORMAT_VERSION;
 use crate::types::*;
 use serde::Serialize;
 
@@ -41,7 +43,7 @@ pub struct EmitOptions {
 }
 
 /// Emit a `DocumentGraph` to bgraph.md format. Targets the current
-/// [`BGRAPH_MD_FORMAT_VERSION`]. Uses [`EmitOptions::default()`] — the
+/// [`BGRAPH_FORMAT_VERSION`]. Uses [`EmitOptions::default()`] — the
 /// wire-format default (no opt-in flags set).
 ///
 /// `provenance` is an explicit, compile-time-required argument (Block A
@@ -164,7 +166,7 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
     }
 
     let block = DocLevelBlock {
-        schema: BGRAPH_MD_FORMAT_VERSION,
+        schema: BGRAPH_FORMAT_VERSION,
         kind: &graph.document_info.kind,
         blazegraph_version: &provenance.blazegraph_version,
         source: DocLevelSource {
