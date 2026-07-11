@@ -161,16 +161,13 @@ struct ParseArgs {
     /// Alias for --fresh-from c0 (reprocess everything from scratch).
     #[arg(long)]
     skip_cache: bool,
-
-    // =========================================================================
-    // Markdown-input flags (B5)
-    // =========================================================================
-    /// Accept hash-drifted bgraph.md input. When the recomputed
-    /// `graph_sha256` does not match the value embedded in the
-    /// doc-level block, return a derivative graph instead of erroring.
-    /// Only meaningful when the input is markdown.
-    #[arg(long)]
-    accept_drift: bool,
+    // Block C.3: the `--accept-drift` runtime toggle was **removed**.
+    // Identity strictness is now a *compile-time* property (the
+    // `strict-identity` cargo feature, default-ON): the shipped binary
+    // rejects a canon-hash mismatch and there is no runtime way to relax
+    // it. The library `ParseOptions.accept_drift` field remains for
+    // programmatic/test callers; only the CLI surface loses the toggle.
+    // See `strict_accept_drift()`.
 }
 
 #[derive(ClapArgs)]
@@ -468,6 +465,16 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
 // Markdown channel (B5)
 // =========================================================================
 
+/// The `accept_drift` value for this **build**. Block C.3: strictness is
+/// a compile-time property, not a runtime flag. In the shipped binary
+/// (default features → `strict-identity` on) this is `false` — a
+/// canon-hash mismatch is a hard reject with no way to relax it. A build
+/// compiled without `strict-identity` tolerates drift (local-debug
+/// escape only; never the shipped artifact).
+const fn strict_accept_drift() -> bool {
+    !cfg!(feature = "strict-identity")
+}
+
 fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
     use blazegraph_io_core::preprocessors::md::{
         is_bgraph_md, parse_markdown, ParseError, ParseIdentity, ParseOptions,
@@ -481,7 +488,7 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
     }
 
     let opts = ParseOptions {
-        accept_drift: args.accept_drift,
+        accept_drift: strict_accept_drift(),
     };
     let result = match parse_markdown(&content, opts) {
         Ok(r) => r,
@@ -495,8 +502,10 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
                  \trecomputed: {recomputed}\n\
                  \n\
                  This means the bgraph.md has been edited since emission.\n\
-                 To accept the drifted content as a new derivative graph,\n\
-                 re-run with --accept-drift.\n"
+                 This binary verifies identity by construction (compile-time\n\
+                 strict-identity) and will not emit a drifted graph — there is\n\
+                 no runtime override. Regenerate the bgraph.md from source, or\n\
+                 restore the original bytes.\n"
             );
             std::process::exit(2);
         }
@@ -543,9 +552,10 @@ fn run_parse_docx(args: ParseArgs) -> Result<()> {
 
     // `ParseOptions` is shared with the markdown channel; `accept_drift`
     // is meaningless for DOCX (no embedded `graph_sha256` to verify),
-    // but we thread it through for API symmetry.
+    // but we thread the build's compile-time strictness through for API
+    // symmetry (Block C.3 — no runtime toggle).
     let opts = ParseOptions {
-        accept_drift: args.accept_drift,
+        accept_drift: strict_accept_drift(),
     };
     let result = parse_docx(&bytes, opts).map_err(|e| anyhow!("\n❌ DOCX parse failed: {e}\n"))?;
 

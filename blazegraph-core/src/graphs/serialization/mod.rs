@@ -14,6 +14,10 @@
 //! - [`markdown_generic`] — plain markdown emitter (the generic
 //!   markdown channel from B6; the inverse of
 //!   `preprocessors::md::generic_md::parse`).
+//! - [`version`] — the versioned-codec seam (arch-14 §7 live tier;
+//!   museum design-flow Block C): `FormatVersion` + `canonicalize_as`
+//!   / `emit_markdown_as` / `upcast`, making "which version's canonical
+//!   form" an explicit input instead of a hardcoded const.
 //!
 //! The existing `to_sequential_format` / `to_flat_format` impl block
 //! lives in this file (legacy output shapes pre-dating bgraph.md).
@@ -21,6 +25,7 @@
 pub mod canonical;
 pub mod markdown;
 pub mod markdown_generic;
+pub mod version;
 
 use crate::types::*;
 use anyhow::Result;

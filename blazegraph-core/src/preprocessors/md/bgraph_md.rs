@@ -21,6 +21,7 @@
 use crate::graphs::builder::GraphBuilder;
 use crate::graphs::node_id::NodeIdGenerator;
 use crate::graphs::serialization::canonical;
+use crate::graphs::serialization::version::FormatVersion;
 use crate::types::*;
 use serde::Deserialize;
 
@@ -629,33 +630,22 @@ fn strip_heading_prefix(body: &str) -> String {
         .to_string()
 }
 
-/// Validate that the doc-level `schema` field is a major version this
-/// parser has an arm for. Accepts `2.x`, `3.x`, `4.x`, and `5.x`.
+/// Validate that the doc-level `schema` field is a version this parser
+/// has a read-path arm for, by routing through the codec seam
+/// ([`FormatVersion::from_schema_str`]). Block C: acceptance narrows to
+/// **`1.x` only** — the honest inaugural edition. The `2.x`–`5.x` lineage
+/// (and everything else) is retired internal pre-museum churn with no
+/// consumer, so it is a clean [`ParseError::UnsupportedSchema`], never
+/// best-effort-read.
 ///
-/// v2.1.0+ (CR-57) dropped v1.x dispatch per the single-convention
-/// contract. CR-83 (v3.0.0) is a major bump for **node-ID derivation
-/// only**, Amendment M (v4.0.0) for the **identity definition only**
-/// (`graph_sha256` = content body; `confidence` off the wire), and
-/// CR-84 (v5.0.0) for **when node identity is finalized** (post-sanity
-/// re-key; refs retained on parse) — in all cases the structural read
-/// path (the walk algorithm + fence shape) is byte-for-byte identical
-/// to v2.x, so the *same* parser arm reads all four. A 2.x/3.x/4.x
-/// file parses structurally under this v5 parser, but a stamped
-/// `graph_sha256` computed under an older definition (or, for
-/// sanity-mutated v4 PDFs, over pre-sanity IDs) will not verify in
-/// strict mode — that is the honest fail-closed answer; cross-version
-/// verification is the museum's job (design-flow Block C), not this
-/// arm's. Future major bumps that *do* change the read path add a new
-/// arm here in lock-step.
+/// Read-side version recognition is no longer an inline string-prefix
+/// match: it *is* `FormatVersion::from_schema_str`, the single chokepoint
+/// the seam owns. A future major bump that changes the read path adds a
+/// `FormatVersion` arm (+ its codec profile) there, in lock-step.
 fn validate_schema(schema: &str) -> Result<(), ParseError> {
-    if schema.starts_with("2.")
-        || schema.starts_with("3.")
-        || schema.starts_with("4.")
-        || schema.starts_with("5.")
-    {
-        Ok(())
-    } else {
-        Err(ParseError::UnsupportedSchema(schema.to_string()))
+    match FormatVersion::from_schema_str(schema) {
+        Some(_) => Ok(()),
+        None => Err(ParseError::UnsupportedSchema(schema.to_string())),
     }
 }
 
@@ -877,19 +867,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_v1_x_schemas() {
-        // v2.1.0+ (CR-57): single convention. v1.x fixtures (body-inside
-        // H/F/M, no bgraph-metadata fence) are no longer parseable. No
-        // back-compat dispatch — fixtures regenerate via the emit path.
-        let v1_fixture =
-            "```bgraph\n\
-             {\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"title\":null,\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
-             ```\n";
-        let result = parse(v1_fixture, ParseOptions { accept_drift: true });
-        assert!(
-            matches!(result, Err(ParseError::UnsupportedSchema(_))),
-            "v1.x schemas must be rejected under v2.1.0+ single-convention parser; got: {result:?}"
-        );
+    fn parse_rejects_retired_2x_through_5x_schemas() {
+        // Block C: the honest baseline reads **only 1.x**. The retired
+        // `2.x`–`5.x` lineage (internal pre-museum churn, no consumer)
+        // and everything else are a clean `UnsupportedSchema` at parse
+        // time — never best-effort-read. (Note the polarity flip from the
+        // pre-reset world, where `1.x` was the rejected legacy format.)
+        for retired in ["0.9.0", "2.0.0", "3.0.0", "4.0.0", "5.0.0", "6.0.0"] {
+            let fixture = format!(
+                "```bgraph\n\
+                 {{\"schema\":\"{retired}\",\"blazegraph_version\":\"0.6.0\",\"source\":{{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"}},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}}\n\
+                 ```\n"
+            );
+            let result = parse(&fixture, ParseOptions { accept_drift: true });
+            assert!(
+                matches!(result, Err(ParseError::UnsupportedSchema(_))),
+                "retired schema {retired} must be rejected under the 1.x-only baseline; got: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -898,7 +893,7 @@ mod tests {
         // (v2.0.0 tag names) must be rejected. The walk picks them up as
         // unrecognized tags via the fence-tag dispatch.
         let bad_codeblock = "```bgraph\n\
-             {\"schema\":\"2.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
+             {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
              ```\n\
              \n\
              ```bgraph-metadata\n{}\n```\n\
@@ -1008,7 +1003,7 @@ mod tests {
         // new bgraph fence inside an active fence. (The scanner sees
         // this as a reserved-prefix violation.)
         let bogus = "```bgraph\n\
-                     {\"schema\":\"2.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
+                     {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
                      ```bgraph-section\n\
                      ```\n";
         // The inner `bgraph-section` open without a preceding ``` close is
@@ -1069,31 +1064,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_schema_accepts_v2_through_v5() {
-        // v2.1.0+ (CR-57) single convention; CR-83 (v3.0.0) changed only
-        // node-ID *values*; Amendment M (v4.0.0) changed only the identity
-        // *definition*; CR-84 (v5.0.0) changed only *when* node identity
-        // is finalized — all four majors share the identical structural
-        // read path.
-        for ok in [
-            "2.0.0", "2.1.0", "2.42.7", "2.99.0", "3.0.0", "3.1.0", "3.99.0", "4.0.0", "4.1.0",
-            "5.0.0", "5.1.0",
-        ] {
+    fn validate_schema_accepts_only_1_x() {
+        // Block C: acceptance narrows to `1.x` — the honest inaugural
+        // edition — routed through the codec seam
+        // (`FormatVersion::from_schema_str`).
+        for ok in ["1.0.0", "1.1.0", "1.42.7", "1.99.0"] {
             assert!(
                 validate_schema(ok).is_ok(),
-                "{ok} should be accepted under the v2–v5-shared-read-path parser"
+                "{ok} should be accepted under the 1.x-only baseline"
             );
         }
     }
 
     #[test]
-    fn validate_schema_rejects_v1_and_v6_plus() {
-        // v1.x predates the single convention; v6.x+ is a hypothetical
-        // future read-path break with no arm yet.
-        for bad in ["0.9.0", "1.0.0", "1.1.0", "1.42.0", "6.0.0", "10.0.0"] {
+    fn validate_schema_rejects_non_1_x() {
+        // Everything outside `1.x` — the retired `2.x`–`5.x` pre-museum
+        // lineage, sub-1.0 mislabels, and hypothetical future majors —
+        // is `UnsupportedSchema`. No best-effort read.
+        for bad in [
+            "0.9.0", "2.0.0", "2.1.0", "3.0.0", "4.0.0", "5.0.0", "5.1.0", "6.0.0", "10.0.0",
+        ] {
             assert!(
                 matches!(validate_schema(bad), Err(ParseError::UnsupportedSchema(_))),
-                "{bad} should be rejected — no parser arm for that major"
+                "{bad} should be rejected — the 1.x-only baseline has no arm for it"
             );
         }
     }

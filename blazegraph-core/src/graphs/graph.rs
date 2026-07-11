@@ -10,6 +10,48 @@ impl Default for DocumentGraph {
     }
 }
 
+impl SortedDocumentGraph {
+    /// Reconstruct the in-memory `DocumentGraph` (the content body) from
+    /// this on-disk wrapper. Inverse of `to_sorted_graph`'s node
+    /// projection: the envelope fields (`schema_version`, `created_at`,
+    /// `parse_provenance`, `structural_profile`, `graph_sha256`) are
+    /// dropped — none is part of identity.
+    pub fn to_document_graph(&self) -> DocumentGraph {
+        let nodes = self.nodes.iter().map(|n| (n.id, n.clone())).collect();
+        DocumentGraph {
+            nodes,
+            document_info: self.document_info.clone(),
+        }
+    }
+
+    /// Verify the embedded envelope `graph_sha256` against the hash
+    /// recomputed from the reconstructed content body — the json-side
+    /// analogue of the md parse path's identity check (Block C.3),
+    /// producing the same [`ParseIdentity`] verdict under the same
+    /// content-body hash. This is the json half of "always-on
+    /// verification": a loaded graph.json can now prove it is untampered.
+    ///
+    /// An empty embedded hash (pre-Block-C graph.json fixtures, kept
+    /// loadable via `#[serde(default)]`) yields `Verified` — there is no
+    /// embedded value to contradict. Strict rejection on a `Derivative`
+    /// verdict is the caller's to apply (mirroring the md path, where the
+    /// CLI's compile-time `strict-identity` feature turns a non-`Verified`
+    /// verdict into a hard reject).
+    pub fn verify_identity(&self) -> crate::preprocessors::md::ParseIdentity {
+        use crate::preprocessors::md::ParseIdentity;
+        let recomputed =
+            crate::graphs::serialization::canonical::graph_sha256(&self.to_document_graph());
+        if self.graph_sha256.is_empty() || recomputed == self.graph_sha256 {
+            ParseIdentity::Verified
+        } else {
+            ParseIdentity::Derivative {
+                original_sha256: self.graph_sha256.clone(),
+                recomputed_sha256: recomputed,
+            }
+        }
+    }
+}
+
 impl DocumentGraph {
     /// Create a new graph with a deterministic root ID.
     pub fn new_with_root(root_id: NodeId) -> Self {
@@ -91,10 +133,22 @@ impl DocumentGraph {
             // CR-87: json and md advertise the **one** serialization-
             // neutral schema/format version. `schema_version` here == the
             // md doc-level `schema` field == `BGRAPH_FORMAT_VERSION`.
-            // (Was `SCHEMA_VERSION = 0.9.0`, a mislabel; harmonized onto
-            // the honest `5.x` lineage. Wrapper field — outside
-            // `graph_sha256`.)
-            schema_version: crate::BGRAPH_FORMAT_VERSION.to_string(),
+            // Block C: stamped through the codec seam
+            // (`FormatVersion::CURRENT`) — the same enum the md emitter
+            // and the read path use — not a bare const. Wrapper field,
+            // outside `graph_sha256`.
+            schema_version: crate::graphs::serialization::version::FormatVersion::CURRENT
+                .schema_str()
+                .to_string(),
+            // Block C.3: the json envelope carries `graph_sha256` so a
+            // loaded graph.json is self-verifiable (symmetric with the
+            // md doc-level block). It is an **envelope** field — outside
+            // `canonical_json` / identity — computed by the same
+            // recompute the md emitter uses, so its value *equals* the
+            // md doc-level block's `graph_sha256` for the same graph and
+            // does not move the content-body hash. See
+            // `SortedDocumentGraph::verify_identity`.
+            graph_sha256: crate::graphs::serialization::canonical::graph_sha256(self),
             // Wall-clock time at which this graph was serialized to disk.
             // Lives on the wrapper so `DocumentGraph` stays time-free —
             // see canonical-input invariant in

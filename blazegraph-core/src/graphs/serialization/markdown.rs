@@ -12,7 +12,7 @@
 //! private.
 
 use super::canonical;
-use crate::preprocessors::md::BGRAPH_FORMAT_VERSION;
+use super::version::FormatVersion;
 use crate::types::*;
 use serde::Serialize;
 
@@ -166,7 +166,12 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
     }
 
     let block = DocLevelBlock {
-        schema: BGRAPH_FORMAT_VERSION,
+        // Block C: stamp the version through the codec seam
+        // (`FormatVersion::CURRENT`), not a bare const — the write-side
+        // version and the read-side recognizer are now the same enum.
+        // For `V1_0` this is exactly `BGRAPH_FORMAT_VERSION` ("1.0.0"),
+        // so the emit is byte-identical.
+        schema: FormatVersion::CURRENT.schema_str(),
         kind: &graph.document_info.kind,
         blazegraph_version: &provenance.blazegraph_version,
         source: DocLevelSource {

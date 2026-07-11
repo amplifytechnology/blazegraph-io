@@ -266,9 +266,10 @@ fn cli_emit_markdown_output_format_writes_bgraph_md() {
 
 #[test]
 fn cli_strict_mode_errors_on_drift() {
-    // Strict-mode (the default — no --accept-drift) bgraph.md parse
-    // with a tampered graph_sha256 must produce a clean error
-    // pointing at `--accept-drift`, with exit code != 0.
+    // Block C.3: the shipped binary is strict by construction
+    // (compile-time `strict-identity`). A tampered graph_sha256 must
+    // produce a clean error with exit code != 0 and **no runtime
+    // override** offered (the `--accept-drift` toggle was removed).
     let dir = unique_temp_dir("strict-drift");
     let fixture_md = dir.join("tampered.bgraph.md");
 
@@ -305,18 +306,19 @@ fn cli_strict_mode_errors_on_drift() {
         "stderr should mention graph_sha256 mismatch; got:\n{stderr}"
     );
     assert!(
-        stderr.contains("--accept-drift"),
-        "stderr should point at --accept-drift; got:\n{stderr}"
+        stderr.contains("no runtime override"),
+        "stderr should state there is no runtime override (Block C.3 strict binary); got:\n{stderr}"
     );
 }
 
 #[test]
-fn cli_accept_drift_returns_derivative_with_warning() {
-    // --accept-drift lets the parse succeed on a hash mismatch and
-    // surfaces the derivative provenance on stderr.
-    let dir = unique_temp_dir("accept-drift");
+fn cli_rejects_removed_accept_drift_flag() {
+    // Block C.3: the `--accept-drift` runtime toggle was removed —
+    // identity strictness is a compile-time property now. Passing the
+    // flag must fail as an unknown argument (clap exits non-zero),
+    // proving there is no runtime way to relax strictness.
+    let dir = unique_temp_dir("removed-accept-drift");
     let fixture_md = dir.join("drifted.bgraph.md");
-    let output_json = dir.join("drifted.json");
 
     let original = build_synthetic_graph();
     let mut md = emit_markdown(&original, &synthetic_provenance());
@@ -332,7 +334,7 @@ fn cli_accept_drift_returns_derivative_with_warning() {
             "-i",
             fixture_md.to_str().unwrap(),
             "-o",
-            output_json.to_str().unwrap(),
+            dir.join("drifted.json").to_str().unwrap(),
             "-f",
             "graph",
             "--accept-drift",
@@ -341,14 +343,13 @@ fn cli_accept_drift_returns_derivative_with_warning() {
         .expect("CLI binary spawns");
 
     assert!(
-        output.status.success(),
-        "CLI must succeed with --accept-drift even on hash mismatch; stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "CLI must reject the removed --accept-drift flag as an unknown argument"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("drifted bgraph.md"),
-        "stderr should warn about derivative provenance; got:\n{stderr}"
+        stderr.contains("--accept-drift") || stderr.contains("unexpected argument"),
+        "clap should report --accept-drift as unknown; got:\n{stderr}"
     );
 }
 

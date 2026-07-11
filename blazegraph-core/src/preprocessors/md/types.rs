@@ -70,6 +70,15 @@ pub enum ParseIdentity {
         /// The `graph_sha256` recomputed from the parsed graph.
         recomputed_sha256: String,
     },
+    // A third arm — `Unverifiable { version }` — is **reserved** for when
+    // the codec seam gains a version whose live codec is absent (the cold
+    // tier, arch-14 §7): "we recognize this edition but cannot recompute
+    // its canonical form in this binary." It has **no producer today** —
+    // with a single codec arm (`FormatVersion::V1_0`), a non-`1.x` schema
+    // is a clean `ParseError::UnsupportedSchema` *parse error*, never a
+    // successfully-parsed graph carrying a can't-verify verdict. The arm
+    // lands with multi-version support (Block C's museum successor), not
+    // before — adding it now would be an unconstructible variant.
 }
 
 /// Strip mode for the [`crate::preprocessors::md::strip`] operation.
@@ -169,13 +178,13 @@ pub enum ParseError {
         recomputed: String,
     },
 
-    /// The doc-level block carried a `schema` field whose major version
-    /// is outside the range this parser has a read-path arm for.
-    /// `2.x`–`5.x` share one structural read path (CR-57 single
-    /// convention through CR-84); `1.x` predates it and `6.x`+ has no arm
-    /// yet, so both are rejected rather than silently misinterpreted. See
-    /// `bgraph_md::validate_schema`.
-    #[error("unsupported schema version {0}; supported range is 2.x.y through 5.x.y")]
+    /// The doc-level block carried a `schema` field this parser has no
+    /// read-path arm for. Block C: the honest baseline accepts **only
+    /// `1.x`**; the retired `2.x`–`5.x` lineage (internal pre-museum
+    /// churn, no consumer) and everything else are rejected rather than
+    /// silently misinterpreted. See `bgraph_md::validate_schema` /
+    /// `graphs::serialization::version::FormatVersion::from_schema_str`.
+    #[error("unsupported schema version {0}; this build reads only 1.x.y")]
     UnsupportedSchema(String),
 
     /// Body content contained a line starting with the reserved

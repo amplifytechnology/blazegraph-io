@@ -146,7 +146,22 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// structurally; sanity-mutated v4 PDFs' stamped IDs/hashes will not
 /// verify under v5 (that is the honest answer — regenerate or
 /// `--accept-drift`).
-pub const BGRAPH_FORMAT_VERSION: &str = "5.0.0";
+///
+/// **1.0.0 (Block C — the honest reset).** The `1.x → 5.x` lineage above
+/// is **internal pre-museum churn with no external consumer** (the "no
+/// fictional users" principle). Block C renumbers the format to its true
+/// inaugural edition — `1.0.0`, "edition one of the content-body-identity
+/// substrate" — declared once in the no-users window; arch-15's increment
+/// semantics apply normally from `1.0.0` forward. The read path now
+/// accepts **only `1.x`** (via the codec seam
+/// [`crate::graphs::serialization::version::FormatVersion`]); every other
+/// schema — including the retired `2.x`–`5.x` — is a clean
+/// `UnsupportedSchema`, not something to best-effort-read. Emit is
+/// byte-identical to the pre-reset `5.0.0` output except this version
+/// string and the json envelope's new `graph_sha256` field; the
+/// `graph_sha256` *value* is unchanged (the reset is a renumber, not a
+/// canonical-form change).
+pub const BGRAPH_FORMAT_VERSION: &str = "1.0.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -203,9 +218,9 @@ mod tests {
     /// detection test, not a reconstruction test).
     fn sample_bgraph_md_header() -> &'static str {
         // v2.1.0+: doc-level block carries no `title` (moved to
-        // bgraph-metadata fence — CR-56 § I.4).
+        // bgraph-metadata fence — CR-56 § I.4). Block C: honest 1.0.0.
         "```bgraph\n\
-         {\"schema\":\"2.3.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
+         {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
          ```\n"
     }
 

@@ -11,7 +11,12 @@
 use blazegraph_io_core::graphs::builder::GraphBuilder;
 use blazegraph_io_core::graphs::node_id::NodeIdGenerator;
 use blazegraph_io_core::graphs::serialization::canonical::{canonical_json, graph_sha256};
-use blazegraph_io_core::graphs::serialization::markdown::emit_markdown;
+use blazegraph_io_core::graphs::serialization::markdown::{
+    emit_markdown, emit_markdown_with_options, EmitOptions,
+};
+use blazegraph_io_core::graphs::serialization::version::{
+    canonicalize_as, emit_markdown_as, FormatVersion,
+};
 use blazegraph_io_core::preprocessors::md::{
     bgraph_md, parse_markdown, ParseError, ParseIdentity, ParseOptions,
 };
@@ -449,7 +454,7 @@ fn reserved_prefix_in_body_is_handled_on_parse() {
     // should fail loud — either ReservedPrefixInBody or
     // MalformedFence is acceptable per the handoff.
     let bogus = "```bgraph\n\
-                 {\"schema\":\"2.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
+                 {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
                  ```\n\
                  \n\
                  ```bgraph-mystery\n\
@@ -502,4 +507,145 @@ fn bgraph_md_parse_direct_entry_point_works() {
     let result = bgraph_md::parse(&md, ParseOptions::default()).expect("parses");
     assert!(matches!(result.identity, ParseIdentity::Verified));
     assert_eq!(canonical_json(&original), canonical_json(&result.graph));
+}
+
+// =========================================================================
+// Block C — the honest 1.0.0 reset, the codec seam, and json
+// self-verification. (Museum design-flow Block C.)
+// =========================================================================
+
+/// Extract the doc-level `bgraph` block JSON from an emitted bgraph.md.
+fn doc_level_json(md: &str) -> serde_json::Value {
+    let line = md
+        .lines()
+        .nth(1)
+        .expect("doc-level fence has a JSON line below the fence open");
+    serde_json::from_str(line).expect("doc-level JSON parses")
+}
+
+#[test]
+fn block_c_emit_stamps_1_0_0_in_both_serializations() {
+    // C.1: the reset. Both serializations advertise the honest inaugural
+    // edition `1.0.0`.
+    let graph = build_synthetic_graph(vec![("Section", "S", 1, 0)], Some("Doc"), None);
+    let md = emit_markdown(&graph, &synthetic_provenance());
+    let md_schema = doc_level_json(&md)["schema"].as_str().unwrap().to_string();
+    assert_eq!(md_schema, "1.0.0", "md doc-level `schema` must be 1.0.0");
+
+    let sorted = graph.to_sorted_graph(Some(&synthetic_provenance()));
+    assert_eq!(
+        sorted.schema_version, "1.0.0",
+        "json `schema_version` must be 1.0.0"
+    );
+}
+
+#[test]
+fn block_c_1x_roundtrips_verified_non_1x_rejected() {
+    // C.1: a 1.x bgraph.md round-trips to Verified; a retired non-1.x
+    // schema is a clean UnsupportedSchema (never best-effort-read).
+    let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], Some("Doc"), None);
+    let md = emit_markdown(&graph, &synthetic_provenance());
+    let result = parse_markdown(&md, ParseOptions::default()).expect("1.x parses");
+    assert!(matches!(result.identity, ParseIdentity::Verified));
+
+    for retired in ["0.9.0", "2.0.0", "5.0.0"] {
+        let tampered = md.replacen("\"schema\":\"1.0.0\"", &format!("\"schema\":\"{retired}\""), 1);
+        let result = parse_markdown(&tampered, ParseOptions { accept_drift: true });
+        assert!(
+            matches!(result, Err(ParseError::UnsupportedSchema(_))),
+            "retired schema {retired} must be rejected; got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn block_c_seam_is_a_pure_refactor() {
+    // C.2: routing emit/canonicalize through the seam
+    // (`FormatVersion::CURRENT`) reproduces the direct calls byte-for-
+    // byte — the seam threads the version differently, it does not change
+    // the content. And the `graph_sha256` *value* is unchanged (it is
+    // version-independent — the reset is a renumber, not a canonical-form
+    // change).
+    let graph = build_synthetic_graph(
+        vec![("Section", "Intro", 1, 0), ("Paragraph", "Body text.", 2, 1)],
+        Some("Doc"),
+        None,
+    );
+    let prov = synthetic_provenance();
+
+    // emit wrapper == direct emit
+    assert_eq!(
+        emit_markdown_as(FormatVersion::CURRENT, &graph, &prov, EmitOptions::default()),
+        emit_markdown_with_options(&graph, &prov, EmitOptions::default()),
+        "the V1_0 emit arm must be the identity of the direct emitter"
+    );
+    // canonicalize wrapper == direct canonical_json
+    assert_eq!(
+        canonicalize_as(FormatVersion::CURRENT, &graph),
+        canonical_json(&graph),
+        "the V1_0 canonicalize arm must be the identity canonicalizer"
+    );
+    // the doc-level block's graph_sha256 equals the version-independent
+    // content-body hash — the seam did not move identity.
+    let md = emit_markdown(&graph, &prov);
+    let doc_sha = doc_level_json(&md)["graph_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(doc_sha, graph_sha256(&graph), "graph_sha256 value must not move");
+}
+
+#[test]
+fn block_c_json_envelope_is_self_verifiable() {
+    // C.3: the json envelope now carries `graph_sha256`, equal to the md
+    // doc-level block's value for the same graph; a round-tripped json
+    // graph verifies to `Verified`.
+    let graph = build_synthetic_graph(
+        vec![("Section", "Intro", 1, 0), ("Paragraph", "Body.", 2, 1)],
+        Some("Doc"),
+        None,
+    );
+    let prov = synthetic_provenance();
+
+    let sorted = graph.to_sorted_graph(Some(&prov));
+    // envelope value == content-body hash == md doc-level block value
+    assert_eq!(sorted.graph_sha256, graph_sha256(&graph));
+    let md = emit_markdown(&graph, &prov);
+    assert_eq!(
+        sorted.graph_sha256,
+        doc_level_json(&md)["graph_sha256"].as_str().unwrap(),
+        "json envelope graph_sha256 must equal the md doc-level block's"
+    );
+
+    // serialize → deserialize → verify
+    let json = serde_json::to_string(&sorted).expect("serializes");
+    let reloaded: SortedDocumentGraph = serde_json::from_str(&json).expect("deserializes");
+    assert_eq!(
+        reloaded.verify_identity(),
+        ParseIdentity::Verified,
+        "an untampered loaded json graph must verify"
+    );
+}
+
+#[test]
+fn block_c_json_verify_detects_tamper() {
+    // C.3: mutate the content body of a loaded json graph while leaving
+    // the embedded envelope hash intact → the recompute no longer matches
+    // → a `Derivative` verdict (the json-side analogue of the md path's
+    // tamper detection).
+    let graph = build_synthetic_graph(vec![("Paragraph", "original.", 1, 0)], Some("Doc"), None);
+    let mut sorted = graph.to_sorted_graph(Some(&synthetic_provenance()));
+
+    // Tamper a body node's text; the embedded graph_sha256 is unchanged.
+    let body = sorted
+        .nodes
+        .iter_mut()
+        .find(|n| n.text_order.is_some())
+        .expect("has a body node");
+    body.content.text = "tampered.".to_string();
+
+    match sorted.verify_identity() {
+        ParseIdentity::Derivative { .. } => {}
+        other => panic!("tampered json must yield Derivative, got {other:?}"),
+    }
 }

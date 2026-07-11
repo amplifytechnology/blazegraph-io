@@ -194,6 +194,20 @@ pub struct DocumentGraph {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
     pub schema_version: String,
+    /// The content-body identity hash, embedded so a loaded graph.json is
+    /// **self-verifiable** — symmetric with the md doc-level block (Block
+    /// C.3). This is an **envelope** field: it wraps identity, is *not*
+    /// part of `canonical_json` / `graph_sha256` (which is computed over
+    /// `DocumentGraph` — the content body alone), and its value *equals*
+    /// the md doc-level block's `graph_sha256` for the same graph. Stamped
+    /// in `to_sorted_graph`; checked by
+    /// [`SortedDocumentGraph::verify_identity`].
+    ///
+    /// `#[serde(default)]` keeps pre-Block-C fixtures (which never carried
+    /// it) loadable — the default is the empty string, which
+    /// `verify_identity` treats as "no embedded hash to check against".
+    #[serde(default)]
+    pub graph_sha256: String,
     /// Wall-clock time at which this graph was serialized to disk.
     /// Lives on the wrapper (not on `DocumentGraph`) so `canonical_json`
     /// is deterministic across runs of the same logical graph — see
