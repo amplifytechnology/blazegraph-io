@@ -169,11 +169,13 @@ pub enum ParseError {
         recomputed: String,
     },
 
-    /// The doc-level block carried a `schema` field whose major
-    /// version is not `1`. The current bgraph.md wire-format major is
-    /// 1; older/newer majors are rejected rather than silently
-    /// misinterpreted.
-    #[error("unsupported schema version {0}; expected 1.x.y")]
+    /// The doc-level block carried a `schema` field whose major version
+    /// is outside the range this parser has a read-path arm for.
+    /// `2.x`–`5.x` share one structural read path (CR-57 single
+    /// convention through CR-84); `1.x` predates it and `6.x`+ has no arm
+    /// yet, so both are rejected rather than silently misinterpreted. See
+    /// `bgraph_md::validate_schema`.
+    #[error("unsupported schema version {0}; supported range is 2.x.y through 5.x.y")]
     UnsupportedSchema(String),
 
     /// Body content contained a line starting with the reserved
