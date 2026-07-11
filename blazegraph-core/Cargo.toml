@@ -1,6 +1,12 @@
 [package]
 name = "blazegraph-io-core"
-version = "0.2.2"
+# CR-87 stopgap retro-bump 0.2.2 → 0.3.0: output materially changed since
+# 0.2.2 (Block A content-body identity + CR-84 node-ID re-key). The graph
+# cache key now tracks this (cache::versions::BLAZEGRAPH_VERSION =
+# crate::VERSION), so the bump invalidates stale entries. NOT a designed
+# release scheme — the coherent core+CLI version overhaul is deferred to
+# CR-85 (ledger item 6).
+version = "0.3.0"
 edition = "2021"
 description = "Core library for semantic document graph processing — parse PDFs into structured, queryable graphs"
 license = "MIT OR Apache-2.0"
