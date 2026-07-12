@@ -23,6 +23,20 @@ pub struct ParsingConfig {
     /// Include raw Tika XML/HTML output in graph metadata for debugging
     #[serde(default)]
     pub include_raw_tika: bool,
+    /// CR-86 / DT-12: when `true`, the build populates
+    /// `DocumentNode.style_info` (verbatim Tika style projection); when
+    /// `false` (default) the build leaves it `None` so the emitted
+    /// `style_info` is `null` on every node. This is a **build-time value
+    /// gate**, not a serialization gate — the field is *always* on the wire
+    /// (see `DocumentNode.style_info`); this flag only decides whether it
+    /// carries data. Because it lives on `ParsingConfig` it flows into
+    /// `config_hash`, so the null-style and data-style editions have
+    /// distinct `config_hash` (and distinct C3 cache keys — no collision).
+    /// Default `false`: style is debug / data-science-lab payload (~20%
+    /// output size, DT-03), kept behind the flag. `#[serde(default)]` keeps
+    /// pre-CR-86 YAML configs deserializing.
+    #[serde(default)]
+    pub include_style_info: bool,
     /// Pipeline configuration - defines which rules to run and in what order
     #[serde(default)]
     pub pipeline: PipelineConfig,
@@ -1556,6 +1570,7 @@ impl ConfigManager {
                 "references".to_string(),
             ],
             include_raw_tika: false, // Default to false for backward compatibility
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase - document type specific tuning
@@ -1612,6 +1627,7 @@ impl ConfigManager {
                 "conditions".to_string(),
             ],
             include_raw_tika: false, // Default to false for backward compatibility
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
@@ -1661,6 +1677,7 @@ impl ConfigManager {
                 "approach".to_string(),
             ],
             include_raw_tika: false, // Default to false for backward compatibility
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
@@ -1725,6 +1742,7 @@ impl Default for ParsingConfig {
             },
             section_patterns: vec![],
             include_raw_tika: false,
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(),

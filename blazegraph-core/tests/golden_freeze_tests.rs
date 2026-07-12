@@ -35,7 +35,7 @@
 //! freezes only bgraph.md (bgraph.json is CR-88).
 
 use blazegraph_io_core::config::ParsingConfig;
-use blazegraph_io_core::graphs::serialization::markdown::{emit_markdown_with_options, EmitOptions};
+use blazegraph_io_core::graphs::serialization::markdown::emit_markdown;
 use blazegraph_io_core::preprocessors::md::{parse_markdown, ParseIdentity, ParseOptions};
 use blazegraph_io_core::preprocessors::Preprocessor;
 use blazegraph_io_core::processor::DocumentProcessor;
@@ -154,23 +154,18 @@ fn regenerate_bgraph_md() -> String {
         )
         .expect("C2 replay builds the graph deterministically");
 
-    // Anchor emit carries `style` on the wire (`include_style_info: true`).
-    // Rationale: `graph_sha256` (the identity hash) is computed over the full
-    // serialized `DocumentGraph`, which for a PDF-source graph includes each
-    // node's populated `style_info`. The parser (CR-45) restores `style_info`
-    // from the wire `style` field — but only when the md carries it. The
-    // default emit (`include_style_info: false`) omits `style`, so a re-parse
-    // reconstructs `style_info: None` and the recomputed hash no longer matches
-    // the embedded one — i.e. a default-emitted bgraph.md for a style-bearing
-    // PDF graph does NOT self-verify. The golden anchor must round-trip to
-    // `Verified`, so it is frozen WITH style. `make golden-generate` passes
-    // `--include-style-info` to match this byte-for-byte. (The default-omitted
-    // production wire and the style round-trip are CR-86's open question; this
-    // anchor documents the coupling rather than papering over it.)
-    let opts = EmitOptions {
-        include_style_info: true,
-    };
-    emit_markdown_with_options(&graph, &provenance, opts)
+    // CR-86 / DT-12: the anchor is the **default null-style `1.0.0`
+    // edition**. `style_info` is now an always-present, config-valued node
+    // field, gated at *build* time: the golden `config.yaml` leaves
+    // `include_style_info` off (the default), so the built graph carries
+    // `style_info: None` on every node. `graph_sha256` covers that (`null`),
+    // the emitter serializes it (`"style":null`), and a re-parse
+    // reconstructs `None` → the recomputed hash matches → `Verified` on the
+    // default path. No emit flag: the emitter serializes exactly what the
+    // graph holds. (The provisional Block D workaround — freezing WITH
+    // `--include-style-info` because the default emit didn't self-verify —
+    // is exactly the bug CR-86 fixes; it is gone.)
+    emit_markdown(&graph, &provenance)
 }
 
 /// `blazegraph-io` git HEAD sha — the codebase_sha binding recorded in the

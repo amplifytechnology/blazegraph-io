@@ -582,6 +582,24 @@ impl DocumentProcessor {
             );
         }
 
+        // CR-86 / DT-12: build-time value gate for `style_info`. The PDF
+        // pipeline populates `DocumentNode.style_info` on every body node
+        // (via `project_style` → the builder), and the rules above consume
+        // it (font-based section detection, detectors) — so we keep it
+        // populated through the whole build. Here, as the last step before
+        // the graph leaves the builder, we gate the *emitted* value on the
+        // config: unless `include_style_info` is on, strip it to `None` so
+        // the graph carries the config-correct value. `graph_sha256`, md,
+        // and json all serialize this one graph → hash equals wire by
+        // construction (the field is always on the wire as `null`; only the
+        // value is gated here). Distinct `config_hash` per edition keeps the
+        // C3 graph cache keyed correctly (no null/data collision).
+        if !config.include_style_info {
+            for node in graph.nodes.values_mut() {
+                node.style_info = None;
+            }
+        }
+
         Ok(graph)
     }
 }

@@ -261,6 +261,52 @@ fn roundtrip_identity_synthetic_small() {
 }
 
 #[test]
+fn roundtrip_identity_with_style_data_verified() {
+    // CR-86 / DT-12: the **style-on** edition round-trips to `Verified`.
+    // The default (null-style) edition is covered by every other test in
+    // this file (`style: None`) plus the real-PDF golden Test B. This test
+    // covers the other edition: populate `style_info` with data on a body
+    // node (as the with-style build does), emit — `style` now carries data
+    // on the wire — re-parse, and assert the canonical bytes match and the
+    // identity is `Verified`. Data on both sides, hash equals wire by
+    // construction. (The null-style and this data-style graph have
+    // different `graph_sha256` — distinct editions, which is correct.)
+    let mut original = build_synthetic_graph(
+        vec![
+            ("Section", "Introduction", 1, 0),
+            ("Paragraph", "Hello world.", 1, 1),
+        ],
+        Some("Styled Test Doc"),
+        None,
+    );
+    let para_id = original
+        .nodes
+        .values()
+        .find(|n| n.node_type == "Paragraph")
+        .map(|n| n.id)
+        .expect("Paragraph node present");
+    original.nodes.get_mut(&para_id).unwrap().style_info = Some(StyleMetadata {
+        font_class: "f7".to_string(),
+        font_size: Some(11.5),
+        is_bold: true,
+        is_italic: false,
+        font_family: Some("NimbusRomNo9L".to_string()),
+        foreground_color: Some("#101010".to_string()),
+        background_color: None,
+    });
+
+    // Prove the with-style wire actually carries the data (not `null`).
+    let md = emit_markdown(&original, &synthetic_provenance());
+    assert!(
+        md.contains("\"style\":{\"font_class\":\"f7\""),
+        "style-on edition must serialize `style` as data; got:\n{md}"
+    );
+
+    // And it round-trips to Verified (data on both sides).
+    assert_roundtrip_identity(&original, &synthetic_provenance());
+}
+
+#[test]
 fn legacy_confidence_key_in_fence_is_tolerated_and_dropped() {
     // v4.0.0 (Block A / Amendment M): `confidence` left the wire. A legacy
     // fence carrying the key must still parse (serde drops unknown fields);

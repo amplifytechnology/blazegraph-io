@@ -258,7 +258,16 @@ pub struct DocumentNode {
     pub location: NodeLocation,
     pub text_order: Option<u32>,
     pub content: NodeContent,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // CR-86 / DT-12: `style_info` is an **always-present, config-valued**
+    // field — never omitted. It serializes as `null` when style is off
+    // (the default edition) and as data when `--include-style-info` is on.
+    // The `skip_serializing_if` was removed so the key is always on the
+    // wire and always in `canonical_json` / `graph_sha256`: the value is
+    // gated at build time (see `processor::rules_and_graph`), so the graph
+    // carries the config-correct value and hash-equals-wire holds by
+    // construction. Always-present (not sometimes-present) keeps the field
+    // inside the arch-14 §6 intersection invariant trivially and out of the
+    // DT-11 empty→populated churn hazard.
     pub style_info: Option<StyleMetadata>,
     pub token_count: usize,
     pub parent: Option<NodeId>,

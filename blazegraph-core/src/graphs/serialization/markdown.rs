@@ -16,31 +16,19 @@ use super::version::FormatVersion;
 use crate::types::*;
 use serde::Serialize;
 
-/// Emitter options. Defaults are the wire-format default — anything
-/// gated behind a flag is opt-in.
+/// Emitter options — the opt-in-flags slot of the versioned-codec seam
+/// (`emit_markdown_as`). **Currently empty.**
 ///
-/// CR-59 (v2.1.0+): `include_style_info` gates whether the per-element
-/// JSON carries the `style` field. CR-45 introduced the field but
-/// shipped with a default of "always emit"; CR-59 reverted the default
-/// to opt-in because the 178-line-per-Shannon bloat outweighed the
-/// debug-readability benefit. The in-memory pipeline still populates
-/// `DocumentNode.style_info` regardless — library consumers of the
-/// `Graph` data structure see style on every PDF-source body node. Only
-/// the bgraph.md serializer gates on the flag.
+/// CR-86 / DT-12 removed the former `include_style_info` flag: `style_info`
+/// is no longer *emit*-gated. It is an always-present, config-valued node
+/// field whose value is gated at **build** time
+/// (`ParsingConfig::include_style_info` → `processor::rules_and_graph`).
+/// The emitter is now dumb — it serializes exactly what the graph holds
+/// (`null` when the build stripped style, data when it kept it), so
+/// `graph_sha256` equals the wire in every mode. The struct is retained as
+/// the seam for future *serialization-time* flags; there are none today.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct EmitOptions {
-    /// When `true`, the per-element JSON carries the `style` field for
-    /// every node whose `style_info` is `Some(...)`. When `false`
-    /// (default), the `style` field is omitted unconditionally. Round-
-    /// trip identity holds in both modes; the parser tolerates either
-    /// shape on input.
-    ///
-    /// CR-84 / CR-86: **debug/inspection-only.** This gate exists so
-    /// `style_info` can be inspected on the wire; the production emit
-    /// path is the default (style omitted). The style round-trip
-    /// question is CR-86's, deferred.
-    pub include_style_info: bool,
-}
+pub struct EmitOptions {}
 
 /// Emit a `DocumentGraph` to bgraph.md format. Targets the current
 /// [`BGRAPH_FORMAT_VERSION`]. Uses [`EmitOptions::default()`] — the
@@ -52,20 +40,21 @@ pub struct EmitOptions {
 /// on `graph.document_info` (with a runtime `.expect()` here); threading
 /// it as a value keeps zero hidden state on `DocumentGraph`.
 ///
-/// For PDF-source graphs whose emitted bgraph.md should carry `style`
-/// on every per-element fence, call [`emit_markdown_with_options`] with
-/// `EmitOptions { include_style_info: true }`.
+/// Whether the emitted bgraph.md carries `style` data on its per-element
+/// fences is decided at **build** time (`ParsingConfig::include_style_info`
+/// → the graph's `style_info` values), not here — this emitter always
+/// serializes exactly what the graph holds (`null` when stripped).
 pub fn emit_markdown(graph: &DocumentGraph, provenance: &ParseProvenance) -> String {
     emit_markdown_with_options(graph, provenance, EmitOptions::default())
 }
 
 /// Emit a `DocumentGraph` to bgraph.md format with explicit options. See
-/// [`EmitOptions`] for the available flags and [`emit_markdown`] for the
-/// provenance contract.
+/// [`EmitOptions`] (currently empty — the seam for future serialization-
+/// time flags) and [`emit_markdown`] for the provenance contract.
 pub fn emit_markdown_with_options(
     graph: &DocumentGraph,
     provenance: &ParseProvenance,
-    opts: EmitOptions,
+    _opts: EmitOptions,
 ) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(graph.nodes.len() + 6);
     parts.push(emit_document_level_block(graph, provenance));
@@ -97,7 +86,7 @@ pub fn emit_markdown_with_options(
     nodes.sort_by_key(|n| n.text_order.expect("filtered above"));
 
     for node in nodes {
-        if let Some(chunk) = emit_node(node, opts) {
+        if let Some(chunk) = emit_node(node) {
             parts.push(chunk);
             parts.push(String::new()); // blank line between elements
         }
@@ -201,8 +190,8 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 /// Fence-tag derivation goes through [`node_type_to_fence_tag`] so
 /// multi-word variants get kebab-case per CR-56 § I.5 / F-11
 /// (`CodeBlock` → `bgraph-code-block`, `Blockquote` → `bgraph-block-quote`).
-fn emit_node(node: &DocumentNode, opts: EmitOptions) -> Option<String> {
-    let meta = node_metadata_json(node, opts);
+fn emit_node(node: &DocumentNode) -> Option<String> {
+    let meta = node_metadata_json(node);
     let text = &node.content.text;
     if node.node_type == "Document" {
         return None; // synthetic root; not a content node
@@ -254,7 +243,7 @@ fn node_type_to_fence_tag(node_type: &str) -> &'static str {
 /// `content.text` (lives in markdown body or inside fence) and
 /// `parent`/`children` (derivable from heading structure on reverse
 /// parse).
-fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
+fn node_metadata_json(node: &DocumentNode) -> String {
     use crate::types::{ExternalRef, InternalRef};
     #[derive(Serialize)]
     struct NodeMetadata<'a> {
@@ -278,24 +267,19 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         // (unknown fields are dropped).
         /// CR-45: verbatim Tika style projection (foreground / background
         /// color, font_family, font_size, is_bold, is_italic, font_class).
-        /// CR-59 (v2.1.0+): gated on `EmitOptions::include_style_info`. When
-        /// the flag is `false` (default), this slot is always `None` so
-        /// `skip_serializing_if` omits the field entirely — regardless of
-        /// whether `node.style_info` is populated. The in-memory carrier
-        /// (`DocumentNode.style_info`) stays populated for library
-        /// consumers; only the wire-format emission is gated. Shape is
+        /// CR-86 / DT-12: **always emitted** — `null` when
+        /// `node.style_info` is `None` (the style-off edition), data when
+        /// populated. No `skip_serializing_if`: the key is always on the
+        /// wire, mirroring `DocumentNode.style_info`, so `graph_sha256`
+        /// (over the graph) equals the emitted bytes by construction. The
+        /// value is gated at build time
+        /// (`ParsingConfig::include_style_info`), never here. Shape is
         /// verbatim Tika projection — see DT-03.
-        #[serde(skip_serializing_if = "Option::is_none")]
         style: Option<&'a StyleMetadata>,
     }
-    // CR-59: style emission is opt-in. When the flag is off we pass
-    // `None` regardless of `node.style_info`; `skip_serializing_if`
-    // then drops the field.
-    let style = if opts.include_style_info {
-        node.style_info.as_ref()
-    } else {
-        None
-    };
+    // CR-86: the emitter is dumb — it serializes exactly the graph's
+    // `style_info` (always present as a key; `null` when the build gate
+    // stripped it, data when it kept it).
     let meta = NodeMetadata {
         id: &node.id,
         node_type: &node.node_type,
@@ -304,7 +288,7 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         token_count: node.token_count,
         internal_refs: &node.internal_refs,
         external_refs: &node.external_refs,
-        style,
+        style: node.style_info.as_ref(),
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
 }
@@ -646,15 +630,17 @@ mod tests {
         let section_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"test:0");
         let paragraph_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"test:1");
 
+        // CR-86 / DT-12: `style` is always emitted — `null` here (these
+        // synthetic nodes carry no style_info).
         let expected = format!(
             "# Intro\n\
              ```bgraph-section\n\
-             {{\"id\":\"{section_id}\",\"node_type\":\"Section\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":1}}\n\
+             {{\"id\":\"{section_id}\",\"node_type\":\"Section\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":1,\"style\":null}}\n\
              ```\n\
              \n\
              Hello.\n\
              ```bgraph-paragraph\n\
-             {{\"id\":\"{paragraph_id}\",\"node_type\":\"Paragraph\",\"location\":{{\"semantic\":{{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":1,\"token_count\":1}}\n\
+             {{\"id\":\"{paragraph_id}\",\"node_type\":\"Paragraph\",\"location\":{{\"semantic\":{{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":1,\"token_count\":1,\"style\":null}}\n\
              ```\n\
              ",
         );
@@ -1086,14 +1072,15 @@ mod tests {
     // variant + struct remain in `types.rs` as future-design sentinels.
 
     // ===================================================================
-    // CR-59 (v2.1.0+) emit tests: style emit-gating.
+    // CR-86 / DT-12 emit tests: `style` is always-emitted, value-gated.
+    // (Supersedes the CR-59 emit-gate tests — style is no longer gated at
+    // serialization; the emitter serializes exactly what the graph holds.)
     // ===================================================================
 
     #[test]
-    fn style_omitted_by_default_even_when_node_carries_it() {
-        // Build a graph and populate `style_info` on its single
-        // Paragraph node. With default `EmitOptions` the emitter must
-        // omit `style` from the per-element JSON regardless.
+    fn style_emitted_as_data_when_node_carries_it() {
+        // When a node's `style_info` is populated (the style-on edition —
+        // the build kept it), the per-element JSON carries `style` as data.
         let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
         let para_id = graph
             .nodes
@@ -1112,57 +1099,23 @@ mod tests {
         });
         let md = emit(&graph);
         assert!(
-            !md.contains("\"style\""),
-            "default EmitOptions must omit `style` even when node.style_info is Some; got:\n{md}"
-        );
-    }
-
-    #[test]
-    fn style_emitted_when_include_flag_set_and_node_carries_it() {
-        let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
-        let para_id = graph
-            .nodes
-            .values()
-            .find(|n| n.node_type == "Paragraph")
-            .map(|n| n.id)
-            .expect("Paragraph node present");
-        graph.nodes.get_mut(&para_id).unwrap().style_info = Some(StyleMetadata {
-            font_class: "f1".to_string(),
-            font_size: Some(10.0),
-            is_bold: false,
-            is_italic: false,
-            font_family: Some("Helvetica".to_string()),
-            foreground_color: Some("#000000".to_string()),
-            background_color: None,
-        });
-        let md = emit_markdown_with_options(
-            &graph,
-            &test_provenance(),
-            EmitOptions {
-                include_style_info: true,
-            },
-        );
-        assert!(
             md.contains("\"style\":{"),
-            "include_style_info=true must emit `style` when node.style_info is Some; got:\n{md}"
+            "populated style_info must serialize `style` as data; got:\n{md}"
         );
     }
 
     #[test]
-    fn style_omitted_when_include_flag_set_but_node_lacks_it() {
-        // skip_serializing_if=Option::is_none still applies: when the
-        // node has no style, the field is absent even with the flag on.
+    fn style_emitted_as_null_when_node_lacks_it() {
+        // When a node's `style_info` is `None` (the default null-style
+        // edition — the build stripped it), the key is STILL emitted, as
+        // `null`. This is the CR-86 always-present contract: the field is
+        // never omitted, so `graph_sha256` (which now covers `null`) equals
+        // the wire and a default-path re-parse self-verifies.
         let graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
-        let md = emit_markdown_with_options(
-            &graph,
-            &test_provenance(),
-            EmitOptions {
-                include_style_info: true,
-            },
-        );
+        let md = emit(&graph);
         assert!(
-            !md.contains("\"style\""),
-            "with-flag emit must still omit `style` when node.style_info is None; got:\n{md}"
+            md.contains("\"style\":null"),
+            "None style_info must serialize `style` as null (always-present); got:\n{md}"
         );
     }
 

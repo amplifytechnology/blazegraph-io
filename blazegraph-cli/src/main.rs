@@ -112,19 +112,19 @@ struct ParseArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Include `style` on every per-element fence in the emitted bgraph.md
-    /// (verbatim Tika projection — `foreground_color`, `background_color`,
-    /// `font_family`, `font_size`, `is_bold`, `is_italic`, `font_class`).
-    /// CR-59 reverted the default to opt-in: by default the wire-format
-    /// emitter omits `style` (the in-memory `node.style_info` is still
-    /// populated for library consumers). Pass this flag to round-trip a
-    /// PDF-source graph with style preserved in the emitted bgraph.md.
-    /// PDF channel only.
+    /// Populate `style_info` (verbatim Tika projection — `foreground_color`,
+    /// `background_color`, `font_family`, `font_size`, `is_bold`,
+    /// `is_italic`, `font_class`) on every node of the built graph. PDF
+    /// channel only.
     ///
-    /// CR-84 / CR-86: **debug/inspection-only.** This flag exists so
-    /// `style_info` can be inspected on the wire; it is not the
-    /// production emit path (default emit omits style). The style
-    /// half of the round-trip question is deferred to CR-86.
+    /// CR-86 / DT-12: this is a **build-time value gate**, not an emit flag.
+    /// The `style_info` field is *always* on the wire (`null` when off,
+    /// data when on); this flag decides the value. It folds into
+    /// `config_hash`, so with-style and null-style are distinct editions
+    /// with distinct identity. Default (flag absent) → the null-style
+    /// edition, which round-trips to `Verified`. Style is debug /
+    /// data-science-lab payload (~20% output size, DT-03), so it is off by
+    /// default.
     #[arg(long)]
     include_style_info: bool,
 
@@ -385,6 +385,14 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
     if args.minimal_parse {
         config.minimal_parse = true;
     }
+    // CR-86 / DT-12: `--include-style-info` is a **build-time** value gate
+    // now (was an emit flag). Setting it on the config populates
+    // `DocumentNode.style_info` during the build and folds into
+    // `config_hash`, so the with-style output is a distinct edition. Default
+    // (flag absent) → null-style edition, which self-verifies on round-trip.
+    if args.include_style_info {
+        config.include_style_info = true;
+    }
 
     // Resolve fresh-from: --skip-cache takes precedence
     let fresh_from = if args.skip_cache {
@@ -434,19 +442,13 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
             println!("✅ Successfully processed document");
             println!("📊 Graph: {} nodes", graph.nodes.len());
 
-            // CR-59 (v2.1.0+): style emission is opt-in. The pipeline
-            // always populates `node.style_info` for library consumers;
-            // only the bgraph.md serializer gates emission, threaded
-            // through `save_graph` → `EmitOptions::include_style_info`.
-            // Block A: provenance rides beside the graph as a value.
+            // CR-86 / DT-12: style is gated at build time (the graph's
+            // `style_info` values already reflect `config.include_style_info`).
+            // The emitter serializes what the graph holds; `save_graph`
+            // no longer takes an emit flag. Block A: provenance rides
+            // beside the graph as a value.
             let output_path = resolve_output_path(&args);
-            save_graph(
-                &graph,
-                &provenance,
-                &output_path,
-                &args.output_format,
-                args.include_style_info,
-            )?;
+            save_graph(&graph, &provenance, &output_path, &args.output_format)?;
 
             // Fast exit - skip JVM shutdown sequence
             #[cfg(feature = "jni-backend")]
@@ -592,17 +594,12 @@ fn emit_parsed_graph(
 ) -> Result<()> {
     println!("📊 Graph: {} nodes", graph.nodes.len());
 
-    // CR-59 (v2.1.0+): style emission is opt-in. Pipeline keeps
-    // `node.style_info` populated for library consumers; the bgraph.md
-    // serializer is gated via `EmitOptions::include_style_info`.
+    // CR-86 / DT-12: style is a build-time value gate. The md/docx
+    // channels parse an existing artifact, so the reconstructed graph's
+    // `style_info` reflects whatever the input carried; the emitter
+    // serializes exactly that. No emit flag.
     let output_path = resolve_output_path(args);
-    save_graph(
-        &graph,
-        &provenance,
-        &output_path,
-        &args.output_format,
-        args.include_style_info,
-    )?;
+    save_graph(&graph, &provenance, &output_path, &args.output_format)?;
     Ok(())
 }
 
@@ -987,7 +984,6 @@ fn save_graph(
     provenance: &ParseProvenance,
     output_path: &str,
     format: &str,
-    include_style_info: bool,
 ) -> Result<()> {
     match format {
         // B6: `-f markdown` is the generic-markdown emitter.
@@ -1019,18 +1015,14 @@ fn save_graph(
             println!("💾 Markdown saved to: {}", output_path);
         }
         "bgraph-md" => {
-            // CR-59 (v2.1.0+): the bgraph.md emitter takes an explicit
-            // options struct; the CLI threads `--include-style-info`
-            // through. Other output formats don't carry style on the
-            // wire (graph.json carries it via `DocumentNode.style_info`
-            // directly; generic markdown has no per-element JSON).
-            let opts = blazegraph_io_core::graphs::serialization::markdown::EmitOptions {
-                include_style_info,
-            };
-            let md =
-                blazegraph_io_core::graphs::serialization::markdown::emit_markdown_with_options(
-                    graph, provenance, opts,
-                );
+            // CR-86 / DT-12: the emitter is dumb — it serializes exactly
+            // the graph's `style_info` (always present, `null` when the
+            // build stripped it). Whether style carries data is a
+            // build-time decision (`config.include_style_info`), already
+            // baked into the graph by the time we get here — no emit flag.
+            let md = blazegraph_io_core::graphs::serialization::markdown::emit_markdown(
+                graph, provenance,
+            );
             std::fs::write(output_path, md)?;
             println!("💾 bgraph.md saved to: {}", output_path);
         }
