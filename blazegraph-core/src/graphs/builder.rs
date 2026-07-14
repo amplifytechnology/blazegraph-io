@@ -194,86 +194,6 @@ impl GraphBuilder {
         Ok(graph)
     }
 
-    /// Build a document graph with random UUIDv4 IDs (legacy fallback).
-    /// Used by --dump-stages and other paths that don't have source/config
-    /// hashes.
-    pub fn build_graph(&self, elements: Vec<SemanticTreeElement>) -> Result<DocumentGraph> {
-        eprintln!(
-            "🏗️  Building document graph from {} elements",
-            elements.len()
-        );
-
-        let mut graph = DocumentGraph::new();
-        let mut node_stack: Vec<NodeId> = Vec::new();
-
-        let root_id = graph.document_info.root_id;
-        node_stack.push(root_id);
-
-        // Create the Document root node
-        let document_node = DocumentNode {
-            id: root_id,
-            node_type: "Document".to_string(),
-            location: NodeLocation {
-                semantic: SemanticLocation {
-                    path: String::new(),
-                    depth: 0,
-                    breadcrumbs: Vec::new(),
-                },
-                physical: None,
-            },
-            text_order: None,
-            content: NodeContent {
-                text: "Document".to_string(),
-            },
-            style_info: None,
-            token_count: 0,
-            parent: None,
-            children: Vec::new(),
-            internal_refs: vec![],
-            external_refs: vec![],
-        };
-        graph.nodes.insert(root_id, document_node);
-
-        for (index, element) in elements.iter().enumerate() {
-            let node = self.create_node_v4(element, index as u32);
-            let node_id = node.id;
-
-            let parent_id = self.find_parent(&mut node_stack, element.hierarchy_level, root_id);
-
-            let mut final_node = node;
-            final_node.parent = Some(parent_id);
-            final_node.location.semantic.depth = element.hierarchy_level;
-            final_node.text_order = Some(index as u32);
-            final_node.location.semantic.path =
-                self.generate_hierarchical_path(&graph, parent_id, index);
-
-            graph.nodes.insert(node_id, final_node);
-
-            if let Some(parent) = graph.nodes.get_mut(&parent_id) {
-                parent.children.push(node_id);
-            }
-
-            if matches!(element.element_type, SemanticElementType::Section) {
-                while let Some(&stack_id) = node_stack.last() {
-                    if let Some(stack_node) = graph.nodes.get(&stack_id) {
-                        if stack_node.location.semantic.depth >= element.hierarchy_level {
-                            node_stack.pop();
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                node_stack.push(node_id);
-            }
-        }
-
-        eprintln!("✅ Graph built: {} nodes", graph.nodes.len());
-
-        Ok(graph)
-    }
-
     fn find_parent(&self, node_stack: &mut Vec<NodeId>, level: u32, root_id: NodeId) -> NodeId {
         if level <= 1 {
             node_stack.truncate(1);
@@ -334,20 +254,6 @@ impl GraphBuilder {
         node
     }
 
-    /// Create node with random ID (UUIDv4, legacy).
-    fn create_node_v4(&self, element: &SemanticTreeElement, order: u32) -> DocumentNode {
-        let node_type_str = node_type_for(element.element_type);
-        let mut node = DocumentNode::new(node_type_str, element.text.clone());
-        node.location.physical = element.physical_location.clone();
-        node.text_order = Some(order);
-        node.token_count = element.token_count;
-        node.style_info = element.style.clone();
-        // CR-62: see above.
-        node.internal_refs = element.internal_refs.clone();
-        node.external_refs = element.external_refs.clone();
-        // Block A / A3: see above — confidence stays off the node.
-        node
-    }
 }
 
 /// CR-83: occurrence-fold separator. Identical to the node-ID key's

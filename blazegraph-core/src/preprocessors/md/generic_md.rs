@@ -486,7 +486,7 @@ pub fn parse(input: &str, _opts: ParseOptions) -> Result<ParseResult, ParseError
     let source_sha256 = sha256_hex(input.as_bytes());
     let config_hash = "none".to_string();
     let provenance = ParseProvenance {
-        blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
+        blazegraph_version: crate::VERSION.to_string(),
         source_format: "markdown".to_string(),
         source_filename: String::new(), // CLI may overwrite; the lib doesn't know
         source_sha256: source_sha256.clone(),

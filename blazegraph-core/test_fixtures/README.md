@@ -155,10 +155,15 @@ records the sha:
 make golden-generate   # submodule Makefile; needs JRE + the Tika JAR
 ```
 
-> **C3 note:** the current pipeline does not write a C3 graph cache
-> (`store_graph_output` has no caller in `process_document_with_cache`), so the
-> family has no committed `c3-graph/` tier. The freeze needs only C2. If a C3
-> write path is added later, `golden-generate` will populate the slot.
+> **C3 note:** C3 is the cached **output** — the config-keyed `DocumentGraph`,
+> from which `bgraph.md`/`.json` are serialized on demand (it is the first
+> config-dependent tier; C0–C2 are config-independent intermediates). The
+> pipeline does not yet *write* C3 (`store_graph_output` has no caller in
+> `process_document_with_cache`); CR-89 corrected the read-gate, and wiring the
+> writer + API delivery is the **C3 output-cache feature CR**. The golden family
+> needs only C2 — the freeze replays via `FreshFrom::C3`, which skips the C3
+> read and always rebuilds — so it commits no `c3-graph/` tier. When the writer
+> lands, `golden-generate` can populate the slot.
 
 ## Git notes
 

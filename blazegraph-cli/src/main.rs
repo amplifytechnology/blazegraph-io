@@ -5,7 +5,7 @@ use std::path::Path;
 // Import from blazegraph-io-core
 use blazegraph_io_core::{
     CacheDefaults, CachePoint, DocumentGraph, DocumentProcessor, FreshFrom, ParseProvenance,
-    ParsingConfig, PipelineStages,
+    ParsingConfig,
 };
 
 /// Default config embedded at compile time — guarantees every install has working defaults.
@@ -127,16 +127,6 @@ struct ParseArgs {
     /// default.
     #[arg(long)]
     include_style_info: bool,
-
-    /// Dump all intermediate pipeline stage outputs to a directory.
-    /// Captures: XHTML, TextElements, ParsedElements, and final Graph as separate files.
-    /// PDF channel only.
-    #[arg(long)]
-    dump_stages: bool,
-
-    /// Directory for stage dump output (default: {cache_dir}/debug).
-    #[arg(long)]
-    stages_dir: Option<String>,
 
     // =========================================================================
     // Cache control (CR-11)
@@ -406,29 +396,6 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
     let cache_defaults = CacheDefaults::default();
 
     println!("📄 Processing: {}", args.input);
-
-    // Stage dump mode: capture and save all intermediates
-    if args.dump_stages {
-        let stages_dir = args
-            .stages_dir
-            .clone()
-            .unwrap_or_else(|| format!("{}/debug", cache_dir));
-        println!("\n🔬 Pipeline stage dump mode");
-        match processor.process_document_capture_stages(&args.input, &config) {
-            Ok(stages) => {
-                save_stages(&stages, &stages_dir)?;
-                println!("\n✅ All stages dumped to: {}", stages_dir);
-            }
-            Err(e) => {
-                eprintln!("❌ Stage dump failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        #[cfg(feature = "jni-backend")]
-        std::process::exit(0);
-        #[cfg(not(feature = "jni-backend"))]
-        return Ok(());
-    }
 
     // Process the document with cache point awareness
     match processor.process_document_with_cache(
@@ -929,54 +896,6 @@ fn show_help() {
         );
         println!("  Or specify your own JRE: --jre-path /path/to/jre");
     }
-}
-
-fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
-    use std::fs;
-    fs::create_dir_all(output_dir)?;
-
-    // Stage 1a: Raw XHTML
-    let xhtml_path = format!("{}/stage1a_xhtml.html", output_dir);
-    fs::write(&xhtml_path, &stages.xhtml)?;
-    println!("  💾 {}", xhtml_path);
-
-    // Stage 1b: TextElements
-    let te_path = format!("{}/stage1b_text_elements.json", output_dir);
-    let te_json = serde_json::to_string_pretty(&stages.text_elements)?;
-    fs::write(&te_path, &te_json)?;
-    println!("  💾 {} ({} elements)", te_path, stages.text_elements.len());
-
-    // Stage 2: ParsedElements
-    let pe_path = format!("{}/stage2_parsed_elements.json", output_dir);
-    let pe_json = serde_json::to_string_pretty(&stages.parsed_elements)?;
-    fs::write(&pe_path, &pe_json)?;
-    println!(
-        "  💾 {} ({} elements)",
-        pe_path,
-        stages.parsed_elements.len()
-    );
-
-    // Stage 3: Final graph
-    let graph_path = format!("{}/stage3_graph.json", output_dir);
-    // Stage-dump graphs come from the legacy provenance-free build path.
-    stages.graph.save_with_format(&graph_path, "graph", None)?;
-    println!("  💾 {} ({} nodes)", graph_path, stages.graph.nodes.len());
-
-    // Summary file
-    let summary = serde_json::json!({
-        "captured_at": chrono::Utc::now().to_rfc3339(),
-        "stage_counts": {
-            "xhtml_bytes": stages.xhtml.len(),
-            "text_elements": stages.text_elements.len(),
-            "parsed_elements": stages.parsed_elements.len(),
-            "graph_nodes": stages.graph.nodes.len(),
-        }
-    });
-    let summary_path = format!("{}/summary.json", output_dir);
-    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
-    println!("  💾 {}", summary_path);
-
-    Ok(())
 }
 
 fn save_graph(

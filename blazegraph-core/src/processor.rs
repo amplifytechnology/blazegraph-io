@@ -19,16 +19,6 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Captured intermediate outputs from each pipeline stage
-/// Used for testing and diagnostics — lets you inspect/compare each boundary
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PipelineStages {
-    pub xhtml: String,
-    pub text_elements: Vec<PdfTextElement>,
-    pub parsed_elements: Vec<ParsedPdfElement>,
-    pub graph: DocumentGraph,
-}
-
 /// Simple profiler that collects timings for pipeline steps
 pub struct StepProfiler {
     enabled: bool,
@@ -167,7 +157,7 @@ impl DocumentProcessor {
         // provenance documentation only.
         let config_hash = calculate_config_hash(config)?;
         let provenance = ParseProvenance {
-            blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
+            blazegraph_version: crate::VERSION.to_string(),
             source_format: "pdf".to_string(),
             source_filename: Path::new(input_path)
                 .file_name()
@@ -177,10 +167,15 @@ impl DocumentProcessor {
             config_hash: config_hash.clone(),
         };
 
-        // --- C3: Graph cache check ---
-        if fresh_from.should_use_cache(CachePoint::C3)
-            && cache_defaults.should_write(CachePoint::C3)
-        {
+        // --- C3: cached output (the DocumentGraph) ---
+        // C3 caches the finished, config-keyed graph — a hit skips the
+        // deterministic build and returns the output directly. The read gates
+        // on cache-eligibility alone (CR-89 removed the prior `should_write`
+        // mis-gate — a read must not depend on the write flag). The writer is
+        // wired by the C3 output-cache feature CR; until then this is a cheap
+        // miss. (The golden freeze replays via `FreshFrom::C3`, for which
+        // `should_use_cache(C3)` is false, so this branch is skipped there.)
+        if fresh_from.should_use_cache(CachePoint::C3) {
             let cache_key = GraphCacheKey::new(pdf_hash.clone(), config_hash.clone());
             if let Some(cached) = self.storage.get_graph_output(&cache_key)? {
                 println!(
@@ -266,127 +261,6 @@ impl DocumentProcessor {
             &CacheDefaults::default(),
             false,
         )
-    }
-
-    /// Process document and capture all intermediate stage outputs
-    /// Used for pipeline diagnostics (--dump-stages). Always runs fresh.
-    pub fn process_document_capture_stages(
-        &mut self,
-        input_path: &str,
-        config: &ParsingConfig,
-    ) -> Result<PipelineStages> {
-        let input_path_ref = Path::new(input_path);
-        let pdf_bytes = std::fs::read(input_path_ref)?;
-        let pdf_hash = calculate_source_hash(&pdf_bytes);
-
-        // Stage 1a: PDF → XHTML (always fresh for diagnostics)
-        let xhtml = self.preprocessor.parse_pdf_to_markup_language(&pdf_bytes)?;
-        println!("📋 Stage 1a: XHTML captured ({} bytes)", xhtml.len());
-
-        // Stage 1b: XHTML → TextElements
-        let preprocessor_output = self
-            .preprocessor
-            .parse_markup_to_preprocessor_output(&xhtml)?;
-        println!(
-            "📋 Stage 1b: {} TextElements captured",
-            preprocessor_output.text_elements.len()
-        );
-
-        // Stage 2: Classification + Rules → ParsedElements
-        let classification = self.classifier.classify(&preprocessor_output)?;
-        let document_analysis = run_analytics(&preprocessor_output.text_elements);
-        if config.dump_analytics {
-            dump_stats(&*self.storage, &pdf_hash, &document_analysis)?;
-        }
-
-        // Reading-order resort + region tagging (Block 06b). Capture the
-        // post-resort stream as the canonical Stage 1b snapshot — this is
-        // the version that flows into rules and carries `region_label`.
-        let text_elements = crate::analytics::tag_and_resort(
-            preprocessor_output.text_elements.clone(),
-            &document_analysis,
-        );
-        let resorted_elements = text_elements.clone();
-
-        let parsed_elements = if config.minimal_parse {
-            self.rule_engine
-                .convert_text_elements_to_parsed(&resorted_elements)
-        } else {
-            let font_size_analysis = self
-                .rule_engine
-                .analyze_font_sizes(&resorted_elements, &preprocessor_output.style_data);
-            self.rule_engine.apply_rules_with_config(
-                &resorted_elements,
-                &classification,
-                &document_analysis,
-                &font_size_analysis,
-                &preprocessor_output.style_data,
-                config,
-            )?
-        };
-        println!(
-            "📋 Stage 2: {} ParsedElements captured",
-            parsed_elements.len()
-        );
-
-        // Infer title from content before graph build
-        let inferred_title = infer_title(&parsed_elements);
-
-        // Stage 3: ParsedPdfElement → SemanticTreeElement (channel exit)
-        let semantic_elements = project_to_semantic_tree(parsed_elements.clone());
-
-        // Block A / A3: transient confidence sidecar for graph_sanity
-        // (see rules_and_graph).
-        let section_confidence: std::collections::HashMap<u32, u8> = semantic_elements
-            .iter()
-            .filter(|e| e.confidence > 0)
-            .map(|e| (e.text_order, e.confidence))
-            .collect();
-
-        // Stage 4: SemanticTreeElement → DocumentGraph
-        let mut graph = self.graph_builder.build_graph(semantic_elements)?;
-
-        // Wire metadata and compute post-processing. CR-57: each channel
-        // now writes a complete DocumentMetadata in its extractor — direct
-        // assignment replaces the old merge_extracted semantic.
-        graph.document_info.document_metadata = preprocessor_output.metadata;
-        // Body-side title inference is honored only when source-native
-        // extraction returned None. F-02 (title-cleanup) is deferred to
-        // the composition layer per `09-metadata-first-class.md`; the
-        // existing PDF pipeline still relies on the inferred fallback
-        // so we preserve it explicitly until the composition layer lands.
-        if graph.document_info.document_metadata.title.is_none() {
-            if let Some(title) = inferred_title {
-                graph.document_info.document_metadata.title = Some(title);
-            }
-        }
-        graph.document_info.outline_data = preprocessor_output.bookmark_data;
-        // Block A / A2: the structural profile no longer lives on the
-        // graph — it is a json-only aggregate recomputed at
-        // serialization time, so the pre/post-sanity recompute dance
-        // (CR-66) is gone. graph_sanity reads the graph directly.
-        // Stage-dump path uses the legacy provenance-free build — no
-        // parse-run identity for the evidence artifact stem.
-        crate::graphs::graph_sanity::apply(
-            &mut graph,
-            &config.graph_sanity,
-            None,
-            Some(&section_confidence),
-        );
-        graph.compute_breadcrumbs();
-        // CR-84: no post-sanity re-key here — this is the debug/evidence
-        // path built on `build_graph` (random UUIDv4 IDs, no content
-        // derivation) and it never feeds an identity-bearing emit; the
-        // re-key belongs to the deterministic path in `rules_and_graph`.
-
-        println!("📋 Stage 3: Graph captured ({} nodes)", graph.nodes.len());
-
-        Ok(PipelineStages {
-            xhtml,
-            text_elements,
-            parsed_elements,
-            graph,
-        })
     }
 
     // =========================================================================

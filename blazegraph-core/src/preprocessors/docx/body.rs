@@ -151,7 +151,7 @@ pub fn parse_docx(bytes: &[u8], _opts: ParseOptions) -> Result<ParseResult, Pars
     let source_sha256 = sha256_hex(bytes);
     let config_hash = "none".to_string();
     let provenance = ParseProvenance {
-        blazegraph_version: env!("CARGO_PKG_VERSION").to_string(),
+        blazegraph_version: crate::VERSION.to_string(),
         source_format: "docx".to_string(),
         source_filename: String::new(), // CLI may overwrite; the lib doesn't know
         source_sha256: source_sha256.clone(),

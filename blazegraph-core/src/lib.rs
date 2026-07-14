@@ -44,7 +44,7 @@ pub use analytics::DocumentAnalysis;
 pub use config::ParsingConfig;
 pub use graphs::NodeIdGenerator;
 pub use preprocessors::{PdfPreprocessor, Preprocessor, TikaPreprocessor};
-pub use processor::{DocumentProcessor, PipelineStages};
+pub use processor::DocumentProcessor;
 pub use storage::{CacheDefaults, CachePoint, FreshFrom};
 pub use types::*;
 
