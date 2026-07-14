@@ -144,6 +144,11 @@ pub struct CacheDefaults {
     pub c1_xhtml: bool,
     pub c2_preprocessor: bool,
     pub c3_graph: bool,
+    /// Analytics sidecar (`stat/**`) write policy. Not a cache tier — a
+    /// run-mode gate on the `dump_stats` write into the cache dir. A read-only
+    /// replay (golden freeze) sets this `false` so it never dirties the
+    /// committed fixture, independent of the config's `dump_analytics`.
+    pub stat: bool,
 }
 
 impl Default for CacheDefaults {
@@ -153,6 +158,7 @@ impl Default for CacheDefaults {
             c1_xhtml: true,
             c2_preprocessor: true,
             c3_graph: false,
+            stat: true,
         }
     }
 }

@@ -142,6 +142,7 @@ fn regenerate_bgraph_md() -> String {
         c1_xhtml: false,
         c2_preprocessor: false,
         c3_graph: false,
+        stat: false,
     };
 
     let (graph, provenance) = processor
@@ -260,33 +261,34 @@ fn golden_freeze_attention_reproduces_bgraph_md() {
 fn golden_freeze_attention_roundtrips_verified() {
     let path = golden_md_path();
 
-    let md = match std::fs::read_to_string(&path) {
-        Ok(md) => md,
-        Err(_) if bless_enabled() => {
-            // Bless bootstrap: Test A (running in parallel) writes the md.
-            // On a first-ever bless with no frozen md yet, there is nothing
-            // to read back — skip rather than racing the writer.
-            eprintln!(
-                "⏭  BLESS_GOLDEN: {} not present yet — roundtrip check skipped \
-                 (Test A writes it).",
+    // Under bless, Test A is concurrently rewriting `document.bgraph.md`.
+    // Reading it here would race the writer — a torn read on a re-bless, since
+    // `fs::write` isn't atomic, and the bootstrap-skip only fired when the file
+    // was *absent*, not *stale*. Instead, roundtrip the freshly-regenerated
+    // content in-memory: the same deterministic, read-only C2 replay Test A
+    // blesses (safe to run concurrently, byte-identical output). This verifies
+    // the *current* output self-verifies without touching the file being
+    // written. Off-bless, we check the *committed* artifact self-verifies
+    // (catches corruption / hand-edits of the frozen md).
+    let md = if bless_enabled() {
+        regenerate_bgraph_md()
+    } else {
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "Missing frozen golden bgraph.md at {}: {e}.\n\
+                 Generate it with `BLESS_GOLDEN=1 cargo test -p blazegraph-io-core \
+                 --test golden_freeze_tests` or `make golden-generate`.",
                 path.display()
-            );
-            return;
-        }
-        Err(e) => panic!(
-            "Missing frozen golden bgraph.md at {}: {e}.\n\
-             Generate it with `BLESS_GOLDEN=1 cargo test -p blazegraph-io-core \
-             --test golden_freeze_tests` or `make golden-generate`.",
-            path.display()
-        ),
+            )
+        })
     };
 
     let result = parse_markdown(&md, ParseOptions::default())
-        .expect("frozen golden bgraph.md parses cleanly");
+        .expect("golden bgraph.md parses cleanly");
 
     assert!(
         matches!(result.identity, ParseIdentity::Verified),
-        "frozen golden bgraph.md must self-verify (doc-level graph_sha256); got {:?}",
+        "golden bgraph.md must self-verify (doc-level graph_sha256); got {:?}",
         result.identity
     );
 }

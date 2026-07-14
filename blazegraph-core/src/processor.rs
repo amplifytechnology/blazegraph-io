@@ -221,6 +221,7 @@ impl DocumentProcessor {
             &id_gen,
             &provenance,
             &pdf_hash,
+            cache_defaults,
             &mut profiler,
         )?;
 
@@ -330,6 +331,7 @@ impl DocumentProcessor {
         id_gen: &NodeIdGenerator,
         parse_provenance: &ParseProvenance,
         pdf_hash: &str,
+        cache_defaults: &CacheDefaults,
         profiler: &mut StepProfiler,
     ) -> Result<DocumentGraph> {
         // Classification
@@ -343,7 +345,11 @@ impl DocumentProcessor {
         let document_analysis = profiler.time_step("Document Analytics", || {
             run_analytics(&preprocessor_output.text_elements)
         });
-        if config.dump_analytics {
+        // Gated on both axes: `dump_analytics` (does the user want analytics
+        // at all) AND `cache_defaults.stat` (may this run write the sidecar
+        // into the cache dir). A read-only replay disables the latter, so the
+        // committed fixture stays clean without a config pin.
+        if config.dump_analytics && cache_defaults.stat {
             dump_stats(&*self.storage, pdf_hash, &document_analysis)?;
         }
 
