@@ -1705,6 +1705,19 @@ impl ParsingConfig {
         Ok(config)
     }
 
+    /// Serialize the fully-resolved config to YAML with **every field explicit**.
+    ///
+    /// This is the *complete* form frozen into a golden edition. Because
+    /// `config_hash` hashes the whole resolved config (and is embedded in the
+    /// emitted `document.bgraph.md` header), a *partial* config lets any
+    /// `#[serde(default)]` change in code silently re-key the frozen anchor:
+    /// the same file would load to a different struct → different hash → broken
+    /// freeze. Materializing every field pins the edition's identity to the
+    /// committed file alone, so we stay free to move defaults in code. (CR-89.)
+    pub fn to_yaml(&self) -> Result<String> {
+        Ok(serde_yaml::to_string(self)?)
+    }
+
     /// Load config with fallback to default
     pub fn load_with_fallback(path: Option<&str>) -> Self {
         match path {

@@ -1,472 +1,305 @@
+# GENERATED — the complete, materialized config for this golden edition.
+# Every field is pinned explicitly so `config_hash` (hashed from the whole
+# config and embedded in document.bgraph.md) is immune to code-default drift:
+# moving a #[serde(default)] in code cannot silently re-key this frozen anchor.
+# Rewritten on BLESS_GOLDEN=1; do not hand-edit. (CR-89.)
 document_type: Generic
+section_and_hierarchy:
+  large_header_threshold: 0.7
+  medium_header_threshold: 0.5
+  small_header_threshold: 0.15
+  min_header_size: 9.5
+  use_bold_indicator: true
+  bold_size_strict: true
+  max_depth: 6
+  font_size_tolerance: 0.1
+  enforce_max_depth: true
+  starting_section_level: 1
+  min_alpha_ratio: 0.9
+  pattern_detection:
+    enabled: true
+    patterns:
+    - ^[A-Z][A-Z\s]{2,}$
+    - ^\d+\.\s+[A-Z][a-z]{3,}
+    - ^(Chapter|Section|Part|Article)\s+\d+
+    - ^[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*:$
+    respect_font_constraints: true
+spatial_clustering:
+  enabled: true
+  enable_paragraph_merging: true
+  enable_spatial_adjacency: true
+  min_line_height: 8.0
+  vertical_gap_threshold_multiplier: 10.0
+  horizontal_alignment_tolerance: 15.0
+  line_grouping_tolerance: 0.5
+  sections:
+    min_segment_size: 20
+    max_segment_size: 300
+  paragraphs:
+    min_segment_size: 50
+    max_segment_size: 3000
+section_patterns: []
+include_raw_tika: false
+include_style_info: false
+pipeline:
+  rules:
+  - name: TableDetection
+    enabled: false
+  - name: SectionDetectionV2
+    enabled: true
+  - name: PatternBasedSectionDetection
+    enabled: false
+  - name: ListDetection
+    enabled: false
+  - name: NodeTypeClustering
+    enabled: true
+  - name: SizeEnforcer
+    enabled: false
+  - name: Validation
+    enabled: false
+list_detection:
+  enabled: true
+  sequence_lookahead_elements: 10
+  sequence_boundary_extension: 3
+  y_tolerance: 10.0
+  bullet_patterns:
+  - •
+  - ·
+  - ●
+  - ■
+  - ▪
+  - ▫
+  - ◦
+  - ‣
+  - ⁃
+  - '-'
+  - '*'
+  - →
+  numbered_patterns:
+  - ^\d+\.
+  - ^\d+\)
+  - ^\(\d+\)
+  - ^[a-z]\.
+  - ^[a-z]\)
+  - ^[A-Z]\.
+  - ^[A-Z]\)
+  - ^[ivx]+\.
+  - ^[IVX]+\.
+  create_list_containers: true
+  preserve_list_items: false
+  max_lookahead_elements: 25
+  last_item_boundary_gap: 80.0
+  validation:
+    enabled: true
+    minimum_size_check: true
+    first_item_validation: true
+    parenthetical_context_check: true
+    sequential_numbering_check: true
+    mathematical_context_check: true
+    hyphen_context_check: true
+    sequential_numbering:
+      allow_letter_sequences: true
+      max_gap_tolerance: 0
+    mathematical_context:
+      symbols:
+      - →
+      - ←
+      - ⇒
+      - ⇐
+      - ∀
+      - ∃
+      terms:
+      - equation
+      - formula
+      - coordinates
+      - system
+      - transform
+    hyphen_context:
+      strategy: strict
+      require_space_after: true
+    sequence_pattern_check: false
+    content_quality_check: false
+    spatial_coherence_check: false
+size_enforcer:
+  enabled: true
+  max_size: 400
+  size_unit: characters
+  preserve_sentences: true
+  min_split_size_ratio: 0.25
+  recursive: true
+  max_iterations: 10
+  split_direction: vertical
+minimal_parse: false
+section_detection_v2:
+  line_height_tolerance: 3.0
+  font_size_tolerance: 0.1
+  structural_size_margin: 4.0
+  structural_size_ratio: null
+  min_alpha_ratio: 0.7
+  max_depth: 6
+  enforce_max_depth: true
+  starting_section_level: 1
+  numbered_seed_promotion: true
+  inclusion_patterns:
+  - pattern: (?i)^chapter\s+[IVXLCDM\d]+([\s\.\-–—:].*)?\s*$
+    require_bold: true
+    require_isolation: true
+  - pattern: (?i)^article\s+\d+[a-z]?\s*$
+    require_bold: true
+    require_isolation: true
+  - pattern: (?i)^section\s+\d+[a-z]?\s*$
+    require_bold: true
+    require_isolation: true
+  - pattern: (?i)^appendix\s+[A-Z\d]+\s*$
+    require_bold: true
+    require_isolation: true
+  inclusion_max_length: 20
+  exclusion_patterns:
+  - ^Figure\s+[A-Z0-9]
+  - ^Table\s+[A-Z0-9]
+  - ^\d+\.?\d*$
+  - ^[\d\s\.]+$
+  tiebreaker_keywords:
+  - name: part
+    pattern: (?i)^part\s+[IVXLCDM\d]+
+  - name: chapter
+    pattern: (?i)^chapter\s+[IVXLCDM\d]+
+  - name: article
+    pattern: (?i)^article\s+\d+[a-z]?
+  - name: section
+    pattern: (?i)^section\s+\d+[a-z]?
+  - name: appendix
+    pattern: (?i)^appendix\s+[A-Z\d]+
+  - name: schedule
+    pattern: (?i)^schedule\s+\d+
+  - name: annex
+    pattern: (?i)^annex\s+[IVX\d]+
+  - name: numbered
+    pattern: ^\d+\s+[A-Z]
+table_detection:
+  enabled: true
+  min_rows: 2
+  min_cols: 2
+  min_grid_vcuts: 1
+  min_column_consistency: 0.6
+  min_density: 0.0
+node_type_clustering:
+  section:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: false
+    region_overflow_threshold: null
+    same_depth: true
+    max_y_gap: 50.0
+    prose_line_separator: ' '
+    table_line_separator: |2+
 
-# Golden-freeze anchor (Block D): analytics sidecar dumps are disabled so the
-# JVM-free freeze test is read-only (no `stat/` files written into the committed
-# cache dir on replay). `dump_analytics` does not affect emitted graph/md content
-# — it only gates offline sidecar writes — but it IS a `config_hash` input, so the
-# golden md and `make golden-generate` both bind to THIS config verbatim.
-dump_analytics: false
+  paragraph:
+    same_line: false
+    same_paragraph: true
+    ignore_region_label: false
+    region_overflow_threshold: 10
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
 
-# Graph sanity-check-and-correction pipe (CR-28). Runs post-graph-build to
-# enforce structural invariants. Each invariant has a check (always-on
-# diagnostic) and a correct (config-gated rewrite) mode.
+  list:
+    same_line: false
+    same_paragraph: true
+    ignore_region_label: false
+    region_overflow_threshold: 10
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  list_item:
+    same_line: false
+    same_paragraph: true
+    ignore_region_label: false
+    region_overflow_threshold: 10
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  header:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: true
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  footer:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: true
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  margin:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: false
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  table:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: false
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
 graph_sanity:
   enabled: true
   invariants:
-    # node.depth = parent.depth + 1 for every non-root node.
-    # Correction strategy: BFS from root, recompute depth from topology.
-    # Fixes the §86-style depth drift caused by stack pollution during
-    # section detection (CR-27 wrap-line classification side-effect).
     depth_consistency:
       check: true
       correct: true
-
-    # CR-71 — evidence-first section detection (landed Sb6). The old per-invariant
-    # demoters (CR-65 height / CR-68 overlap / CR-69 count) are parked OFF
-    # (check/correct false); their geometric predicates are now read by the
-    # flag-only `section_detectors`, whose thresholds still live on these structs.
-    # `section_prune` does the single demotion (geo + font >= 2), then the CR-70
-    # rebalance rebuilds topology.
-
-    # CR-65 predicate threshold (read by the height detector). tolerance 2.0.
     section_height_bounded_by_title:
       check: false
       correct: false
       tolerance: 2.0
-
-    # CR-69 predicate thresholds (read by the count detector).
+    section_paragraph_overlap:
+      check: false
+      correct: false
+      threshold: 0.2
+      bookmark_bypass: false
     section_overlap_count:
       check: false
       correct: false
       count_threshold: 3
       min_overlap_frac: 0.0
-
-    # CR-68 predicate threshold (read by the overlap detector). 0.20 is the live
-    # overlap signal — figure callouts with a high covering-paragraph overlap.
-    section_paragraph_overlap:
-      check: false
-      correct: false
-      threshold: 0.20
-      bookmark_bypass: false
-
-    # CR-71 flag-only detectors: reuse the predicates above, write evidence, never
-    # mutate node_type. The verdict (main_font / bad_fonts) is derived from these.
-    section_detectors:
-      height_flag: true
-      overlap_flag: true
-      count_flag: true
-
-    # CR-71 prune (the only demoter in the evidence-first path): demote a flagged
-    # section whose font is in bad_fonts (geo + font >= 2). emit_evidence_artifact
-    # is a debug-only dump, off in production.
-    section_prune:
-      enabled: true
-      prune_on_detection: true
-      emit_evidence_artifact: false
-
-    # CR-78 Phase B — confidence floor. Demote Sections whose detection-time
-    # confidence is below this (after the CR-71 prune, before the CR-70 rebalance).
-    # 0 = off (baseline). The per-doc precision lever for over-detected docs —
-    # set per-doc by the config picker, not as a global default.
-    min_confidence: 0
-
-    # CR-70 topology rebalance (runs last). Sb8: document_title_nesting nests the
-    # body under its title (largest-font level-1 section); the caps are 4/5 (was
-    # 3/4) so the added title level keeps deep X.Y.Z sections distinct.
     topology_rebalance:
       check: true
       correct: true
       max_section_depth: 4
       max_total_depth: 5
       document_title_nesting: true
-
-# Pipeline configuration - defines which rules to run and in what order
-# NEW APPROACH: Section detection FIRST, then spatial clustering
-pipeline:
-  rules:
-    # CR-79 (Tier 1) — PARKED 2026-06-05. The pipe + signals are fully wired
-    # but DISABLED: the leaf-level feature signal is directional, not cleanly
-    # separable (see CR-79 "Parked" section). Re-enable when a future session
-    # finds the separator. When on, it tags table region leaves Table FIRST so
-    # they leave section detection's population and graph_sanity sees a clean
-    # remainder. Analytics signals (grid_vcuts/aligned_cols/column_consistency)
-    # keep computing regardless — they're the resume substrate.
-    - name: "TableDetection"
-      enabled: false
-    - name: "SectionDetectionV2"
+    numbering_restart:
+      check: true
+      correct: true
+    section_detectors:
+      height_flag: true
+      overlap_flag: true
+      count_flag: true
+    section_prune:
       enabled: true
-    - name: "PatternBasedSectionDetection"
-      enabled: false
-    - name: "ListDetection"
-      enabled: false
-    - name: "NodeTypeClustering"
-      enabled: true
-    - name: "SizeEnforcer"
-      enabled: false
-    - name: "Validation"
-      enabled: false
-
-# CR-79 (Tier 1) table detection. Reads the per-region `RegionSignature`
-# (already computed in analytics/page_stats) and tags qualifying body leaves
-# Table; NodeTypeClustering then fuses each tagged region into one Table node
-# (bbox = union). It TAGS, it does not extract cells — that is Tier 2.
-#
-# table  ⇔  n_peaks >= min_peaks_x  &&  n_peaks_y >= min_peaks_y
-#       &&  y_peak_cv <= max_y_peak_cv  &&  density >= min_density
-#
-# min_peaks_x / min_peaks_y are unambiguous (>=2 = multi-column / multi-row).
-# max_y_peak_cv (row-regularity ceiling) and min_density (fill-ratio floor) are
-# the eyeball-tuned thresholds — calibrate against the off-wire debug dump
-# (cache/table/<doc>.table.json).
-table_detection:
-  enabled: true
-  # v2 metric (cv dropped — it was backwards). AND-gated for precision.
-  min_rows: 2                  # n_peaks_y >= : multi-row
-  min_cols: 2                  # aligned_cols >= : columns recurring across rows (signal B)
-  min_grid_vcuts: 1            # grid_vcuts >= : XY-cut column grid absorbed (signal A)
-  min_column_consistency: 0.6  # mean fill of aligned columns (signal B) — TUNE
-  min_density: 0.0             # soft floor, default off
-
-section_detection_v2:
-  # Font size tolerance (points). Defines the ±tolerance band around body size.
-  # delta < -tolerance             → REJECT
-  # |delta| ≤ tolerance            → R3 (at-body): bold AND isolated_in_leaf
-  # tolerance < delta ≤ margin     → R2 (medium): bold OR  isolated_in_leaf
-  # delta > structural_size_margin → R1 (large):  auto-promote
-  font_size_tolerance: 0.1
-
-  # Points above body at which size alone promotes (R1 threshold: body + margin).
-  # 4pt is a clear visual hierarchy break — 9pt body → 13pt header on RFC-style
-  # docs, 10pt → 14pt+ on academic papers. Below 4pt the size signal is weaker
-  # and we lean on auxiliary signals in R2 (`bold OR isolated_in_leaf`).
-  # Calibrated against the 6-PDF corpus delta distribution (Block 09, 2026-05-07).
-  structural_size_margin: 4.0
-
-  # Proportional alternative: when set, R1 threshold = body * ratio (overrides margin).
-  structural_size_ratio: ~ # None
-
-  # Y-coordinate tolerance (points) for grouping bboxes onto the same visual line
-  # within a Region tree leaf (used by `is_isolated_in_leaf` to identify
-  # same-Y neighbors and check their bold-ness).
-  line_height_tolerance: 3.0
-
-  # Minimum alphabetic character ratio — filters math symbols and noise.
-  # 0.7 keeps short numbered headers like "3.2 Attention" (9 alpha / 12 non-ws = 0.75)
-  # while still rejecting math/formula spans (typically <0.5 ASCII-alpha).
-  # Bare numeric content is rejected separately via exclusion_patterns.
-  min_alpha_ratio: 0.7
-
-  # Hierarchy depth limits.
-  max_depth: 6
-  enforce_max_depth: true
-  starting_section_level: 1
-
-  # Sb8 — seed deep numbered subsections. RFC X.Y.Z headers are typeset at body
-  # size + bold, with the number split into its own span, so they fail the size
-  # tiers (delta≈0 → R3), R3's isolation gate (header shares a leaf with the body
-  # paragraph), and bookmark-match (split number). This promotes a bold,
-  # line-leading multi-level-numbering segment ("3.5.2. Title") to a Section
-  # directly; the same-line / source-adjacent fragment passes fuse number+title.
-  numbered_seed_promotion: true
-
-  # Inclusion patterns: promote a weak/rejected candidate to section when the regex
-  # matches AND the per-pattern structural gates pass AND the text length is within
-  # `inclusion_max_length`. Patterns require the keyword followed by an explicit
-  # identifier (number / Roman / letter) and an end-of-string anchor. This shape
-  # distinguishes real labels ("Article 64", "CHAPTER 4 – Other provisions") from
-  # body wrap-lines that begin with the keyword but continue with prose
-  # ("section 12(1) and Schedule 2", "article or offensive weapon.").
-  #
-  # CR-26: text length cap, isolation gate (always-required, pre-CR-42).
-  # CR-42: per-pattern `require_bold` / `require_isolation` gates. The Section
-  # pattern in particular ships with `require_bold: true` to filter out inline
-  # hyperlink spans (normal-weight `<span class="f4" style="color:#2222ee">
-  # Section 18</span>`) that occur in RFC-class documents. UK-Act-of-Parliament
-  # body labels like "Section 12" are reliably bold, so the gate is a no-op for
-  # the canonical Police-Act use case while closing the rfc-quic FP class.
-  inclusion_patterns:
-    - { pattern: "(?i)^chapter\\s+[IVXLCDM\\d]+([\\s\\.\\-–—:].*)?\\s*$", require_bold: true, require_isolation: true }
-    - { pattern: "(?i)^article\\s+\\d+[a-z]?\\s*$",                       require_bold: true, require_isolation: true }
-    - { pattern: "(?i)^section\\s+\\d+[a-z]?\\s*$",                       require_bold: true, require_isolation: true }
-    - { pattern: "(?i)^appendix\\s+[A-Z\\d]+\\s*$",                       require_bold: true, require_isolation: true }
-
-  # Maximum text length (characters) for an inclusion-pattern match to promote.
-  # Defence in depth alongside the shape-anchored patterns above — caps any
-  # accidentally-permissive future pattern at the structural-label scale.
-  inclusion_max_length: 20
-
-  # Exclusion patterns: demote a promoted candidate (applied before inclusion).
-  # The caption patterns require a label token ([A-Z0-9]) after Figure/Table so
-  # real captions ("Figure 6:", "Table 1:", "Table B-1:") demote while a genuine
-  # heading like "Table of Contents" (lowercase "of") survives — it is itself an
-  # outline entry on RFCs (a bookmark TP), and the captions are FP anchors.
-  exclusion_patterns:
-    - "^Figure\\s+[A-Z0-9]"
-    - "^Table\\s+[A-Z0-9]"
-    - "^\\d+\\.?\\d*$" # bare numbers / decimals like "0.1", "4.92"
-    - "^[\\d\\s\\.]+$" # rows of numbers (table data)
-
-  # Tiebreaker keywords (CR-27): identify the structural "tier" of a section.
-  # Consulted only when font-size delta vs. previous section is within tolerance
-  # (the tie). Same keyword → sibling. Different keyword present in stack → step
-  # back to that tier. New keyword → tiebreaker fires, push deeper.
-  # Order matters — first match wins; specific keywords before generic ones.
-  tiebreaker_keywords:
-    - { name: part, pattern: "(?i)^part\\s+[IVXLCDM\\d]+" }
-    - { name: chapter, pattern: "(?i)^chapter\\s+[IVXLCDM\\d]+" }
-    - { name: article, pattern: "(?i)^article\\s+\\d+[a-z]?" }
-    - { name: section, pattern: "(?i)^section\\s+\\d+[a-z]?" }
-    - { name: appendix, pattern: "(?i)^appendix\\s+[A-Z\\d]+" }
-    - { name: schedule, pattern: "(?i)^schedule\\s+\\d+" }
-    - { name: annex, pattern: "(?i)^annex\\s+[IVX\\d]+" }
-    - { name: numbered, pattern: "^\\d+\\s+[A-Z]" }
-
-# Node type clustering (CR-29) — merges fragmented Tika elements into the
-# logical lines/paragraphs/sections they came from. Runs after SectionDetectionV2.
-#
-# Algorithm: partition coarsely at (page, element_type, region_label, …),
-# then walk each bucket in reading order and split into a new merge group
-# whenever `max_y_gap` is exceeded between consecutive elements. Each
-# ParsedElementType has its own self-contained config — no shared defaults.
-#
-# Constraints (split when violated):
-#   same_line                   — Tika line_number equality
-#   same_paragraph              — Tika paragraph_number equality (Y-gap-based; reliable for prose)
-#   same_depth                  — hierarchy_level equality (safety against unrelated section collapse)
-#   ignore_region_label         — drop region_label from the key (used for Header / Footer
-#                                 where per-page running chrome is one logical unit)
-#   max_y_gap                   — points; null disables. Geometric proximity check.
-#   region_overflow_threshold   — null disables. CR-38 stopgap: when a (page,
-#                                 region_label) has ≥N distinct paragraph_numbers,
-#                                 drop paragraph_number from the key for that
-#                                 region (catches Tika's row-keyed paragraph_number
-#                                 in 2-column body layout — gpt2 page 2 case).
-#                                 Tradeoff: collapses real within-column paragraph
-#                                 breaks when triggered. CR-38 will replace this
-#                                 with bbox-derived paragraph detection.
-#
-# region_label (Block 06b reading-order resort) is the primary structural axis
-# and is part of the key by default — clustering only happens within one Region
-# tree leaf. Set `ignore_region_label: true` to collapse all of a type's
-# elements within a page (Header/Footer default).
-node_type_clustering:
-  section:
-    # Within-region merge with depth equality + proximity. A multi-line bold
-    # title in one leaf at one depth is one Section.
-    same_line: false
-    same_paragraph: false
-    same_depth: true
-    ignore_region_label: false
-    max_y_gap: 50.0
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-  paragraph:
-    # Within-region, with Tika paragraph_number as the within-region granularity
-    # refinement. Solves "whole page = one leaf" small-margin docs where region
-    # alone is too coarse.
-    #
-    # region_overflow_threshold: 10 catches gpt2-style 2-column body where Tika
-    # emits one paragraph_number per visual row across both columns. CR-38 will
-    # replace this heuristic with bbox-derived paragraph detection.
-    same_line: false
-    same_paragraph: true
-    same_depth: false
-    ignore_region_label: false
-    max_y_gap: null
-    region_overflow_threshold: 10
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-  list:
-    same_line: false
-    same_paragraph: true
-    same_depth: false
-    ignore_region_label: false
-    max_y_gap: null
-    region_overflow_threshold: 10
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-  list_item:
-    same_line: false
-    same_paragraph: true
-    same_depth: false
-    ignore_region_label: false
-    max_y_gap: null
-    region_overflow_threshold: 10
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-  header:
-    # Per-page running header is one logical unit — collapse all H-N labels
-    # on a page into one bucket. Future CR will split on-page footnotes from
-    # page chrome; for now everything labeled Header on a page merges.
-    same_line: false
-    same_paragraph: false
-    same_depth: false
-    ignore_region_label: true
-    max_y_gap: null
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-  footer:
-    same_line: false
-    same_paragraph: false
-    same_depth: false
-    ignore_region_label: true
-    max_y_gap: null
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-  margin:
-    # Keep region_label as a partition dimension — sidebars and edge-marginal
-    # notes in different leaves are distinct logical units.
-    same_line: false
-    same_paragraph: false
-    same_depth: false
-    ignore_region_label: false
-    max_y_gap: null
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-  table:
-    # CR-79 (Tier 1) — fuse the WHOLE region into one Table node. A table spans
-    # many lines / paragraphs / Y-gaps, so every within-region gate is dropped;
-    # the region IS the table boundary (one node per region leaf). Two stacked
-    # tables in distinct leaves keep distinct region_label → stay separate; a
-    # table never fuses with adjacent prose (type differs).
-    same_line: false
-    same_paragraph: false
-    same_depth: false
-    ignore_region_label: false
-    max_y_gap: null
-    prose_line_separator: " "
-    table_line_separator: "\n"
-
-section_and_hierarchy:
-  # Font size analysis parameters
-  large_header_threshold: 0.7
-  medium_header_threshold: 0.5
-  small_header_threshold: 0.15 # More selective - 15% above median
-  min_header_size: 9.5 # Just below 10pt to catch those bold headers
-  use_bold_indicator: true
-  bold_size_strict: true # true = bold AND larger, false = bold OR larger
-  min_alpha_ratio: 0.9 # Minimum ratio of ASCII alpha chars — filters math symbols as false headers
-  # Contextual hierarchy parameters
-  max_depth: 6
-  font_size_tolerance: 0.1
-  enforce_max_depth: true
-  starting_section_level: 1
-  # Pattern-based section detection configuration
-  pattern_detection:
-    enabled: true
-    respect_font_constraints: true
-    patterns:
-      # More restrictive patterns to avoid false positives like "Meaningful"
-      - "^[A-Z][A-Z\\s]{2,}$" # ALL CAPS (min 3 chars total)
-      - "^\\d+\\.\\s+[A-Z][a-z]{3,}" # "1. Title" (min 4 chars in title)
-      - "^(Chapter|Section|Part|Article)\\s+\\d+" # Explicit structural words
-      - "^[A-Z][a-z]{2,}(?:\\s+[A-Z][a-z]{2,})*:$" # "Title Case:" (with colon, min 3 chars per word)
-# 🎯 SPATIAL CLUSTERING CONFIG - Two-stage clustering approach
-spatial_clustering:
-  enabled: true
-  # 📝 NEW: Paragraph merging based on Tika's paragraph detection
-  enable_paragraph_merging: true # Merge segments with same paragraph_number
-  # 🧩 NEW: Spatial adjacency clustering (groups spatially close elements)
-  enable_spatial_adjacency: true # Disabled by default - paragraph merging is often sufficient
-  min_line_height: 8.0
-  # 🔧 KEY PARAMETER: Higher value = less sensitive = fewer segments
-  vertical_gap_threshold_multiplier: 10.0 # Much less sensitive - allow natural line spacing
-  horizontal_alignment_tolerance: 15.0 # More tolerance for alignment
-  line_grouping_tolerance: 0.5 # More tolerance for line grouping
-  # Separate configuration for different element types
-  sections:
-    min_segment_size: 20 # Short section titles allowed
-    max_segment_size: 300 # Keep section headers concise
-  paragraphs:
-    min_segment_size: 50 # Lower minimum to preserve small content
-    max_segment_size: 3000 # Larger maximum for complete paragraphs
-section_patterns:
-  # - "customer-related success factors"
-  # - "success factors related to collaboration"
-  # - "success factors related to communication"
-  # - "chapter"
-  # - "section"
-  # - "part"
-  # - "overview"
-  # - "principles"
-  # - "approach"
-
-# List detection configuration - two-phase processing
-list_detection:
-  enabled: true
-
-  # Phase 1: Sequence Detection (NEW - element-based approach)
-  sequence_lookahead_elements: 10 # How far to look for next marker (in elements)
-  sequence_boundary_extension: 3 # Elements past last marker to include for boundary detection
-
-  # Phase 2: Content Classification
-  y_tolerance: 10.0 # Y-coordinate tolerance for spatial validation (points)
-  last_item_boundary_gap: 80.0 # Y-gap threshold for sequence end detection (points)
-
-  # List item pattern definitions
-  bullet_patterns: ["•", "·", "●", "■", "▪", "▫", "◦", "‣", "⁃", "-", "*", "→"]
-  numbered_patterns: [
-      "^\\d+\\.", # 1., 2., 3.
-      "^\\d+\\)", # 1), 2), 3)
-      "^\\(\\d+\\)", # (1), (2), (3)
-      "^[a-z]\\.", # a., b., c.
-      "^[a-z]\\)", # a), b), c)
-      "^[A-Z]\\.", # A., B., C.
-      "^[A-Z]\\)", # A), B), C)
-      "^[ivx]+\\.", # i., ii., iii.
-      "^[IVX]+\\.", # I., II., III.
-    ]
-
-  # Phase 2.5: List Validation (NEW - false positive elimination)
-  validation:
-    enabled: true # Enable validation framework
-    minimum_size_check: true # Lists must have >1 item
-    first_item_validation: true # Numbered lists must start with "1"
-    parenthetical_context_check: true # (n) format must start with (1)
-
-    # Advanced context-aware validation rules (NEW)
-    sequential_numbering_check: true # Validate sequential numbering (1,2,3 not 1,7)
-    mathematical_context_check: true # Detect mathematical symbols in math contexts
-    hyphen_context_check: true # Distinguish list bullets from word continuations
-
-    # Rule-specific configuration
-    sequential_numbering:
-      allow_letter_sequences: true # Allow a, b, c sequences
-      max_gap_tolerance: 0 # No gaps allowed in numbering
-
-    mathematical_context:
-      symbols: ["→", "←", "⇒", "⇐", "∀", "∃"] # Mathematical symbols to detect
-      terms: ["equation", "formula", "coordinates", "system", "transform"] # Context terms
-
-    hyphen_context:
-      strategy: "strict" # Strategy: reject, strict, context_aware
-      require_space_after: true # Require space after hyphen for valid lists
-
-    # Future validation rules (disabled)
-    sequence_pattern_check: false
-    content_quality_check: false
-    spatial_coherence_check: false
-
-  # Container behavior (UNCHANGED)
-  create_list_containers: true # Group related list items
-  # TODO: Show ListItem Behavior does not look like it is fully defined in the graph
-  preserve_list_items: false # Clean output - just List nodes
-  max_lookahead_elements: 25 # Maximum lookahead elements for content search
-
-# Size enforcement configuration - intelligent text splitting
-size_enforcer:
-  enabled: true
-  max_size: 400 # Maximum characters per node
-  size_unit: "characters" # "characters", "words", or "bytes"
-  preserve_sentences: true # Respect sentence boundaries when splitting
-  min_split_size_ratio: 0.25 # Minimum chunk size (25% of max_size)
-  recursive: true # Keep splitting until all nodes comply
-  max_iterations: 10 # Safety limit for recursive splitting
-  split_direction: "vertical" # "horizontal" (side-by-side) or "vertical" (stacked)
+      prune_on_detection: true
+      emit_evidence_artifact: false
+    min_confidence: 0
+dump_analytics: false

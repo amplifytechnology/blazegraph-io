@@ -189,6 +189,35 @@ fn bless_enabled() -> bool {
     std::env::var_os("BLESS_GOLDEN").is_some()
 }
 
+/// Prepended to the frozen golden `config.yaml` when blessing, explaining why
+/// it is a complete machine-materialized config rather than the annotated
+/// source. (A YAML comment — ignored on load, so it does not affect
+/// `config_hash`.)
+const GOLDEN_CONFIG_HEADER: &str = "\
+# GENERATED — the complete, materialized config for this golden edition.
+# Every field is pinned explicitly so `config_hash` (hashed from the whole
+# config and embedded in document.bgraph.md) is immune to code-default drift:
+# moving a #[serde(default)] in code cannot silently re-key this frozen anchor.
+# Rewritten on BLESS_GOLDEN=1; do not hand-edit. (CR-89.)
+";
+
+/// Freeze the **complete** resolved config next to the md at bless time: load
+/// the current config, re-serialize it with every field explicit, and write it
+/// back. Keeps the golden edition self-contained — its identity depends on the
+/// committed file, not on any `#[serde(default)]` in code.
+fn freeze_materialized_config() {
+    let config_path = golden_dir().join("config.yaml");
+    let config = ParsingConfig::load_from_file(
+        config_path.to_str().expect("config.yaml path is valid UTF-8"),
+    )
+    .expect("golden config.yaml loads");
+    let materialized = format!(
+        "{GOLDEN_CONFIG_HEADER}{}",
+        config.to_yaml().expect("config serializes to complete YAML")
+    );
+    std::fs::write(&config_path, materialized).expect("write materialized golden config.yaml");
+}
+
 // =========================================================================
 // Test A — reproduction (freeze).
 // =========================================================================
@@ -200,11 +229,12 @@ fn golden_freeze_attention_reproduces_bgraph_md() {
 
     if bless_enabled() {
         std::fs::write(&path, &regenerated).expect("write frozen golden bgraph.md");
+        freeze_materialized_config();
         let sha = git_head_sha();
         std::fs::write(golden_dir().join("PRODUCED_BY"), format!("{sha}\n"))
             .expect("write PRODUCED_BY sidecar");
         eprintln!(
-            "✅ BLESS_GOLDEN: re-froze {} ({} bytes) + PRODUCED_BY {}",
+            "✅ BLESS_GOLDEN: re-froze {} ({} bytes) + materialized config.yaml + PRODUCED_BY {}",
             path.display(),
             regenerated.len(),
             sha
