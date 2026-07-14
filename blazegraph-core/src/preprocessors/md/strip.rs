@@ -143,7 +143,7 @@ fn strip_all_fences(input: &str) -> Result<String, ParseError> {
 ///
 /// If the doc-level JSON happens to carry a top-level `bookmarks` field
 /// (it does not in the current emitter — bookmarks live in a separate
-/// `bgraph-bookmarks` fence — but this is a forward-compat safety net),
+/// `bgraph-outline` fence — but this is a forward-compat safety net),
 /// that field is dropped. Bookmarks themselves are stripped in the
 /// body-pass (separate fence).
 fn strip_with_frontmatter(input: &str) -> Result<String, ParseError> {
@@ -158,8 +158,8 @@ fn strip_with_frontmatter(input: &str) -> Result<String, ParseError> {
         // artifact in the first place.
         return Ok(body);
     };
-    let mut value: serde_json::Value = serde_json::from_str(json_line)
-        .map_err(|source| ParseError::JsonParse { source })?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(json_line).map_err(|source| ParseError::JsonParse { source })?;
     if let Some(obj) = value.as_object_mut() {
         // Forward-compat: drop `bookmarks` if it surfaces at top level.
         obj.remove("bookmarks");
@@ -376,8 +376,8 @@ fn strip_with_node_types(input: &str, tags: &[String]) -> Result<String, ParseEr
                 }
                 (boundary + 1) as usize
             };
-            for k in body_start..=close_idx {
-                delete[k] = true;
+            for slot in &mut delete[body_start..=close_idx] {
+                *slot = true;
             }
         }
         // Advance past the close, regardless of whether we deleted.
@@ -434,7 +434,7 @@ mod tests {
             "{\"schema\":\"2.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"src-sha\"},\"flow_type\":\"Fixed\",\"title\":\"Sample\",\"config_hash\":\"cfg-sha\",\"graph_sha256\":\"deadbeef\"}",
             "```",
             "",
-            "```bgraph-bookmarks",
+            "```bgraph-outline",
             "{\"sections\":[{\"title\":\"Introduction\",\"order\":0,\"level\":1}]}",
             "```",
             "",
@@ -627,16 +627,13 @@ fn main() {}
         let yaml_payload = &after_open[..close_idx];
         let yaml_payload_with_nl = format!("{yaml_payload}\n");
         // YAML round-trips.
-        let parsed: serde_json::Value = serde_yaml::from_str(&yaml_payload_with_nl)
-            .expect("frontmatter YAML must parse");
+        let parsed: serde_json::Value =
+            serde_yaml::from_str(&yaml_payload_with_nl).expect("frontmatter YAML must parse");
         assert_eq!(
             parsed.get("graph_sha256").and_then(|v| v.as_str()),
             Some("deadbeef")
         );
-        assert_eq!(
-            parsed.get("schema").and_then(|v| v.as_str()),
-            Some("2.0.0")
-        );
+        assert_eq!(parsed.get("schema").and_then(|v| v.as_str()), Some("2.0.0"));
         // Exactly one blank line between `---` close and body.
         // After `\n---\n` (the close), the next two bytes should be
         // `\n<non-blank>` — i.e., a single blank then content.
@@ -685,9 +682,9 @@ fn main() {}
         ];
         let mut last_idx: Option<usize> = None;
         for key in expected_order {
-            let idx = frontmatter
-                .find(key)
-                .unwrap_or_else(|| panic!("canonical key {key} missing in frontmatter:\n{frontmatter}"));
+            let idx = frontmatter.find(key).unwrap_or_else(|| {
+                panic!("canonical key {key} missing in frontmatter:\n{frontmatter}")
+            });
             if let Some(prev) = last_idx {
                 assert!(
                     idx > prev,
@@ -711,10 +708,12 @@ fn main() {}
             .map(|(yaml, _rest)| yaml)
             .expect("frontmatter must be delimited");
         let yaml_with_nl = format!("{frontmatter}\n");
-        let parsed: serde_json::Value =
-            serde_yaml::from_str(&yaml_with_nl).expect("YAML parses");
+        let parsed: serde_json::Value = serde_yaml::from_str(&yaml_with_nl).expect("YAML parses");
         let source = parsed.get("source").expect("source key present");
-        assert!(source.is_object(), "source must be a nested map, got: {source:?}");
+        assert!(
+            source.is_object(),
+            "source must be a nested map, got: {source:?}"
+        );
         assert_eq!(
             source.get("format").and_then(|v| v.as_str()),
             Some("pdf"),
@@ -733,7 +732,7 @@ fn main() {}
     }
 
     /// CR-55 Test 3: bookmarks dropped under default mode.
-    /// The `bgraph-bookmarks` fence content is stripped from the body;
+    /// The `bgraph-outline` fence content is stripped from the body;
     /// no `bookmarks:` key in frontmatter; no orphan blank line.
     #[test]
     fn cr55_test3_bookmarks_dropped_in_default_mode() {
@@ -751,12 +750,12 @@ fn main() {}
             !frontmatter.contains("bookmarks:"),
             "frontmatter must not contain bookmarks key; got:\n{frontmatter}"
         );
-        // No `bgraph-bookmarks` fence body in the document body
+        // No `bgraph-outline` fence body in the document body
         // (sample's bookmarks JSON line carries the literal
         // `"sections":[{"title":"Introduction"`...).
         assert!(
             !out.contains("\"sections\":[{\"title\":\"Introduction\""),
-            "bgraph-bookmarks fence body must be stripped from output"
+            "bgraph-outline fence body must be stripped from output"
         );
         // No no-blank-line orphan double-blanks where the bookmarks
         // fence used to live (between doc-level and first paragraph
@@ -813,8 +812,7 @@ fn main() {}
     #[test]
     fn cr55_test6_node_types_lib_removes_matching_element_body_and_fence() {
         let md = sample_bgraph_md();
-        let out =
-            strip(&md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(&md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         assert!(
             !out.contains("```bgraph-header"),
             "header fence must be removed; got:\n{out}"
@@ -838,11 +836,8 @@ fn main() {}
     #[test]
     fn cr55_test7_node_types_composed_with_body_only_pass() {
         let md = sample_bgraph_md();
-        let after_filter = strip(
-            &md,
-            StripMode::NodeTypes(vec!["header".to_string()]),
-        )
-        .expect("filter pass OK");
+        let after_filter =
+            strip(&md, StripMode::NodeTypes(vec!["header".to_string()])).expect("filter pass OK");
         let out = strip(&after_filter, StripMode::BodyOnly).expect("body-only pass OK");
         // No frontmatter under body-only.
         assert!(
@@ -876,8 +871,7 @@ Body paragraph.
 {\"id\":\"y\",\"text_order\":1}
 ```
 ";
-        let out =
-            strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         assert!(!out.contains("Running header"));
         assert!(!out.contains("```bgraph-header"));
         // Paragraph element survives.
@@ -909,8 +903,7 @@ previous body
 {\"id\":\"h\",\"text_order\":1}
 ```
 ";
-        let out =
-            strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         // Header fence pair gone.
         assert!(!out.contains("```bgraph-header"));
         // Previous element fully intact.
@@ -942,8 +935,7 @@ A paragraph that mentions the reserved prefix in its body:
         // The indented `   ```bgraph-header` line is NOT a fence
         // (not at column zero). Asking to strip headers must therefore
         // leave the paragraph's body intact.
-        let out =
-            strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
+        let out = strip(md, StripMode::NodeTypes(vec!["header".to_string()])).expect("strip OK");
         assert!(
             out.contains("mentions the reserved prefix"),
             "paragraph body must survive when reserved-prefix appears only mid-body; got:\n{out}"

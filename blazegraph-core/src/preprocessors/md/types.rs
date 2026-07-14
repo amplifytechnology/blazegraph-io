@@ -7,7 +7,7 @@
 //!
 //! Wire-format definition: `docs/P2/core/architecture/08-bgraph-md-format.md`.
 
-use crate::types::DocumentGraph;
+use crate::types::{DocumentGraph, ParseProvenance};
 
 /// Options controlling markdown parse behavior.
 ///
@@ -38,6 +38,13 @@ pub struct ParseResult {
     pub graph: DocumentGraph,
     /// Round-trip identity status for this parse.
     pub identity: ParseIdentity,
+    /// The parse-run provenance for this graph (Block A / Amendment M):
+    /// reconstructed from the doc-level envelope block (bgraph.md) or
+    /// derived from the source bytes (generic md / DOCX). Rides beside
+    /// the graph, never on it — `DocumentGraph` is the canonical-hash
+    /// input and carries content only. Consumers thread this into
+    /// `emit_markdown` / `to_sorted_graph`.
+    pub provenance: ParseProvenance,
 }
 
 /// Round-trip identity status for a parsed graph.
@@ -63,6 +70,15 @@ pub enum ParseIdentity {
         /// The `graph_sha256` recomputed from the parsed graph.
         recomputed_sha256: String,
     },
+    // A third arm — `Unverifiable { version }` — is **reserved** for when
+    // the codec seam gains a version whose live codec is absent (the cold
+    // tier, arch-14 §7): "we recognize this edition but cannot recompute
+    // its canonical form in this binary." It has **no producer today** —
+    // with a single codec arm (`FormatVersion::V1_0`), a non-`1.x` schema
+    // is a clean `ParseError::UnsupportedSchema` *parse error*, never a
+    // successfully-parsed graph carrying a can't-verify verdict. The arm
+    // lands with multi-version support (Block C's museum successor), not
+    // before — adding it now would be an unconstructible variant.
 }
 
 /// Strip mode for the [`crate::preprocessors::md::strip`] operation.
@@ -94,7 +110,7 @@ pub enum StripMode {
     /// and lift the doc-level `bgraph` block to YAML frontmatter at the
     /// top of the output. Produces docling-comparable plain markdown
     /// with provenance preserved. Body content for every variant
-    /// survives. `bgraph-bookmarks` fence content is dropped (not
+    /// survives. `bgraph-outline` fence content is dropped (not
     /// lifted) — outlines are recoverable from the source `.bgraph.md`.
     BodyWithFrontmatter,
     /// Remove every bgraph fence (doc-level + bookmarks + every
@@ -139,7 +155,7 @@ pub enum ParseError {
     MissingDocLevelBlock,
 
     /// A bgraph fence appeared in an invalid position or with an
-    /// invalid shape (e.g., `bgraph-bookmarks` not immediately after
+    /// invalid shape (e.g., `bgraph-outline` not immediately after
     /// the doc-level block, or a Header/Footer/Margin fence with no
     /// body content).
     #[error("malformed bgraph fence: {0}")]
@@ -162,11 +178,13 @@ pub enum ParseError {
         recomputed: String,
     },
 
-    /// The doc-level block carried a `schema` field whose major
-    /// version is not `1`. The current bgraph.md wire-format major is
-    /// 1; older/newer majors are rejected rather than silently
-    /// misinterpreted.
-    #[error("unsupported schema version {0}; expected 1.x.y")]
+    /// The doc-level block carried a `schema` field this parser has no
+    /// read-path arm for. Block C: the honest baseline accepts **only
+    /// `1.x`**; the retired `2.x`–`5.x` lineage (internal pre-museum
+    /// churn, no consumer) and everything else are rejected rather than
+    /// silently misinterpreted. See `bgraph_md::validate_schema` /
+    /// `graphs::serialization::version::FormatVersion::from_schema_str`.
+    #[error("unsupported schema version {0}; this build reads only 1.x.y")]
     UnsupportedSchema(String),
 
     /// Body content contained a line starting with the reserved
@@ -195,4 +213,12 @@ pub enum ParseError {
         parsed: String,
         expected: String,
     },
+
+    /// The DOCX container could not be read as a WordprocessingML document:
+    /// the bytes are not a valid ZIP, `word/document.xml` is absent, or its
+    /// XML is malformed. Carries a human-facing detail. (S10 / Track C — the
+    /// DOCX channel shares this `ParseError` enum with the markdown channel
+    /// since both project to the same `ParseResult`.)
+    #[error("malformed docx: {0}")]
+    MalformedDocx(String),
 }

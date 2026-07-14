@@ -21,6 +21,7 @@
 use crate::graphs::builder::GraphBuilder;
 use crate::graphs::node_id::NodeIdGenerator;
 use crate::graphs::serialization::canonical;
+use crate::graphs::serialization::version::FormatVersion;
 use crate::types::*;
 use serde::Deserialize;
 
@@ -70,10 +71,7 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                                 "duplicate doc-level bgraph fence".to_string(),
                             ));
                         }
-                        if metadata_seen
-                            || !parsed_elements.is_empty()
-                            || bookmarks.is_some()
-                        {
+                        if metadata_seen || !parsed_elements.is_empty() || bookmarks.is_some() {
                             return Err(ParseError::MalformedFence(
                                 "doc-level bgraph fence must appear first".to_string(),
                             ));
@@ -102,29 +100,28 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                         }
                         if bookmarks.is_some() || !parsed_elements.is_empty() {
                             return Err(ParseError::MalformedFence(
-                                "bgraph-metadata fence must appear before bgraph-bookmarks \
+                                "bgraph-metadata fence must appear before bgraph-outline \
                                  and per-element fences"
                                     .to_string(),
                             ));
                         }
                         metadata_seen = true;
-                        document_metadata =
-                            serde_json::from_str(body.trim_end_matches('\n'))
-                                .map_err(|source| ParseError::JsonParse { source })?;
+                        document_metadata = serde_json::from_str(body.trim_end_matches('\n'))
+                            .map_err(|source| ParseError::JsonParse { source })?;
                         pending_body = None;
                     }
-                    "bgraph-bookmarks" => {
+                    "bgraph-outline" => {
                         if doc_level.is_none() {
                             return Err(ParseError::MissingDocLevelBlock);
                         }
                         if bookmarks.is_some() {
                             return Err(ParseError::MalformedFence(
-                                "duplicate bgraph-bookmarks fence".to_string(),
+                                "duplicate bgraph-outline fence".to_string(),
                             ));
                         }
                         if !parsed_elements.is_empty() {
                             return Err(ParseError::MalformedFence(
-                                "bgraph-bookmarks fence must appear before per-element fences"
+                                "bgraph-outline fence must appear before per-element fences"
                                     .to_string(),
                             ));
                         }
@@ -149,13 +146,8 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                             metadata: meta,
                         });
                     }
-                    "bgraph-paragraph"
-                    | "bgraph-header"
-                    | "bgraph-footer"
-                    | "bgraph-margin"
-                    | "bgraph-code-block"
-                    | "bgraph-list"
-                    | "bgraph-block-quote"
+                    "bgraph-paragraph" | "bgraph-header" | "bgraph-footer" | "bgraph-margin"
+                    | "bgraph-code-block" | "bgraph-list" | "bgraph-block-quote"
                     | "bgraph-table" => {
                         // v2.1.0+ single convention: body-outside for
                         // every content variant (including H/F/M; CR-48
@@ -233,29 +225,37 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
                 // the field on inputs that carry it.
                 style: p.metadata.style.clone(),
                 token_count: p.metadata.token_count,
-                internal_refs: vec![],
-                external_refs: vec![],
-                // CR-78 (v2.4.0): thread the parsed confidence back so the
-                // reconstructed graph re-emits byte-identically. (Unlike
-                // internal/external refs — which the parser currently drops
-                // because the round-trip tests only exercise empty refs —
-                // confidence is non-zero on real Section nodes, so it MUST
-                // round-trip to keep the canonical hash stable.)
-                confidence: p.metadata.confidence,
+                // CR-84 (component 3 — refs round-trip faithfulness):
+                // per-element refs were parsed then dropped since CR-62
+                // ("parsed, not yet consumed"), so a forward emit that
+                // carried refs never reverse-parsed to the same
+                // canonical_json. Retain them onto the reconstructed
+                // element; the builder copies them onto the node. Refs
+                // were always in the forward hash — this is a
+                // faithfulness fix, not a canon change.
+                internal_refs: p.metadata.internal_refs.clone(),
+                external_refs: p.metadata.external_refs.clone(),
+                // Block A / A3: `confidence` left the wire (v4.0.0); the
+                // reconstructed element carries the neutral 0 — it no
+                // longer feeds the node or the hash.
+                confidence: 0,
             }
             .validate(),
         );
     }
 
-    // NodeIdGenerator from doc-level provenance. CR-47 dropped
-    // `blazegraph_version` from the namespace, so node IDs are
-    // already version-invariant — the parser side and the emitter
-    // side derive identical IDs from `(source_sha256, config_hash)`
-    // regardless of which blazegraph version ran which step. The
-    // `blazegraph_version` field in `doc_level` stays as provenance
-    // documentation only (see CR-47 Amendment G).
-    let id_gen = NodeIdGenerator::new(&doc_level.source.sha256, &doc_level.config_hash);
+    // CR-83: node IDs are content+breadcrumb-derived, no document
+    // namespace. The parser-side and emitter-side derive identical IDs
+    // from the node content + breadcrumb path + occurrence — independent
+    // of source/config/version. `source.sha256` + `config_hash` stay in
+    // `doc_level` as *document* identity (they feed `graph_sha256`), not
+    // node scoping.
+    let id_gen = NodeIdGenerator::new();
 
+    // Block A / Amendment M: the reconstructed provenance rides beside
+    // the graph (on `ParseResult`), never on it — the identity recompute
+    // below hashes the content body only, on both the emit and parse
+    // sides.
     let provenance = ParseProvenance {
         blazegraph_version: doc_level.blazegraph_version.clone(),
         source_format: doc_level.source.format.clone(),
@@ -265,7 +265,7 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     };
 
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(semantic_elements, &id_gen, provenance)
+        .build_graph_deterministic(semantic_elements, &id_gen)
         .map_err(|e| ParseError::MalformedFence(format!("graph build failed: {e}")))?;
 
     // ----- Phase 4: populate fields the builder does not. -----
@@ -275,35 +275,21 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
     // inputs), `document_metadata` defaults to `Default::default()`,
     // which is the honest "no extracted metadata" answer.
     graph.document_info.document_metadata = document_metadata;
-    graph.document_info.bookmark_data = bookmarks;
+    // CR-82: round-trip the artifact kind (default `document` when absent).
+    graph.document_info.kind = doc_level.kind.clone();
+    graph.document_info.outline_data = bookmarks;
     // CR-49 (v2.1.0+) added `topology` here.
     // CR-60 (2026-05-22) retracted `source_identity` + `supersedes`
     // per the byte-in/byte-out principle (arch doc 11 + DT-04).
     // Absent in the source bgraph.md → `None` on the reconstructed graph.
     graph.document_info.topology = doc_level.topology.clone();
-    graph.structural_profile.flow_type = doc_level.flow_type.clone();
+    graph.document_info.flow_type = doc_level.flow_type.clone();
 
-    // Canonical post-build sequence (mirrors processor.rs:501-502).
-    graph.compute_structural_profile();
+    // Canonical post-build sequence (mirrors processor.rs). Block A /
+    // A2: no structural-profile reconstruction before the identity
+    // recompute — the profile is json-only and out of the hash, so the
+    // verify path no longer needs it.
     graph.compute_breadcrumbs();
-
-    // Self-consistency check (debug only): verify the IDs the builder
-    // derived match the IDs the emitter embedded. A mismatch here means
-    // the parsed bgraph.md was emitted by a different
-    // (version, source, config) than its metadata claims, or was
-    // hand-tampered. Non-load-bearing for round-trip identity (the
-    // builder's IDs are the truth), but a useful fail-loud signal.
-    #[cfg(debug_assertions)]
-    {
-        for p in &parsed_elements {
-            let derived = id_gen.node_id(p.metadata.text_order);
-            debug_assert_eq!(
-                derived, p.metadata.id,
-                "per-element id mismatch at text_order {}: parsed={}, derived={}",
-                p.metadata.text_order, p.metadata.id, derived
-            );
-        }
-    }
 
     // ----- Phase 5: identity verification. -----
     let recomputed = canonical::graph_sha256(&graph);
@@ -321,7 +307,36 @@ pub fn parse(input: &str, opts: ParseOptions) -> Result<ParseResult, ParseError>
         });
     };
 
-    Ok(ParseResult { graph, identity })
+    // Self-consistency check (debug only): for a VERIFIED (untampered) doc,
+    // each per-element fence's embedded ID must equal the ID the builder
+    // re-derives. For drifted/derivative docs, mismatched embedded IDs are
+    // *expected* — that is the drift — so this applies only when Verified.
+    // (CR-83: IDs are content+breadcrumb-derived. This catches per-element
+    // fence tampering that the doc-level `graph_sha256` recompute — which
+    // hashes the builder's derived IDs, not the embedded ones — cannot see.)
+    #[cfg(debug_assertions)]
+    if matches!(identity, ParseIdentity::Verified) {
+        let by_text_order: std::collections::HashMap<u32, NodeId> = graph
+            .nodes
+            .values()
+            .filter_map(|n| n.text_order.map(|t| (t, n.id)))
+            .collect();
+        for p in &parsed_elements {
+            if let Some(&derived) = by_text_order.get(&p.metadata.text_order) {
+                debug_assert_eq!(
+                    derived, p.metadata.id,
+                    "per-element id mismatch at text_order {}: parsed={}, derived={}",
+                    p.metadata.text_order, p.metadata.id, derived
+                );
+            }
+        }
+    }
+
+    Ok(ParseResult {
+        graph,
+        identity,
+        provenance,
+    })
 }
 
 // =========================================================================
@@ -409,7 +424,7 @@ fn scan_segments(input: &str) -> Result<Vec<Segment>, ParseError> {
 /// leading triple-backticks). Otherwise `None`.
 ///
 /// Recognized tags (v2.1.0+ / CR-57): `bgraph`, `bgraph-metadata`,
-/// `bgraph-bookmarks`, `bgraph-section`, `bgraph-paragraph`,
+/// `bgraph-outline`, `bgraph-section`, `bgraph-paragraph`,
 /// `bgraph-header`, `bgraph-footer`, `bgraph-margin`, `bgraph-code-block`,
 /// `bgraph-list`, `bgraph-block-quote`, `bgraph-table`. Any other
 /// ` ```bgraph* ` line-start is rejected by the caller as a
@@ -426,7 +441,7 @@ pub(super) fn bgraph_fence_open_tag(line: &str) -> Option<String> {
     let info = line.strip_prefix("```")?;
     if info == "bgraph"
         || info == "bgraph-metadata"
-        || info == "bgraph-bookmarks"
+        || info == "bgraph-outline"
         || info == "bgraph-section"
         || info == "bgraph-paragraph"
         || info == "bgraph-header"
@@ -506,6 +521,10 @@ fn collapse_free_buffer(lines: &[&str]) -> String {
 #[derive(Debug, Clone, Deserialize)]
 struct DocLevelBlock {
     schema: String,
+    // CR-82: artifact discriminator. `#[serde(default)]` so pre-2.5.0
+    // files (no `kind`) parse as `document` — back-compatible read.
+    #[serde(default = "crate::types::default_kind")]
+    kind: String,
     blazegraph_version: String,
     source: DocLevelSource,
     flow_type: FlowType,
@@ -545,19 +564,20 @@ struct NodeMetadata {
     token_count: usize,
     /// CR-62 (v2.3.0+): per-element refs to other locations within this
     /// document. `#[serde(default)]` so pre-v2.3.0 fixtures parse cleanly.
+    /// CR-84: retained onto the reconstructed node (refs round-trip
+    /// faithfulness) — no longer parse-and-drop.
     #[serde(default)]
     internal_refs: Vec<crate::types::InternalRef>,
     /// CR-62 (v2.3.0+): per-element refs to external locations. Same
-    /// forward-compat tolerance.
+    /// forward-compat tolerance. CR-84: retained onto the reconstructed
+    /// node.
     #[serde(default)]
     external_refs: Vec<crate::types::ExternalRef>,
-    /// CR-78 (v2.4.0+): per-element detection confidence (Section nodes).
-    /// `#[serde(default)]` → `0` for pre-v2.4.0 fixtures and for non-Section
-    /// nodes (the emitter omits the field when `0`). Threaded back onto the
-    /// reconstructed `SemanticTreeElement.confidence` so re-emit is byte-
-    /// symmetric (the CR-57 round-trip invariant) for non-zero scores.
-    #[serde(default)]
-    confidence: u8,
+    // v4.0.0 (Block A / Amendment M): `confidence` left the wire. A
+    // legacy (≤3.x) input carrying it parses fine — serde drops unknown
+    // fields — but the value is discarded; it no longer round-trips
+    // (and a ≤3.x stamped graph_sha256 would not verify under the v4
+    // content-only recompute anyway).
     /// CR-45: per-element verbatim Tika style projection. `#[serde(default)]`
     /// makes the field tolerant of fixtures / hand-edited inputs that
     /// omit it (forward-compat with the spec's "tolerate absent optional
@@ -610,17 +630,22 @@ fn strip_heading_prefix(body: &str) -> String {
         .to_string()
 }
 
-/// Validate that the doc-level `schema` field is a major version this
-/// parser has an arm for. v2.1.0+ (CR-57) accepts only `2.x` — the v1.x
-/// body-inside H/F/M dispatch + v2.0.0 old variant-tag dispatch are
-/// removed per the single-convention contract (CR-56 § I.5 +
-/// no_fictional_users). Future major bumps add accepted prefixes here
-/// in lock-step with the matching parser arms.
+/// Validate that the doc-level `schema` field is a version this parser
+/// has a read-path arm for, by routing through the codec seam
+/// ([`FormatVersion::from_schema_str`]). Block C: acceptance narrows to
+/// **`1.x` only** — the honest inaugural edition. The `2.x`–`5.x` lineage
+/// (and everything else) is retired internal pre-museum churn with no
+/// consumer, so it is a clean [`ParseError::UnsupportedSchema`], never
+/// best-effort-read.
+///
+/// Read-side version recognition is no longer an inline string-prefix
+/// match: it *is* `FormatVersion::from_schema_str`, the single chokepoint
+/// the seam owns. A future major bump that changes the read path adds a
+/// `FormatVersion` arm (+ its codec profile) there, in lock-step.
 fn validate_schema(schema: &str) -> Result<(), ParseError> {
-    if schema.starts_with("2.") {
-        Ok(())
-    } else {
-        Err(ParseError::UnsupportedSchema(schema.to_string()))
+    match FormatVersion::from_schema_str(schema) {
+        Some(_) => Ok(()),
+        None => Err(ParseError::UnsupportedSchema(schema.to_string())),
     }
 }
 
@@ -657,6 +682,24 @@ mod tests {
 
     // --- shared fixture builders --------------------------------------
 
+    /// Synthetic provenance for emit/round-trip tests. Threaded
+    /// explicitly into every emit call (Block A: provenance is an
+    /// argument, not graph state).
+    fn synthetic_provenance() -> ParseProvenance {
+        ParseProvenance {
+            blazegraph_version: "0.6.0".to_string(),
+            source_format: "markdown".to_string(),
+            source_filename: "synthetic.md".to_string(),
+            source_sha256: "synthetic-source-sha".to_string(),
+            config_hash: "synthetic-config-hash".to_string(),
+        }
+    }
+
+    /// Emit with the shared synthetic provenance + default options.
+    fn emit(graph: &DocumentGraph) -> String {
+        emit_markdown(graph, &synthetic_provenance())
+    }
+
     /// Build a synthetic graph for round-trip tests. `nodes_in` is
     /// `(node_type, text, depth, text_order)`. The graph is built via
     /// `GraphBuilder::build_graph_deterministic` so IDs / paths /
@@ -666,14 +709,7 @@ mod tests {
         title: Option<&str>,
         bookmarks: Option<BookmarkData>,
     ) -> DocumentGraph {
-        let provenance = ParseProvenance {
-            blazegraph_version: "0.6.0".to_string(),
-            source_format: "markdown".to_string(),
-            source_filename: "synthetic.md".to_string(),
-            source_sha256: "synthetic-source-sha".to_string(),
-            config_hash: "synthetic-config-hash".to_string(),
-        };
-        let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+        let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
 
         let elements: Vec<SemanticTreeElement> = nodes_in
             .iter()
@@ -707,12 +743,11 @@ mod tests {
             .collect();
 
         let mut graph = GraphBuilder::new()
-            .build_graph_deterministic(elements, &id_gen, provenance)
+            .build_graph_deterministic(elements, &id_gen)
             .expect("synthetic graph builds");
         graph.document_info.document_metadata.title = title.map(str::to_string);
-        graph.document_info.bookmark_data = bookmarks;
-        graph.structural_profile.flow_type = FlowType::Free;
-        graph.compute_structural_profile();
+        graph.document_info.outline_data = bookmarks;
+        graph.document_info.flow_type = FlowType::Free;
         graph.compute_breadcrumbs();
         graph
     }
@@ -727,22 +762,19 @@ mod tests {
     fn parse_doc_level_identity_plus_metadata_fence_round_trips_title() {
         // v2.1.0 (CR-56 § I.4): `title` lives in the bgraph-metadata
         // fence, not the doc-level block. Round-trip still recovers it.
-        let graph =
-            build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], Some("Title"), None);
-        let md = emit_markdown(&graph);
+        let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], Some("Title"), None);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let info = &result.graph.document_info;
         assert_eq!(info.document_metadata.title.as_deref(), Some("Title"));
-        let prov = info.parse_provenance.as_ref().expect("provenance");
+        // Block A: provenance rides on the ParseResult, not the graph.
+        let prov = &result.provenance;
         assert_eq!(prov.blazegraph_version, "0.6.0");
         assert_eq!(prov.source_format, "markdown");
         assert_eq!(prov.source_filename, "synthetic.md");
         assert_eq!(prov.source_sha256, "synthetic-source-sha");
         assert_eq!(prov.config_hash, "synthetic-config-hash");
-        assert!(matches!(
-            result.graph.structural_profile.flow_type,
-            FlowType::Free
-        ));
+        assert!(matches!(result.graph.document_info.flow_type, FlowType::Free));
     }
 
     #[test]
@@ -766,13 +798,13 @@ mod tests {
             Some("Doc"),
             Some(bookmarks.clone()),
         );
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses with bookmarks");
         let parsed_bm = result
             .graph
             .document_info
-            .bookmark_data
-            .expect("bookmark_data is Some");
+            .outline_data
+            .expect("outline_data is Some");
         assert_eq!(parsed_bm.sections.len(), 2);
         assert_eq!(parsed_bm.sections[0].title, "Intro");
         assert_eq!(parsed_bm.sections[0].level, 1);
@@ -781,17 +813,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_bookmarks_fence_absent_yields_none_bookmark_data() {
+    fn parse_bookmarks_fence_absent_yields_none_outline_data() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
-        assert!(result.graph.document_info.bookmark_data.is_none());
+        assert!(result.graph.document_info.outline_data.is_none());
     }
 
     #[test]
     fn parse_section_pairs_with_preceding_heading() {
         let graph = build_synthetic_graph(vec![("Section", "Introduction", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         // The Section node should carry "Introduction" as its content.
         let section = result
@@ -806,7 +838,7 @@ mod tests {
     #[test]
     fn parse_paragraph_pairs_with_preceding_text() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Hello world.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let para = result
             .graph
@@ -823,7 +855,7 @@ mod tests {
         // fence, same shape as Paragraph.
         let graph =
             build_synthetic_graph(vec![("Header", "Running header text", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let header = result
             .graph
@@ -835,19 +867,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_v1_x_schemas() {
-        // v2.1.0+ (CR-57): single convention. v1.x fixtures (body-inside
-        // H/F/M, no bgraph-metadata fence) are no longer parseable. No
-        // back-compat dispatch — fixtures regenerate via the emit path.
-        let v1_fixture =
-            "```bgraph\n\
-             {\"schema\":\"1.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"title\":null,\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
-             ```\n";
-        let result = parse(v1_fixture, ParseOptions { accept_drift: true });
-        assert!(
-            matches!(result, Err(ParseError::UnsupportedSchema(_))),
-            "v1.x schemas must be rejected under v2.1.0+ single-convention parser; got: {result:?}"
-        );
+    fn parse_rejects_retired_2x_through_5x_schemas() {
+        // Block C: the honest baseline reads **only 1.x**. The retired
+        // `2.x`–`5.x` lineage (internal pre-museum churn, no consumer)
+        // and everything else are a clean `UnsupportedSchema` at parse
+        // time — never best-effort-read. (Note the polarity flip from the
+        // pre-reset world, where `1.x` was the rejected legacy format.)
+        for retired in ["0.9.0", "2.0.0", "3.0.0", "4.0.0", "5.0.0", "6.0.0"] {
+            let fixture = format!(
+                "```bgraph\n\
+                 {{\"schema\":\"{retired}\",\"blazegraph_version\":\"0.6.0\",\"source\":{{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"}},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}}\n\
+                 ```\n"
+            );
+            let result = parse(&fixture, ParseOptions { accept_drift: true });
+            assert!(
+                matches!(result, Err(ParseError::UnsupportedSchema(_))),
+                "retired schema {retired} must be rejected under the 1.x-only baseline; got: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -855,16 +892,15 @@ mod tests {
         // F-11 + single-convention: bgraph-codeblock / bgraph-blockquote
         // (v2.0.0 tag names) must be rejected. The walk picks them up as
         // unrecognized tags via the fence-tag dispatch.
-        let bad_codeblock = format!(
-            "```bgraph\n\
-             {{\"schema\":\"2.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"}},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}}\n\
+        let bad_codeblock = "```bgraph\n\
+             {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
              ```\n\
              \n\
-             ```bgraph-metadata\n{{}}\n```\n\
+             ```bgraph-metadata\n{}\n```\n\
              \n\
              body\n\
-             ```bgraph-codeblock\n{{\"id\":\"00000000-0000-0000-0000-000000000000\",\"node_type\":\"CodeBlock\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":1}}\n```\n",
-        );
+             ```bgraph-codeblock\n{\"id\":\"00000000-0000-0000-0000-000000000000\",\"node_type\":\"CodeBlock\",\"location\":{\"semantic\":{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]},\"physical\":null},\"text_order\":0,\"token_count\":1}\n```\n"
+            .to_string();
         let result = parse(&bad_codeblock, ParseOptions { accept_drift: true });
         assert!(
             matches!(result, Err(ParseError::MalformedFence(_))),
@@ -888,7 +924,7 @@ mod tests {
         // Build a real bgraph.md, then surgically replace one
         // node_type with garbage so we hit UnknownNodeType.
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let tampered = md.replace("\"node_type\":\"Paragraph\"", "\"node_type\":\"Gibberish\"");
         let result = parse(&tampered, ParseOptions { accept_drift: true });
         assert!(matches!(result, Err(ParseError::UnknownNodeType(_))));
@@ -903,7 +939,7 @@ mod tests {
             None,
             None,
         );
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let para = result
             .graph
@@ -917,7 +953,7 @@ mod tests {
     #[test]
     fn parse_strict_mode_rejects_drift() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Original.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         // Mutate the body so graph_sha256 changes.
         let tampered = md.replace("Original.", "Tampered.");
         let result = parse(&tampered, ParseOptions::default());
@@ -927,7 +963,7 @@ mod tests {
     #[test]
     fn parse_accept_drift_mode_returns_derivative() {
         let graph = build_synthetic_graph(vec![("Paragraph", "Original.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let tampered = md.replace("Original.", "Tampered.");
         let result =
             parse(&tampered, ParseOptions { accept_drift: true }).expect("parses with drift");
@@ -955,7 +991,7 @@ mod tests {
             Some("Doc"),
             None,
         );
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         assert_eq!(canonical(&result.graph), canonical(&original));
@@ -967,7 +1003,7 @@ mod tests {
         // new bgraph fence inside an active fence. (The scanner sees
         // this as a reserved-prefix violation.)
         let bogus = "```bgraph\n\
-                     {\"schema\":\"2.1.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
+                     {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"markdown\",\"filename\":\"x.md\",\"sha256\":\"a\"},\"flow_type\":\"Free\",\"config_hash\":\"b\",\"graph_sha256\":\"c\"}\n\
                      ```bgraph-section\n\
                      ```\n";
         // The inner `bgraph-section` open without a preceding ``` close is
@@ -1002,7 +1038,7 @@ mod tests {
             Some("Sample Document"),
             Some(bookmarks),
         );
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         eprintln!("--- BEGIN bgraph.md sample ---");
         eprintln!("{md}");
         eprintln!("--- END bgraph.md sample ---");
@@ -1028,24 +1064,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_schema_accepts_only_v2_x() {
-        // v2.1.0+ (CR-57): single convention. v1.x and v3.x+ are rejected.
-        for ok in ["2.0.0", "2.1.0", "2.42.7", "2.99.0"] {
+    fn validate_schema_accepts_only_1_x() {
+        // Block C: acceptance narrows to `1.x` — the honest inaugural
+        // edition — routed through the codec seam
+        // (`FormatVersion::from_schema_str`).
+        for ok in ["1.0.0", "1.1.0", "1.42.7", "1.99.0"] {
             assert!(
                 validate_schema(ok).is_ok(),
-                "{ok} should be accepted under v2.1.0+ parser"
+                "{ok} should be accepted under the 1.x-only baseline"
             );
         }
     }
 
     #[test]
-    fn validate_schema_rejects_v1_and_v3_plus() {
+    fn validate_schema_rejects_non_1_x() {
+        // Everything outside `1.x` — the retired `2.x`–`5.x` pre-museum
+        // lineage, sub-1.0 mislabels, and hypothetical future majors —
+        // is `UnsupportedSchema`. No best-effort read.
         for bad in [
-            "0.9.0", "1.0.0", "1.1.0", "1.42.0", "3.0.0", "4.0.0", "10.0.0",
+            "0.9.0", "2.0.0", "2.1.0", "3.0.0", "4.0.0", "5.0.0", "5.1.0", "6.0.0", "10.0.0",
         ] {
             assert!(
                 matches!(validate_schema(bad), Err(ParseError::UnsupportedSchema(_))),
-                "{bad} should be rejected by v2.1.0+ single-convention parser"
+                "{bad} should be rejected — the 1.x-only baseline has no arm for it"
             );
         }
     }
@@ -1057,7 +1098,7 @@ mod tests {
         let raw_codeblock = "```rust\nfn main() {}\n```";
         let original =
             build_synthetic_graph(vec![("CodeBlock", raw_codeblock, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         // The reconstructed CodeBlock's body should equal the
@@ -1075,7 +1116,7 @@ mod tests {
     fn parse_list_fence_recovers_multi_item_body() {
         let raw_list = "- one\n- two\n- three";
         let original = build_synthetic_graph(vec![("List", raw_list, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         let list = result
@@ -1091,7 +1132,7 @@ mod tests {
     fn parse_list_fence_handles_nested_indented_continuation() {
         let raw_list = "- top\n  - nested\n  - also nested\n- top two";
         let original = build_synthetic_graph(vec![("List", raw_list, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         let list = result
             .graph
@@ -1107,7 +1148,7 @@ mod tests {
         let raw_quote = "> a quote\n> still quoted";
         let original =
             build_synthetic_graph(vec![("Blockquote", raw_quote, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         let bq = result
             .graph
@@ -1122,7 +1163,7 @@ mod tests {
     fn parse_table_fence_recovers_gfm_body_with_alignment_row() {
         let raw_table = "| h1 | h2 |\n|---|---|\n| a | b |";
         let original = build_synthetic_graph(vec![("Table", raw_table, 1, 0)], Some("Doc"), None);
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         let tbl = result
             .graph
@@ -1131,6 +1172,96 @@ mod tests {
             .find(|n| n.node_type == "Table")
             .expect("Table present");
         assert_eq!(tbl.content.text, raw_table);
+    }
+
+    /// CR-79 — a `Table` node round-trips with full emit→parse symmetry: the
+    /// reconstructed graph is canonical-equal to the original and the parse
+    /// identity is `Verified`. This is the round-trip acceptance for the Tier 1
+    /// table node the `TableDetectionRule` produces.
+    #[test]
+    fn parse_table_node_round_trip_symmetry_cr79() {
+        let raw_table = "| col a | col b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
+        let original =
+            build_synthetic_graph(vec![("Table", raw_table, 1, 0)], Some("CR-79 Table"), None);
+        let md = emit(&original);
+        let result = parse(&md, ParseOptions::default()).expect("table node round-trips");
+        assert!(matches!(result.identity, ParseIdentity::Verified));
+        assert_eq!(canonical(&result.graph), canonical(&original));
+        // Second emit is byte-identical (idempotent emit on a parsed graph).
+        let md2 = emit_markdown(&result.graph, &result.provenance);
+        assert_eq!(md, md2, "second emit must be byte-identical");
+    }
+
+    /// CR-84 (component 3): per-element `internal_refs` / `external_refs`
+    /// round-trip — emitted refs are retained onto the reconstructed node
+    /// (not parse-and-dropped), so the reverse `canonical_json` matches
+    /// the forward one and strict identity verifies.
+    #[test]
+    fn parse_round_trip_retains_refs_verified() {
+        let mut original = build_synthetic_graph(
+            vec![
+                ("Section", "Intro", 1, 0),
+                ("Paragraph", "See [1] and the site.", 1, 1),
+            ],
+            Some("Refs Doc"),
+            None,
+        );
+        // Attach refs to the paragraph node (the builder path would have
+        // carried them from the channel; refs were always in the forward
+        // hash).
+        let para_id = original
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Paragraph")
+            .map(|n| n.id)
+            .expect("paragraph present");
+        let para = original.nodes.get_mut(&para_id).unwrap();
+        para.internal_refs = vec![InternalRef {
+            text: "[1]".to_string(),
+            source_page: Some(1),
+            source_bbox: None,
+            target: InternalRefTarget::Named {
+                name: "cite.example2026".to_string(),
+                page: Some(9),
+                point: None,
+            },
+        }];
+        para.external_refs = vec![ExternalRef {
+            text: "the site".to_string(),
+            source_page: Some(1),
+            source_bbox: None,
+            target: ExternalRefTarget::Uri {
+                url: "https://example.com".to_string(),
+            },
+        }];
+
+        let md = emit(&original);
+        assert!(
+            md.contains("\"internal_refs\""),
+            "emitted bgraph.md must carry the refs; got:\n{md}"
+        );
+
+        let result = parse(&md, ParseOptions::default())
+            .expect("refs-carrying bgraph.md round-trips strictly");
+        assert!(
+            matches!(result.identity, ParseIdentity::Verified),
+            "identity must verify — refs are in the forward hash, so \
+             dropping them on parse would HashMismatch; got {:?}",
+            result.identity
+        );
+        assert_eq!(canonical(&result.graph), canonical(&original));
+
+        // The refs landed on the reconstructed node, not just the hash.
+        let reparsed_para = result
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.node_type == "Paragraph")
+            .expect("paragraph present");
+        assert_eq!(reparsed_para.internal_refs.len(), 1);
+        assert_eq!(reparsed_para.internal_refs[0].text, "[1]");
+        assert_eq!(reparsed_para.external_refs.len(), 1);
+        assert_eq!(reparsed_para.external_refs[0].text, "the site");
     }
 
     #[test]
@@ -1165,7 +1296,7 @@ mod tests {
 
         // Round-trip: the escaped body lets the scanner see only the
         // real bgraph-paragraph fence as a fence open.
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default())
             .expect("self-referential paragraph round-trips cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
@@ -1187,13 +1318,13 @@ mod tests {
             None,
         );
         original.document_info.topology = Some("stream".to_string());
-        let md1 = emit_markdown(&original);
+        let md1 = emit(&original);
         let result = parse(&md1, ParseOptions::default()).expect("round-trips");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         let info = &result.graph.document_info;
         assert_eq!(info.topology.as_deref(), Some("stream"));
         // Second emit must be byte-identical to the first.
-        let md2 = emit_markdown(&result.graph);
+        let md2 = emit_markdown(&result.graph, &result.provenance);
         assert_eq!(md1, md2, "second emit must be byte-identical to the first");
     }
 
@@ -1211,7 +1342,7 @@ mod tests {
         // as a fence, but the dispatch arm in `parse` no longer accepts
         // it and falls through to MalformedFence).
         let base = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&base);
+        let md = emit(&base);
         // Splice a `bgraph-message` fence into a synthetic shape. Use a
         // hand-built fence with the minimum JSON the parser would have
         // tried to dispatch on.
@@ -1230,7 +1361,7 @@ mod tests {
         // A bgraph.md without `topology` parses cleanly; the
         // reconstructed graph carries `None`.
         let graph = build_synthetic_graph(vec![("Paragraph", "Body.", 1, 0)], None, None);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let result = parse(&md, ParseOptions::default()).expect("parses");
         let info = &result.graph.document_info;
         assert!(info.topology.is_none());
@@ -1253,7 +1384,7 @@ mod tests {
             Some("Mixed"),
             None,
         );
-        let md = emit_markdown(&original);
+        let md = emit(&original);
         let result = parse(&md, ParseOptions::default()).expect("parses cleanly");
         assert!(matches!(result.identity, ParseIdentity::Verified));
         assert_eq!(canonical(&result.graph), canonical(&original));

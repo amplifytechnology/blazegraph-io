@@ -4,8 +4,8 @@ use std::path::Path;
 
 // Import from blazegraph-io-core
 use blazegraph_io_core::{
-    CacheDefaults, CachePoint, DocumentGraph, DocumentProcessor, FreshFrom, ParsingConfig,
-    PipelineStages,
+    CacheDefaults, CachePoint, DocumentGraph, DocumentProcessor, FreshFrom, ParseProvenance,
+    ParsingConfig,
 };
 
 /// Default config embedded at compile time — guarantees every install has working defaults.
@@ -42,10 +42,11 @@ enum Command {
     /// Parse a document into a semantic graph (or emit it back to
     /// markdown).
     ///
-    /// Input formats: `.pdf` (PDF channel) and `.bgraph.md` / `.md`
-    /// (markdown channel — bgraph.md round-trip artifact or generic
-    /// markdown, lib auto-detects). Format detection is by extension
-    /// first; content-sniff for unknown extensions.
+    /// Input formats: `.pdf` (PDF channel), `.docx` (OOXML channel),
+    /// and `.bgraph.md` / `.md` (markdown channel — bgraph.md
+    /// round-trip artifact or generic markdown, lib auto-detects).
+    /// Format detection is by extension first; content-sniff for
+    /// unknown extensions.
     Parse(ParseArgs),
 
     /// Strip bgraph fences from a bgraph.md file.
@@ -63,7 +64,7 @@ enum Command {
 
 #[derive(ClapArgs)]
 struct ParseArgs {
-    /// Path to the input file (PDF, .bgraph.md, or .md).
+    /// Path to the input file (PDF, .docx, .bgraph.md, or .md).
     #[arg(short, long, default_value = "../sample_pdfs/sample3.pdf")]
     input: String,
 
@@ -111,26 +112,21 @@ struct ParseArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Include `style` on every per-element fence in the emitted bgraph.md
-    /// (verbatim Tika projection — `foreground_color`, `background_color`,
-    /// `font_family`, `font_size`, `is_bold`, `is_italic`, `font_class`).
-    /// CR-59 reverted the default to opt-in: by default the wire-format
-    /// emitter omits `style` (the in-memory `node.style_info` is still
-    /// populated for library consumers). Pass this flag to round-trip a
-    /// PDF-source graph with style preserved in the emitted bgraph.md.
-    /// PDF channel only.
+    /// Populate `style_info` (verbatim Tika projection — `foreground_color`,
+    /// `background_color`, `font_family`, `font_size`, `is_bold`,
+    /// `is_italic`, `font_class`) on every node of the built graph. PDF
+    /// channel only.
+    ///
+    /// CR-86 / DT-12: this is a **build-time value gate**, not an emit flag.
+    /// The `style_info` field is *always* on the wire (`null` when off,
+    /// data when on); this flag decides the value. It folds into
+    /// `config_hash`, so with-style and null-style are distinct editions
+    /// with distinct identity. Default (flag absent) → the null-style
+    /// edition, which round-trips to `Verified`. Style is debug /
+    /// data-science-lab payload (~20% output size, DT-03), so it is off by
+    /// default.
     #[arg(long)]
     include_style_info: bool,
-
-    /// Dump all intermediate pipeline stage outputs to a directory.
-    /// Captures: XHTML, TextElements, ParsedElements, and final Graph as separate files.
-    /// PDF channel only.
-    #[arg(long)]
-    dump_stages: bool,
-
-    /// Directory for stage dump output (default: {cache_dir}/debug).
-    #[arg(long)]
-    stages_dir: Option<String>,
 
     // =========================================================================
     // Cache control (CR-11)
@@ -155,16 +151,13 @@ struct ParseArgs {
     /// Alias for --fresh-from c0 (reprocess everything from scratch).
     #[arg(long)]
     skip_cache: bool,
-
-    // =========================================================================
-    // Markdown-input flags (B5)
-    // =========================================================================
-    /// Accept hash-drifted bgraph.md input. When the recomputed
-    /// `graph_sha256` does not match the value embedded in the
-    /// doc-level block, return a derivative graph instead of erroring.
-    /// Only meaningful when the input is markdown.
-    #[arg(long)]
-    accept_drift: bool,
+    // Block C.3: the `--accept-drift` runtime toggle was **removed**.
+    // Identity strictness is now a *compile-time* property (the
+    // `strict-identity` cargo feature, default-ON): the shipped binary
+    // rejects a canon-hash mismatch and there is no runtime way to relax
+    // it. The library `ParseOptions.accept_drift` field remains for
+    // programmatic/test callers; only the CLI surface loses the toggle.
+    // See `strict_accept_drift()`.
 }
 
 #[derive(ClapArgs)]
@@ -243,8 +236,6 @@ fn parse_node_type(s: &str) -> std::result::Result<String, String> {
         ))
     }
 }
-
-
 
 /// CLI mirror of [`blazegraph_io_core::preprocessors::md::StripMode`]
 /// (the two exposed-as-`--mode` variants — `NodeTypes` is reached via
@@ -339,11 +330,13 @@ fn run_parse(args: ParseArgs) -> Result<()> {
     match detect_input_format(Path::new(&args.input))? {
         InputFormat::Markdown { content } => run_parse_markdown(args, content),
         InputFormat::Pdf => run_parse_pdf(args, cache_dir),
+        InputFormat::Docx => run_parse_docx(args),
         InputFormat::Unknown => Err(anyhow!(
             "❌ Input format not recognized: {}\n\
              \n\
              Supported formats:\n\
              \t.pdf            — PDF documents (full parsing pipeline)\n\
+             \t.docx           — Word documents (OOXML channel)\n\
              \t.bgraph.md      — Blazegraph markdown round-trip artifact\n\
              \t.md, .markdown  — Generic markdown\n",
             args.input
@@ -382,6 +375,14 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
     if args.minimal_parse {
         config.minimal_parse = true;
     }
+    // CR-86 / DT-12: `--include-style-info` is a **build-time** value gate
+    // now (was an emit flag). Setting it on the config populates
+    // `DocumentNode.style_info` during the build and folds into
+    // `config_hash`, so the with-style output is a distinct edition. Default
+    // (flag absent) → null-style edition, which self-verifies on round-trip.
+    if args.include_style_info {
+        config.include_style_info = true;
+    }
 
     // Resolve fresh-from: --skip-cache takes precedence
     let fresh_from = if args.skip_cache {
@@ -396,29 +397,6 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
 
     println!("📄 Processing: {}", args.input);
 
-    // Stage dump mode: capture and save all intermediates
-    if args.dump_stages {
-        let stages_dir = args
-            .stages_dir
-            .clone()
-            .unwrap_or_else(|| format!("{}/debug", cache_dir));
-        println!("\n🔬 Pipeline stage dump mode");
-        match processor.process_document_capture_stages(&args.input, &config) {
-            Ok(stages) => {
-                save_stages(&stages, &stages_dir)?;
-                println!("\n✅ All stages dumped to: {}", stages_dir);
-            }
-            Err(e) => {
-                eprintln!("❌ Stage dump failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        #[cfg(feature = "jni-backend")]
-        std::process::exit(0);
-        #[cfg(not(feature = "jni-backend"))]
-        return Ok(());
-    }
-
     // Process the document with cache point awareness
     match processor.process_document_with_cache(
         &args.input,
@@ -427,16 +405,17 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
         &cache_defaults,
         args.profile,
     ) {
-        Ok(graph) => {
+        Ok((graph, provenance)) => {
             println!("✅ Successfully processed document");
             println!("📊 Graph: {} nodes", graph.nodes.len());
 
-            // CR-59 (v2.1.0+): style emission is opt-in. The pipeline
-            // always populates `node.style_info` for library consumers;
-            // only the bgraph.md serializer gates emission, threaded
-            // through `save_graph` → `EmitOptions::include_style_info`.
+            // CR-86 / DT-12: style is gated at build time (the graph's
+            // `style_info` values already reflect `config.include_style_info`).
+            // The emitter serializes what the graph holds; `save_graph`
+            // no longer takes an emit flag. Block A: provenance rides
+            // beside the graph as a value.
             let output_path = resolve_output_path(&args);
-            save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
+            save_graph(&graph, &provenance, &output_path, &args.output_format)?;
 
             // Fast exit - skip JVM shutdown sequence
             #[cfg(feature = "jni-backend")]
@@ -455,6 +434,16 @@ fn run_parse_pdf(args: ParseArgs, cache_dir: String) -> Result<()> {
 // Markdown channel (B5)
 // =========================================================================
 
+/// The `accept_drift` value for this **build**. Block C.3: strictness is
+/// a compile-time property, not a runtime flag. In the shipped binary
+/// (default features → `strict-identity` on) this is `false` — a
+/// canon-hash mismatch is a hard reject with no way to relax it. A build
+/// compiled without `strict-identity` tolerates drift (local-debug
+/// escape only; never the shipped artifact).
+const fn strict_accept_drift() -> bool {
+    !cfg!(feature = "strict-identity")
+}
+
 fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
     use blazegraph_io_core::preprocessors::md::{
         is_bgraph_md, parse_markdown, ParseError, ParseIdentity, ParseOptions,
@@ -468,7 +457,7 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
     }
 
     let opts = ParseOptions {
-        accept_drift: args.accept_drift,
+        accept_drift: strict_accept_drift(),
     };
     let result = match parse_markdown(&content, opts) {
         Ok(r) => r,
@@ -482,8 +471,10 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
                  \trecomputed: {recomputed}\n\
                  \n\
                  This means the bgraph.md has been edited since emission.\n\
-                 To accept the drifted content as a new derivative graph,\n\
-                 re-run with --accept-drift.\n"
+                 This binary verifies identity by construction (compile-time\n\
+                 strict-identity) and will not emit a drifted graph — there is\n\
+                 no runtime override. Regenerate the bgraph.md from source, or\n\
+                 restore the original bytes.\n"
             );
             std::process::exit(2);
         }
@@ -510,14 +501,72 @@ fn run_parse_markdown(args: ParseArgs, content: String) -> Result<()> {
         }
     }
 
+    emit_parsed_graph(&args, result.graph, result.provenance)
+}
+
+// =========================================================================
+// DOCX channel (C4)
+// =========================================================================
+
+fn run_parse_docx(args: ParseArgs) -> Result<()> {
+    use blazegraph_io_core::preprocessors::docx::parse_docx;
+    use blazegraph_io_core::preprocessors::md::ParseOptions;
+
+    println!("📄 Parsing DOCX: {}", args.input);
+
+    // The lib's `parse_docx` takes raw zip bytes (no pre-read in
+    // `detect_input_format`, mirroring the PDF arm).
+    let bytes =
+        std::fs::read(&args.input).map_err(|e| anyhow!("failed to read {}: {e}", args.input))?;
+
+    // `ParseOptions` is shared with the markdown channel; `accept_drift`
+    // is meaningless for DOCX (no embedded `graph_sha256` to verify),
+    // but we thread the build's compile-time strictness through for API
+    // symmetry (Block C.3 — no runtime toggle).
+    let opts = ParseOptions {
+        accept_drift: strict_accept_drift(),
+    };
+    let result = parse_docx(&bytes, opts).map_err(|e| anyhow!("\n❌ DOCX parse failed: {e}\n"))?;
+
     let graph = result.graph;
+    let mut provenance = result.provenance;
+
+    // The lib leaves `source_filename` empty — same convention as the
+    // markdown channel; the CLI owns the filename. Overwrite the
+    // provenance's `source_filename` with the input basename. Block A
+    // bonus: provenance is envelope-only now, so this CLI-side override
+    // can no longer perturb `graph_sha256`.
+    provenance.source_filename = Path::new(&args.input)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&args.input)
+        .to_string();
+
+    emit_parsed_graph(&args, graph, provenance)
+}
+
+/// Shared emit/output tail for the markdown and DOCX channels: log the
+/// node count, resolve the output path by `-f`, and write via
+/// `save_graph` (graph / sequential / flat / markdown / bgraph-md).
+///
+/// Factored out of `run_parse_markdown` so the DOCX path emits through
+/// the identical logic — every input parses to the channel-agnostic
+/// canonical graph first, and the emit format is chosen by `-f` alone
+/// (the B6 routing rule). The PDF channel keeps its own success-branch
+/// tail because it carries extra concerns (JVM fast-exit, stage dump).
+fn emit_parsed_graph(
+    args: &ParseArgs,
+    graph: DocumentGraph,
+    provenance: ParseProvenance,
+) -> Result<()> {
     println!("📊 Graph: {} nodes", graph.nodes.len());
 
-    // CR-59 (v2.1.0+): style emission is opt-in. Pipeline keeps
-    // `node.style_info` populated for library consumers; the bgraph.md
-    // serializer is gated via `EmitOptions::include_style_info`.
-    let output_path = resolve_output_path(&args);
-    save_graph(&graph, &output_path, &args.output_format, args.include_style_info)?;
+    // CR-86 / DT-12: style is a build-time value gate. The md/docx
+    // channels parse an existing artifact, so the reconstructed graph's
+    // `style_info` reflects whatever the input carried; the emitter
+    // serializes exactly that. No emit flag.
+    let output_path = resolve_output_path(args);
+    save_graph(&graph, &provenance, &output_path, &args.output_format)?;
     Ok(())
 }
 
@@ -603,6 +652,11 @@ enum InputFormat {
     /// generic markdown). The lib's `parse_markdown` dispatcher
     /// content-sniffs and routes; the CLI just passes the bytes.
     Markdown { content: String },
+    /// DOCX input (OOXML WordprocessingML). Like the PDF variant, the
+    /// bytes are read in the dispatched `run_parse_docx` (the lib's
+    /// `parse_docx` takes the raw zip bytes), so this variant carries
+    /// no payload — extension detection alone selects it.
+    Docx,
     /// Unknown extension and content does not look like markdown.
     Unknown,
 }
@@ -630,6 +684,11 @@ fn detect_input_format(path: &Path) -> Result<InputFormat> {
 
     match ext_lower.as_deref() {
         Some("pdf") => Ok(InputFormat::Pdf),
+        // Extension is decisive for DOCX — no content sniff. The bytes
+        // are read in `run_parse_docx` (the lib's `parse_docx` takes
+        // raw zip bytes), mirroring the PDF arm's "read in the channel"
+        // shape rather than the markdown arm's pre-read.
+        Some("docx") => Ok(InputFormat::Docx),
         Some("md") | Some("markdown") => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
@@ -774,7 +833,7 @@ fn show_help() {
 
     println!("\n📋 `parse` options:");
     println!("  --config <path>         Load custom config file (PDF only)");
-    println!("  --input <path>          Input file (PDF, .bgraph.md, or .md)");
+    println!("  --input <path>          Input file (PDF, .docx, .bgraph.md, or .md)");
     println!("  --output <path>         Output file path (auto-generated if not specified)");
     println!("  --output-format <fmt>   Output format: graph, sequential, flat, or markdown");
     println!("  --accept-drift          Accept hash-drifted bgraph.md input (returns derivative)");
@@ -797,6 +856,7 @@ fn show_help() {
 
     println!("\n📥 Input Formats (parse, auto-detected):");
     println!("  .pdf                    PDF channel (full pipeline)");
+    println!("  .docx                   Word/OOXML channel (S10 Track C)");
     println!("  .bgraph.md              bgraph.md round-trip artifact");
     println!("  .md / .markdown         Generic markdown (B6)");
 
@@ -804,21 +864,29 @@ fn show_help() {
     println!(
         "  --mode body-with-frontmatter  (default) Strip every fence; lift doc-level metadata to YAML frontmatter"
     );
-    println!("  --mode body-only        Remove all bgraph fences (Unstructured-equivalent body output)");
+    println!(
+        "  --mode body-only        Remove all bgraph fences (Unstructured-equivalent body output)"
+    );
     println!(
         "  --node-types <list>     Comma-sep types to strip entirely via structural rule (e.g. header,footer,margin)"
     );
 
     println!("\n📝 Usage Examples:");
     println!("  blazegraph parse -i document.pdf");
+    println!("  blazegraph parse -i document.docx");
+    println!("  blazegraph parse -i document.docx -f markdown -o document.md");
     println!("  blazegraph parse -i document.pdf -f bgraph-md -o document.bgraph.md");
     println!("  blazegraph parse -i document.md -f markdown -o roundtrip.md");
     println!("  blazegraph parse -i document.md -f graph -o document.json");
     println!("  blazegraph parse -i document.bgraph.md -o document.json");
     println!("  blazegraph parse -i document.bgraph.md --accept-drift -o derived.json");
-    println!("  blazegraph strip -i document.bgraph.md -o document.md   # default: body+frontmatter");
+    println!(
+        "  blazegraph strip -i document.bgraph.md -o document.md   # default: body+frontmatter"
+    );
     println!("  blazegraph strip -i document.bgraph.md --mode body-only -o document_body.md");
-    println!("  blazegraph strip -i document.bgraph.md --node-types header,footer,margin -o clean.md");
+    println!(
+        "  blazegraph strip -i document.bgraph.md --node-types header,footer,margin -o clean.md"
+    );
 
     #[cfg(feature = "jni-backend")]
     {
@@ -830,58 +898,11 @@ fn show_help() {
     }
 }
 
-fn save_stages(stages: &PipelineStages, output_dir: &str) -> Result<()> {
-    use std::fs;
-    fs::create_dir_all(output_dir)?;
-
-    // Stage 1a: Raw XHTML
-    let xhtml_path = format!("{}/stage1a_xhtml.html", output_dir);
-    fs::write(&xhtml_path, &stages.xhtml)?;
-    println!("  💾 {}", xhtml_path);
-
-    // Stage 1b: TextElements
-    let te_path = format!("{}/stage1b_text_elements.json", output_dir);
-    let te_json = serde_json::to_string_pretty(&stages.text_elements)?;
-    fs::write(&te_path, &te_json)?;
-    println!("  💾 {} ({} elements)", te_path, stages.text_elements.len());
-
-    // Stage 2: ParsedElements
-    let pe_path = format!("{}/stage2_parsed_elements.json", output_dir);
-    let pe_json = serde_json::to_string_pretty(&stages.parsed_elements)?;
-    fs::write(&pe_path, &pe_json)?;
-    println!(
-        "  💾 {} ({} elements)",
-        pe_path,
-        stages.parsed_elements.len()
-    );
-
-    // Stage 3: Final graph
-    let graph_path = format!("{}/stage3_graph.json", output_dir);
-    stages.graph.save_with_format(&graph_path, "graph")?;
-    println!("  💾 {} ({} nodes)", graph_path, stages.graph.nodes.len());
-
-    // Summary file
-    let summary = serde_json::json!({
-        "captured_at": chrono::Utc::now().to_rfc3339(),
-        "stage_counts": {
-            "xhtml_bytes": stages.xhtml.len(),
-            "text_elements": stages.text_elements.len(),
-            "parsed_elements": stages.parsed_elements.len(),
-            "graph_nodes": stages.graph.nodes.len(),
-        }
-    });
-    let summary_path = format!("{}/summary.json", output_dir);
-    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
-    println!("  💾 {}", summary_path);
-
-    Ok(())
-}
-
 fn save_graph(
     graph: &DocumentGraph,
+    provenance: &ParseProvenance,
     output_path: &str,
     format: &str,
-    include_style_info: bool,
 ) -> Result<()> {
     match format {
         // B6: `-f markdown` is the generic-markdown emitter.
@@ -913,36 +934,32 @@ fn save_graph(
             println!("💾 Markdown saved to: {}", output_path);
         }
         "bgraph-md" => {
-            // CR-59 (v2.1.0+): the bgraph.md emitter takes an explicit
-            // options struct; the CLI threads `--include-style-info`
-            // through. Other output formats don't carry style on the
-            // wire (graph.json carries it via `DocumentNode.style_info`
-            // directly; generic markdown has no per-element JSON).
-            let opts = blazegraph_io_core::graphs::serialization::markdown::EmitOptions {
-                include_style_info,
-            };
-            let md =
-                blazegraph_io_core::graphs::serialization::markdown::emit_markdown_with_options(
-                    graph, opts,
-                );
+            // CR-86 / DT-12: the emitter is dumb — it serializes exactly
+            // the graph's `style_info` (always present, `null` when the
+            // build stripped it). Whether style carries data is a
+            // build-time decision (`config.include_style_info`), already
+            // baked into the graph by the time we get here — no emit flag.
+            let md = blazegraph_io_core::graphs::serialization::markdown::emit_markdown(
+                graph, provenance,
+            );
             std::fs::write(output_path, md)?;
             println!("💾 bgraph.md saved to: {}", output_path);
         }
         "sequential" => {
-            graph.save_with_format(output_path, "sequential")?;
+            graph.save_with_format(output_path, "sequential", Some(provenance))?;
             println!("💾 Sequential format saved to: {}", output_path);
         }
         "flat" => {
-            graph.save_with_format(output_path, "flat")?;
+            graph.save_with_format(output_path, "flat", Some(provenance))?;
             println!("💾 Flat format saved to: {}", output_path);
         }
         "graph" => {
-            graph.save_with_format(output_path, "graph")?;
+            graph.save_with_format(output_path, "graph", Some(provenance))?;
             println!("💾 Graph saved to: {}", output_path);
         }
         other => {
             println!("⚠️  Unknown output format '{other}', using default graph format");
-            graph.save_with_format(output_path, "graph")?;
+            graph.save_with_format(output_path, "graph", Some(provenance))?;
             println!("💾 Graph saved to: {}", output_path);
         }
     }
@@ -1016,7 +1033,6 @@ mod tests {
                     children: Vec::new(),
                     internal_refs: Vec::new(),
                     external_refs: Vec::new(),
-                    confidence: 0,
                 },
             );
         }
@@ -1043,19 +1059,18 @@ mod tests {
                 children: child_ids,
                 internal_refs: Vec::new(),
                 external_refs: Vec::new(),
-                confidence: 0,
             },
         );
         DocumentGraph {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: blazegraph_io_core::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
-                bookmark_data: None,
-                parse_provenance: None,
+                outline_data: None,
+                flow_type: FlowType::default(),
                 topology: None,
             },
-            structural_profile: StructuralProfile::default(),
         }
     }
 

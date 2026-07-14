@@ -1,6 +1,17 @@
 [package]
 name = "blazegraph-io-core"
-version = "0.2.2"
+# CR-87 stopgap retro-bump 0.2.2 → 0.3.0: output materially changed since
+# 0.2.2 (Block A content-body identity + CR-84 node-ID re-key). The graph
+# cache key now tracks this (cache::versions::BLAZEGRAPH_VERSION =
+# crate::VERSION), so the bump invalidates stale entries. NOT a designed
+# release scheme — the coherent core+CLI version overhaul is deferred to
+# CR-85 (ledger item 6).
+# Block C stopgap 0.3.0 → 0.4.0: emitted output changed again — the
+# format-version reset `5.0.0 → 1.0.0` (md `schema` + json
+# `schema_version`) plus the new json envelope `graph_sha256` field. Same
+# cache-invalidation rationale; still NOT the designed release scheme
+# (CR-85 item 6).
+version = "0.4.0"
 edition = "2021"
 description = "Core library for semantic document graph processing — parse PDFs into structured, queryable graphs"
 license = "MIT OR Apache-2.0"
@@ -26,8 +37,14 @@ uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.0"
 
-# XML parsing for Tika XHTML
+# XML parsing for Tika XHTML and the OOXML (DOCX) body walk.
 quick-xml = "0.31"
+
+# OOXML container (DOCX is a ZIP). `default-features = false` + only the
+# `deflate` codec keeps the dependency surface minimal — we read a
+# well-understood subset (`word/document.xml`, `word/styles.xml`) and
+# never write archives. See the C1 DOCX-channel handoff.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Unicode NFKC normalization for compat-decomposable glyphs (ligatures,
 # non-breaking space, etc.) — folds chars that look identical on screen
@@ -59,8 +76,21 @@ gray_matter = { version = "0.3", default-features = false, features = ["yaml"] }
 jni = { version = "0.21", features = ["invocation"], optional = true }
 
 [features]
-# Default to JNI backend - works cross-platform
-default = ["jni-backend"]
+# Default to JNI backend - works cross-platform. `strict-identity` is
+# default-ON so the shipped library/binary is strict by construction
+# (Block C.3).
+default = ["jni-backend", "strict-identity"]
 
 # JNI backend - primary backend for cross-platform deployments
 jni-backend = ["dep:jni"]
+
+# Compile-time identity strictness (Block C.3 — always-on verification).
+# Default-enabled. This is the workspace-level strictness switch the
+# CLI's own `strict-identity` feature propagates; the load-bearing
+# behavior lives in the CLI (it forces `accept_drift = false` and rejects
+# a non-`Verified` verdict). The library **always** exposes
+# `ParseOptions.accept_drift` for programmatic/test callers regardless of
+# this feature — strictness is a property of the shipped *binary*, not a
+# removal of the library capability. Reserved here for a future
+# library-level hard-fail hook and for downstream (API) pinning.
+strict-identity = []

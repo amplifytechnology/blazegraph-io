@@ -14,6 +14,10 @@
 //! - [`markdown_generic`] — plain markdown emitter (the generic
 //!   markdown channel from B6; the inverse of
 //!   `preprocessors::md::generic_md::parse`).
+//! - [`version`] — the versioned-codec seam (arch-14 §7 live tier;
+//!   museum design-flow Block C): `FormatVersion` + `canonicalize_as`
+//!   / `emit_markdown_as` / `upcast`, making "which version's canonical
+//!   form" an explicit input instead of a hardcoded const.
 //!
 //! The existing `to_sequential_format` / `to_flat_format` impl block
 //! lives in this file (legacy output shapes pre-dating bgraph.md).
@@ -21,6 +25,7 @@
 pub mod canonical;
 pub mod markdown;
 pub mod markdown_generic;
+pub mod version;
 
 use crate::types::*;
 use anyhow::Result;
@@ -55,7 +60,8 @@ impl DocumentGraph {
         SequentialDocument {
             format: "sequential".to_string(),
             segments,
-            structural_profile: self.structural_profile.clone(),
+            // Derived aggregate, recomputed on demand (Block A).
+            structural_profile: self.compute_structural_profile(),
         }
     }
 
@@ -83,7 +89,16 @@ impl DocumentGraph {
         }
     }
 
-    pub fn save_with_format(&self, path: &str, format: &str) -> Result<()> {
+    /// Save in the named output format. `provenance` is threaded
+    /// explicitly (Block A / Amendment M) and only consumed by the
+    /// default graph.json arm, where it lands on the wrapper; the
+    /// sequential/flat shapes carry no parse-run identity.
+    pub fn save_with_format(
+        &self,
+        path: &str,
+        format: &str,
+        provenance: Option<&ParseProvenance>,
+    ) -> Result<()> {
         match format {
             "sequential" => {
                 let sequential = self.to_sequential_format();
@@ -96,7 +111,7 @@ impl DocumentGraph {
                 std::fs::write(path, json)?;
             }
             _ => {
-                self.save_to_json(path)?;
+                self.save_to_json(path, provenance)?;
             }
         }
         Ok(())

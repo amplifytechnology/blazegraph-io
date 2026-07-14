@@ -9,6 +9,7 @@ use super::node_type_clustering::NodeTypeClusteringRule;
 use super::section_detection::SectionAndHierarchyDetectionRule;
 use super::section_detection_v2::SectionDetectionV2Rule;
 use super::spatial_clustering::SpatialClusteringRule;
+use super::table_detection::TableDetectionRule;
 use super::validation::ValidationRule;
 
 // Disabled rules (will be rewritten):
@@ -304,6 +305,20 @@ impl RuleEngine {
                 );
                 let result = section_rule.apply(elements)?;
                 debug_pipeline_elements("SectionDetection", &result, &self.debug_config);
+                Ok(result)
+            }
+            "TableDetection" => {
+                println!("📊 DETECTING TABLES (CR-79 Tier 1 — RegionSignature tag)...");
+                let rule = TableDetectionRule::new(
+                    self,
+                    text_elements,
+                    config,
+                    document_analysis,
+                    font_size_analysis,
+                    style_data,
+                );
+                let result = rule.apply(elements)?;
+                debug_pipeline_elements("TableDetection", &result, &self.debug_config);
                 Ok(result)
             }
             "SectionDetectionV2" => {

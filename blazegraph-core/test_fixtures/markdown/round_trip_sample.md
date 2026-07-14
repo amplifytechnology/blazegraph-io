@@ -41,10 +41,10 @@ A nested list:
 
 ## Tables
 
-| name      | role     |
-|-----------|----------|
-| marcus    | designer |
-| claude    | builder  |
+| name   | role     |
+|--------|----------|
+| marcus | designer |
+| claude | builder  |
 
 ## Closing
 

@@ -144,6 +144,24 @@ pub struct RegionSignature {
     pub n_peaks_y: u32,
     /// Coefficient of variation of inter-Y-peak gaps. 0.0 when < 3 peaks.
     pub y_peak_cv: f32,
+
+    // ── CR-79 v2 table signals ─────────────────────────────────────
+    /// Signal A — grid-collapse. Count of v-cut (column-boundary)
+    /// x-positions the column-divider merge absorbed into this leaf
+    /// (`region.rs::collapse_to_leaf`). 0 when no grid was collapsed here.
+    #[serde(default)]
+    pub grid_vcuts: u32,
+    /// Signal B — number of column lines (clustered element left-edges)
+    /// that recur across >= 2 rows. A table has >= 2 such columns; a
+    /// reference entry has ~1 (the wrapped-text indent — its number/first
+    /// column only appears in the entry's first row).
+    #[serde(default)]
+    pub aligned_cols: u32,
+    /// Signal B — mean fill of the aligned columns (rows-present / n_rows).
+    /// Sparsity-robust: an empty cell lowers a column's fill, not its
+    /// existence.
+    #[serde(default)]
+    pub column_consistency: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +648,94 @@ fn count_x_peaks(
 }
 
 // ---------------------------------------------------------------------------
+// Column alignment across rows (per-region) — CR-79 v2 signal B
+// ---------------------------------------------------------------------------
+
+/// Tolerance (pt) for clustering element left-edges into column lines.
+const COLUMN_ALIGN_X_TOL: f32 = 6.0;
+
+/// Cross-row column alignment within a leaf. Returns
+/// `(aligned_cols, consistency)`:
+/// - `aligned_cols` = number of column lines (clustered element left-edges)
+///   that recur across ≥ 2 distinct rows. A table has ≥ 2; a reference
+///   entry has ~1 — its wrapped-text indent recurs, but the number/first
+///   column appears in only the entry's first row, so it doesn't count.
+/// - `consistency` = mean over those columns of `rows_present / n_rows`
+///   (how solidly the columns are filled). Sparsity-robust: an empty cell
+///   lowers a column's fill, it doesn't remove the column.
+fn compute_column_alignment(
+    spans: &[&ObservedSpan],
+    median_line_height: f32,
+    config: &PageStatsConfig,
+) -> (u32, f32) {
+    if spans.len() < 2 {
+        return (0, 0.0);
+    }
+    let row_tol = config
+        .visual_line_tolerance_floor
+        .max(config.visual_line_tolerance_fraction * median_line_height);
+
+    // Row id per span, by clustering y-centers (same rule as visual lines).
+    let mut by_y: Vec<usize> = (0..spans.len()).collect();
+    let yc = |i: usize| spans[i].bbox.y + spans[i].bbox.height / 2.0;
+    by_y.sort_by(|&a, &b| {
+        yc(a)
+            .partial_cmp(&yc(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut row_of = vec![0usize; spans.len()];
+    let mut row = 0usize;
+    let mut last_y = yc(by_y[0]);
+    for (k, &i) in by_y.iter().enumerate() {
+        if k > 0 && (yc(i) - last_y) > row_tol {
+            row += 1;
+        }
+        row_of[i] = row;
+        last_y = yc(i);
+    }
+    let n_rows = row + 1;
+    if n_rows < 2 {
+        return (0, 0.0);
+    }
+
+    // Cluster left-edges into column lines; track distinct rows hit by each.
+    let mut by_x: Vec<usize> = (0..spans.len()).collect();
+    by_x.sort_by(|&a, &b| {
+        spans[a]
+            .bbox
+            .x
+            .partial_cmp(&spans[b].bbox.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut col_rows: Vec<std::collections::HashSet<usize>> = Vec::new();
+    let mut cur: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut last_x = spans[by_x[0]].bbox.x;
+    for &i in &by_x {
+        let x = spans[i].bbox.x;
+        if x - last_x > COLUMN_ALIGN_X_TOL && !cur.is_empty() {
+            col_rows.push(std::mem::take(&mut cur));
+        }
+        cur.insert(row_of[i]);
+        last_x = x;
+    }
+    if !cur.is_empty() {
+        col_rows.push(cur);
+    }
+
+    // A column counts only if it spans ≥ 2 rows.
+    let presences: Vec<f32> = col_rows
+        .iter()
+        .filter(|rs| rs.len() >= 2)
+        .map(|rs| rs.len() as f32 / n_rows as f32)
+        .collect();
+    if presences.is_empty() {
+        return (0, 0.0);
+    }
+    let consistency = presences.iter().sum::<f32>() / presences.len() as f32;
+    (presences.len() as u32, consistency)
+}
+
+// ---------------------------------------------------------------------------
 // Visual lines (per-region)
 // ---------------------------------------------------------------------------
 
@@ -744,6 +850,10 @@ fn build_region_signature(
     let (n_peaks_y, y_peak_cv) =
         measure_y_peaks_in(leaf_spans.iter().map(|s| &s.bbox), bx.y0, bx.y1);
 
+    // CR-79 v2 signals.
+    let grid_vcuts = leaf.grid.as_ref().map(|g| g.n_vcuts).unwrap_or(0);
+    let (aligned_cols, column_consistency) = compute_column_alignment(&leaf_spans, mlh, config);
+
     RegionSignature {
         page_number,
         region_label: leaf.label.clone(),
@@ -765,6 +875,9 @@ fn build_region_signature(
         n_peaks,
         n_peaks_y,
         y_peak_cv,
+        grid_vcuts,
+        aligned_cols,
+        column_consistency,
     }
 }
 
@@ -934,6 +1047,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: (0..n_body as u32).collect(),
+            grid: None,
         };
         PageRegions {
             page_number,
@@ -1134,6 +1248,7 @@ mod tests {
                     children: vec![],
                     label: "1".to_string(),
                     element_indices: vec![0],
+                    grid: None,
                 },
                 Region {
                     r#box: bx_b,
@@ -1142,10 +1257,12 @@ mod tests {
                     children: vec![],
                     label: "2".to_string(),
                     element_indices: vec![1],
+                    grid: None,
                 },
             ],
             label: String::new(),
             element_indices: vec![],
+            grid: None,
         };
         let region = RegionStats {
             per_page: vec![PageRegions {
@@ -1237,6 +1354,7 @@ mod tests {
                     children: vec![],
                     label: "1".to_string(),
                     element_indices: vec![0],
+                    grid: None,
                 },
                 Region {
                     r#box: bx_b,
@@ -1245,10 +1363,12 @@ mod tests {
                     children: vec![],
                     label: "2".to_string(),
                     element_indices: vec![1],
+                    grid: None,
                 },
             ],
             label: String::new(),
             element_indices: vec![],
+            grid: None,
         };
         let region = RegionStats {
             per_page: vec![PageRegions {

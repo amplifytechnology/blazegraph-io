@@ -16,10 +16,19 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_fixtures/snapshots")
 }
 
-/// Load a stage3 fixture, augmenting it with synthetic
-/// `parse_provenance` so the emitter can run. Pre-0.6.0 fixtures lack
-/// the field; the additive serde-default keeps deserialization clean,
-/// but the emitter requires Some(_) at emit time.
+/// Synthetic provenance so the emitter can run against fixtures (Block
+/// A: provenance is an explicit emit argument, not graph state).
+fn fixture_provenance(name: &str) -> ParseProvenance {
+    ParseProvenance {
+        blazegraph_version: "0.6.0-test".to_string(),
+        source_format: "pdf".to_string(),
+        source_filename: format!("{name}.pdf"),
+        source_sha256: format!("test-source-sha-{name}"),
+        config_hash: "test-config-hash".to_string(),
+    }
+}
+
+/// Load a stage3 fixture.
 fn load_fixture_graph(name: &str) -> (DocumentGraph, Value) {
     let path = fixtures_dir().join(name).join("stage3_graph.json");
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| {
@@ -38,20 +47,10 @@ fn load_fixture_graph(name: &str) -> (DocumentGraph, Value) {
     for node in sorted.nodes {
         nodes.insert(node.id, node);
     }
-    let mut document_info = sorted.document_info;
-    // Synthesize a provenance triple from fixture-stable data so the
-    // emitter has something deterministic to embed.
-    document_info.parse_provenance = Some(ParseProvenance {
-        blazegraph_version: "0.6.0-test".to_string(),
-        source_format: "pdf".to_string(),
-        source_filename: format!("{name}.pdf"),
-        source_sha256: format!("test-source-sha-{name}"),
-        config_hash: "test-config-hash".to_string(),
-    });
+    let document_info = sorted.document_info;
     let graph = DocumentGraph {
         nodes,
         document_info,
-        structural_profile: sorted.structural_profile,
     };
     (graph, raw_value)
 }
@@ -59,7 +58,7 @@ fn load_fixture_graph(name: &str) -> (DocumentGraph, Value) {
 #[test]
 fn emit_matches_node_counts_for_shannon_fixture() {
     let (graph, raw) = load_fixture_graph("claude_shannon_paper");
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &fixture_provenance("claude_shannon_paper"));
 
     // First line should be the document-level fence open.
     let first_line = md.lines().next().expect("non-empty output");
@@ -124,5 +123,62 @@ fn emit_matches_node_counts_for_shannon_fixture() {
     assert!(
         !md.contains("```bgraph-document"),
         "Document root should be skipped, not emitted as a fence",
+    );
+}
+
+/// CR-87 drift-guard: the version axes must not silently diverge again.
+///
+/// (1) **One schema/format version, two serializations.** The bgraph.md
+/// doc-level `schema` field and the json wrapper's `schema_version` are
+/// two stampings of the ONE serialization-neutral schema/format version.
+/// They must emit the same value, and it must equal
+/// `BGRAPH_FORMAT_VERSION`. We emit from a real graph (not just compare
+/// consts) so a hardcoded literal slipped into *either* stamp site —
+/// `graph.rs::to_sorted_graph` (json) or `markdown.rs` (md) — fails
+/// loudly here rather than shipping a mismatch (the exact pre-CR-87 bug:
+/// json advertised `0.9.0` while md advertised `5.0.0`).
+///
+/// (2) **Cache tracks the build (Option A).** `BLAZEGRAPH_VERSION ==
+/// crate::VERSION`. If a hand-maintained cache-version literal is ever
+/// re-introduced (the drifted `0.1.1` this CR killed), this fails.
+#[test]
+fn cr87_version_axes_do_not_drift() {
+    use blazegraph_io_core::cache::versions::BLAZEGRAPH_VERSION;
+    use blazegraph_io_core::{BGRAPH_FORMAT_VERSION, VERSION};
+
+    let graph = DocumentGraph::new();
+    let prov = fixture_provenance("drift_guard");
+
+    // md side: `schema` on the doc-level JSON line (second line, under
+    // the ```bgraph fence open).
+    let md = emit_markdown(&graph, &prov);
+    let json_line = md
+        .lines()
+        .nth(1)
+        .expect("doc-level fence has a JSON line below the fence open");
+    let doc_block: Value =
+        serde_json::from_str(json_line).expect("doc-level JSON parses as an object");
+    let md_schema = doc_block["schema"].as_str().expect("`schema` is a string");
+
+    // json side: `schema_version` on the wrapper.
+    let sorted = graph.to_sorted_graph(Some(&prov));
+    let json_schema_version = sorted.schema_version.as_str();
+
+    assert_eq!(
+        md_schema, json_schema_version,
+        "CR-87 drift: md doc-level `schema` ({md_schema}) != json `schema_version` \
+         ({json_schema_version}) — the two serializations must advertise the ONE \
+         schema/format version",
+    );
+    assert_eq!(
+        md_schema, BGRAPH_FORMAT_VERSION,
+        "both serializations must stamp BGRAPH_FORMAT_VERSION ({BGRAPH_FORMAT_VERSION})",
+    );
+
+    assert_eq!(
+        BLAZEGRAPH_VERSION, VERSION,
+        "CR-87 drift: cache BLAZEGRAPH_VERSION ({BLAZEGRAPH_VERSION}) != crate::VERSION \
+         ({VERSION}) — the graph cache key must track the build so output changes \
+         invalidate stale entries",
     );
 }

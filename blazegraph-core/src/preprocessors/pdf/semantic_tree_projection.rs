@@ -116,9 +116,7 @@ pub fn project_to_semantic_tree(elements: Vec<ParsedPdfElement>) -> Vec<Semantic
 /// carried through clustering) into channel-agnostic `internal_refs[]` /
 /// `external_refs[]`. Each link contributes exactly one entry to one of the
 /// two output vecs, preserving source order.
-fn split_links_into_refs(
-    parsed: &ParsedPdfElement,
-) -> (Vec<InternalRef>, Vec<ExternalRef>) {
+fn split_links_into_refs(parsed: &ParsedPdfElement) -> (Vec<InternalRef>, Vec<ExternalRef>) {
     let source_page = parsed.placement.as_ref().map(|p| p.page_number);
     let mut internal_refs = Vec::new();
     let mut external_refs = Vec::new();
@@ -216,6 +214,9 @@ fn project_element_type(input: &ParsedElementType) -> SemanticElementType {
         ParsedElementType::Header => SemanticElementType::Header,
         ParsedElementType::Footer => SemanticElementType::Footer,
         ParsedElementType::Margin => SemanticElementType::Margin,
+        // CR-79 (Tier 1): a region leaf tagged Table by the TableDetectionRule
+        // projects to the channel-agnostic Table node type.
+        ParsedElementType::Table => SemanticElementType::Table,
     }
 }
 
@@ -477,8 +478,7 @@ mod tests {
         // delimiters must be adjacent to non-whitespace inside). Trim
         // before wrap; NodeContent::new will trim again downstream as a
         // no-op.
-        let input =
-            fixture_with_emphasis(ParsedElementType::Paragraph, "  lorem  ", false, true);
+        let input = fixture_with_emphasis(ParsedElementType::Paragraph, "  lorem  ", false, true);
         let projected = project_to_semantic_tree(vec![input]);
         assert_eq!(projected[0].text, "*lorem*");
     }

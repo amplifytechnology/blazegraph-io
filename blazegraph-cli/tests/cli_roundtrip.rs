@@ -41,19 +41,24 @@ fn unique_temp_dir(test_name: &str) -> PathBuf {
     dir
 }
 
-/// Build a small synthetic graph through the deterministic builder.
-/// Mirrors `markdown_roundtrip_tests::build_synthetic_graph` but kept
-/// self-contained so this file doesn't depend on the core crate's
-/// integration-test helpers.
-fn build_synthetic_graph() -> DocumentGraph {
-    let provenance = ParseProvenance {
+/// Synthetic provenance for emit calls (Block A: provenance is an
+/// explicit emit argument, not graph state).
+fn synthetic_provenance() -> ParseProvenance {
+    ParseProvenance {
         blazegraph_version: "0.6.0-cli-test".to_string(),
         source_format: "markdown".to_string(),
         source_filename: "cli-roundtrip.md".to_string(),
         source_sha256: "cli-test-source-sha".to_string(),
         config_hash: "cli-test-config-hash".to_string(),
-    };
-    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+    }
+}
+
+/// Build a small synthetic graph through the deterministic builder.
+/// Mirrors `markdown_roundtrip_tests::build_synthetic_graph` but kept
+/// self-contained so this file doesn't depend on the core crate's
+/// integration-test helpers.
+fn build_synthetic_graph() -> DocumentGraph {
+    let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
     let elements = vec![
         SemanticTreeElement {
             text: "Introduction".to_string(),
@@ -129,11 +134,10 @@ fn build_synthetic_graph() -> DocumentGraph {
         },
     ];
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(elements, &id_gen, provenance)
+        .build_graph_deterministic(elements, &id_gen)
         .expect("synthetic graph builds");
     graph.document_info.document_metadata.title = Some("CLI Round-Trip Sample".to_string());
-    graph.structural_profile.flow_type = FlowType::Free;
-    graph.compute_structural_profile();
+    graph.document_info.flow_type = FlowType::Free;
     graph.compute_breadcrumbs();
     graph
 }
@@ -158,7 +162,6 @@ fn canonicalize_saved_graph(path: &std::path::Path) -> String {
     let graph = DocumentGraph {
         nodes,
         document_info: sorted.document_info,
-        structural_profile: sorted.structural_profile,
     };
     canonical_json(&graph)
 }
@@ -183,7 +186,7 @@ fn cli_roundtrip_markdown_to_graph_canonical_bytes_match() {
     let roundtrip_json = dir.join("roundtrip.json");
 
     let original = build_synthetic_graph();
-    let md = emit_markdown(&original);
+    let md = emit_markdown(&original, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -232,7 +235,7 @@ fn cli_emit_markdown_output_format_writes_bgraph_md() {
     let output_md = dir.join("output.bgraph.md");
 
     let original = build_synthetic_graph();
-    let md = emit_markdown(&original);
+    let md = emit_markdown(&original, &synthetic_provenance());
     std::fs::write(&input_md, &md).expect("write input md");
 
     let output = Command::new(BIN)
@@ -263,14 +266,15 @@ fn cli_emit_markdown_output_format_writes_bgraph_md() {
 
 #[test]
 fn cli_strict_mode_errors_on_drift() {
-    // Strict-mode (the default — no --accept-drift) bgraph.md parse
-    // with a tampered graph_sha256 must produce a clean error
-    // pointing at `--accept-drift`, with exit code != 0.
+    // Block C.3: the shipped binary is strict by construction
+    // (compile-time `strict-identity`). A tampered graph_sha256 must
+    // produce a clean error with exit code != 0 and **no runtime
+    // override** offered (the `--accept-drift` toggle was removed).
     let dir = unique_temp_dir("strict-drift");
     let fixture_md = dir.join("tampered.bgraph.md");
 
     let original = build_synthetic_graph();
-    let mut md = emit_markdown(&original);
+    let mut md = emit_markdown(&original, &synthetic_provenance());
     // Tamper: corrupt the embedded graph_sha256 so parse hits
     // HashMismatch.
     md = md.replace(
@@ -302,21 +306,22 @@ fn cli_strict_mode_errors_on_drift() {
         "stderr should mention graph_sha256 mismatch; got:\n{stderr}"
     );
     assert!(
-        stderr.contains("--accept-drift"),
-        "stderr should point at --accept-drift; got:\n{stderr}"
+        stderr.contains("no runtime override"),
+        "stderr should state there is no runtime override (Block C.3 strict binary); got:\n{stderr}"
     );
 }
 
 #[test]
-fn cli_accept_drift_returns_derivative_with_warning() {
-    // --accept-drift lets the parse succeed on a hash mismatch and
-    // surfaces the derivative provenance on stderr.
-    let dir = unique_temp_dir("accept-drift");
+fn cli_rejects_removed_accept_drift_flag() {
+    // Block C.3: the `--accept-drift` runtime toggle was removed —
+    // identity strictness is a compile-time property now. Passing the
+    // flag must fail as an unknown argument (clap exits non-zero),
+    // proving there is no runtime way to relax strictness.
+    let dir = unique_temp_dir("removed-accept-drift");
     let fixture_md = dir.join("drifted.bgraph.md");
-    let output_json = dir.join("drifted.json");
 
     let original = build_synthetic_graph();
-    let mut md = emit_markdown(&original);
+    let mut md = emit_markdown(&original, &synthetic_provenance());
     md = md.replace(
         "\"graph_sha256\":\"",
         "\"graph_sha256\":\"00000000000000000000000000000000",
@@ -329,7 +334,7 @@ fn cli_accept_drift_returns_derivative_with_warning() {
             "-i",
             fixture_md.to_str().unwrap(),
             "-o",
-            output_json.to_str().unwrap(),
+            dir.join("drifted.json").to_str().unwrap(),
             "-f",
             "graph",
             "--accept-drift",
@@ -338,14 +343,13 @@ fn cli_accept_drift_returns_derivative_with_warning() {
         .expect("CLI binary spawns");
 
     assert!(
-        output.status.success(),
-        "CLI must succeed with --accept-drift even on hash mismatch; stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "CLI must reject the removed --accept-drift flag as an unknown argument"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("drifted bgraph.md"),
-        "stderr should warn about derivative provenance; got:\n{stderr}"
+        stderr.contains("--accept-drift") || stderr.contains("unexpected argument"),
+        "clap should report --accept-drift as unknown; got:\n{stderr}"
     );
 }
 
@@ -359,7 +363,7 @@ fn cli_strip_body_only_removes_all_bgraph_fences() {
     let stripped = dir.join("stripped.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -414,7 +418,7 @@ fn cli_strip_default_mode_emits_frontmatter() {
     let stripped = dir.join("stripped.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -445,14 +449,13 @@ fn cli_strip_default_mode_emits_frontmatter() {
         .map(|(yaml, _)| yaml)
         .expect("frontmatter delimited");
     let yaml_str = format!("{frontmatter}\n");
-    let parsed: serde_json::Value = serde_yaml::from_str(&yaml_str)
-        .expect("frontmatter must round-trip through serde_yaml");
+    let parsed: serde_json::Value =
+        serde_yaml::from_str(&yaml_str).expect("frontmatter must round-trip through serde_yaml");
     assert!(parsed.get("graph_sha256").is_some());
     // Body survives.
     assert!(out.contains("First paragraph body."));
     // Source file untouched (content sanity).
-    let src_after =
-        std::fs::read_to_string(&fixture_md).expect("read source after strip");
+    let src_after = std::fs::read_to_string(&fixture_md).expect("read source after strip");
     assert_eq!(md, src_after, "source file must not be modified by strip");
 }
 
@@ -466,7 +469,7 @@ fn cli_strip_node_types_filters_headers() {
     let stripped = dir.join("stripped.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -505,7 +508,7 @@ fn cli_strip_rejects_unknown_node_type() {
     let dir = unique_temp_dir("strip-bad-type");
     let fixture_md = dir.join("fixture.bgraph.md");
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -538,7 +541,7 @@ fn cli_strip_rejects_bgraph_as_node_type() {
     let dir = unique_temp_dir("strip-bgraph-type");
     let fixture_md = dir.join("fixture.bgraph.md");
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -551,10 +554,7 @@ fn cli_strip_rejects_bgraph_as_node_type() {
         ])
         .output()
         .expect("CLI binary spawns");
-    assert!(
-        !output.status.success(),
-        "`--node-types bgraph` must fail"
-    );
+    assert!(!output.status.success(), "`--node-types bgraph` must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("body-only"),
@@ -569,7 +569,7 @@ fn cli_strip_to_stdout_when_no_output_path() {
     let fixture_md = dir.join("fixture.bgraph.md");
 
     let graph = build_synthetic_graph();
-    let md = emit_markdown(&graph);
+    let md = emit_markdown(&graph, &synthetic_provenance());
     std::fs::write(&fixture_md, &md).expect("write fixture md");
 
     let output = Command::new(BIN)
@@ -660,6 +660,102 @@ fn cli_generic_markdown_roundtrip_via_dash_f_markdown() {
     assert_eq!(
         written, input,
         "byte-identical round-trip drift on generic markdown"
+    );
+}
+
+#[test]
+fn parse_docx_fixture_produces_graph() {
+    // C4: `.docx` input is dispatched to the DOCX channel
+    // (`parse_docx`) through the CLI surface. Parse the clean
+    // purpose-built `structured.docx` fixture and assert a non-empty
+    // graph with both Sections and Paragraphs (the fixture carries 6
+    // Sections incl. a Title, 6 Paragraphs incl. TOC lines, 1 Table,
+    // and 1 Blockquote — see the C1 orchestrator addendum).
+    //
+    // Fixture lives in the sibling core crate; resolve relative to this
+    // crate's manifest dir so the test is CWD-independent.
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../blazegraph-core/test_fixtures/docx/structured.docx");
+    assert!(
+        fixture.exists(),
+        "docx fixture missing at {}",
+        fixture.display()
+    );
+
+    let dir = unique_temp_dir("docx-fixture");
+    let out_json = dir.join("structured.json");
+
+    let output = Command::new(BIN)
+        .args([
+            "parse",
+            "-i",
+            fixture.to_str().unwrap(),
+            "-o",
+            out_json.to_str().unwrap(),
+            "-f",
+            "graph",
+        ])
+        .output()
+        .expect("CLI binary spawns");
+    assert!(
+        output.status.success(),
+        "CLI exited non-zero parsing docx fixture: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Read the CLI-saved graph back and assert structure.
+    let raw = std::fs::read_to_string(&out_json).expect("read docx graph json");
+    let sorted: SortedDocumentGraph =
+        serde_json::from_str(&raw).expect("CLI-saved docx JSON deserializes");
+
+    assert!(
+        !sorted.nodes.is_empty(),
+        "docx parse must produce a non-empty graph"
+    );
+
+    let section_count = sorted
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "Section")
+        .count();
+    let paragraph_count = sorted
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "Paragraph")
+        .count();
+    assert!(
+        section_count > 0,
+        "docx graph must contain Section nodes; node types present: {:?}",
+        sorted
+            .nodes
+            .iter()
+            .map(|n| n.node_type.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        paragraph_count > 0,
+        "docx graph must contain Paragraph nodes; node types present: {:?}",
+        sorted
+            .nodes
+            .iter()
+            .map(|n| n.node_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // The DOCX channel stamps `source_format = "docx"`, and the CLI
+    // overwrites the lib-empty `source_filename` with the input
+    // basename.
+    // Block A: provenance lives on the SortedDocumentGraph wrapper.
+    let prov = sorted
+        .parse_provenance
+        .as_ref()
+        .expect("docx graph.json carries parse provenance on the wrapper");
+    assert_eq!(prov.source_format, "docx", "source_format must be docx");
+    assert_eq!(
+        prov.source_filename, "structured.docx",
+        "CLI must overwrite source_filename with the input basename"
     );
 }
 

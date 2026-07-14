@@ -46,15 +46,20 @@ fn parse_generic(input: &str) -> DocumentGraph {
 /// Build a synthetic graph for the Amendment F bgraph.md round-trip
 /// tests. Mirrors `bgraph_md::tests::build_synthetic_graph` but lives
 /// here so the integration tests can compose the new variants.
-fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph {
-    let provenance = ParseProvenance {
+/// Synthetic provenance for the Amendment F emit calls (Block A:
+/// provenance is threaded explicitly, not graph state).
+fn synthetic_provenance() -> ParseProvenance {
+    ParseProvenance {
         blazegraph_version: "0.7.0-b6-test".to_string(),
         source_format: "markdown".to_string(),
         source_filename: "amendment-f.md".to_string(),
         source_sha256: "amendment-f-source-sha".to_string(),
         config_hash: "amendment-f-config-hash".to_string(),
-    };
-    let id_gen = NodeIdGenerator::new(&provenance.source_sha256, &provenance.config_hash);
+    }
+}
+
+fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph {
+    let id_gen = NodeIdGenerator::new(); // CR-83: content+breadcrumb-derived
     let elements: Vec<SemanticTreeElement> = nodes_in
         .iter()
         .map(|(node_type, text, depth, text_order)| {
@@ -85,10 +90,9 @@ fn build_synthetic_graph(nodes_in: Vec<(&str, &str, u32, u32)>) -> DocumentGraph
         })
         .collect();
     let mut graph = GraphBuilder::new()
-        .build_graph_deterministic(elements, &id_gen, provenance)
+        .build_graph_deterministic(elements, &id_gen)
         .expect("synthetic graph builds");
-    graph.structural_profile.flow_type = FlowType::Free;
-    graph.compute_structural_profile();
+    graph.document_info.flow_type = FlowType::Free;
     graph.compute_breadcrumbs();
     graph
 }
@@ -235,12 +239,24 @@ fn roundtrip_identity_nested_list() {
 
 #[test]
 fn roundtrip_identity_table() {
-    let input = "# Table\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+    // The generic-MD channel canonicalizes table layout (CR-80 #2): outer
+    // pipes, delimiter row, columns padded to max-content width. Byte-identity
+    // therefore holds for *canonical* input (idempotency) — non-canonical
+    // tables are normalized, which is the cross-channel convergence behavior.
+    let input = "# Table\n\n| a   | b   |\n|-----|-----|\n| 1   | 2   |\n";
     let g1 = parse_generic(input);
     let emitted = emit_generic_md(&g1);
     assert_eq!(emitted, input, "byte-identical round-trip drift");
     let g2 = parse_generic(&emitted);
     assert_semantically_equal(&g1, &g2);
+
+    // And a non-canonical table normalizes to the same canonical form.
+    let messy = parse_generic("# Table\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+    assert_eq!(
+        emit_generic_md(&messy),
+        input,
+        "non-canonical table normalizes"
+    );
 }
 
 #[test]
@@ -293,7 +309,7 @@ fn roundtrip_identity_real_content_sample() {
 #[test]
 fn bgraph_md_roundtrip_codeblock_identity() {
     let original = build_synthetic_graph(vec![("CodeBlock", "```rust\nfn x() {}\n```", 1, 0)]);
-    let md = emit_bgraph_md(&original);
+    let md = emit_bgraph_md(&original, &synthetic_provenance());
     let result = bgraph_md::parse(&md, ParseOptions::default()).expect("round-trip parses");
     assert!(matches!(result.identity, ParseIdentity::Verified));
     assert_eq!(canonical_json(&result.graph), canonical_json(&original));
@@ -302,7 +318,7 @@ fn bgraph_md_roundtrip_codeblock_identity() {
 #[test]
 fn bgraph_md_roundtrip_list_identity() {
     let original = build_synthetic_graph(vec![("List", "- one\n- two\n- three", 1, 0)]);
-    let md = emit_bgraph_md(&original);
+    let md = emit_bgraph_md(&original, &synthetic_provenance());
     let result = bgraph_md::parse(&md, ParseOptions::default()).expect("round-trip parses");
     assert!(matches!(result.identity, ParseIdentity::Verified));
     assert_eq!(canonical_json(&result.graph), canonical_json(&original));
@@ -311,7 +327,7 @@ fn bgraph_md_roundtrip_list_identity() {
 #[test]
 fn bgraph_md_roundtrip_blockquote_identity() {
     let original = build_synthetic_graph(vec![("Blockquote", "> quoted\n> still", 1, 0)]);
-    let md = emit_bgraph_md(&original);
+    let md = emit_bgraph_md(&original, &synthetic_provenance());
     let result = bgraph_md::parse(&md, ParseOptions::default()).expect("round-trip parses");
     assert!(matches!(result.identity, ParseIdentity::Verified));
     assert_eq!(canonical_json(&result.graph), canonical_json(&original));
@@ -320,7 +336,7 @@ fn bgraph_md_roundtrip_blockquote_identity() {
 #[test]
 fn bgraph_md_roundtrip_table_identity() {
     let original = build_synthetic_graph(vec![("Table", "| a | b |\n|---|---|\n| 1 | 2 |", 1, 0)]);
-    let md = emit_bgraph_md(&original);
+    let md = emit_bgraph_md(&original, &synthetic_provenance());
     let result = bgraph_md::parse(&md, ParseOptions::default()).expect("round-trip parses");
     assert!(matches!(result.identity, ParseIdentity::Verified));
     assert_eq!(canonical_json(&result.graph), canonical_json(&original));
@@ -337,7 +353,7 @@ fn bgraph_md_roundtrip_mixed_variants_identity() {
         ("Blockquote", "> q", 1, 4),
         ("Table", "| h |\n|---|\n| c |", 1, 5),
     ]);
-    let md = emit_bgraph_md(&original);
+    let md = emit_bgraph_md(&original, &synthetic_provenance());
     let result = bgraph_md::parse(&md, ParseOptions::default()).expect("round-trip parses");
     assert!(matches!(result.identity, ParseIdentity::Verified));
     assert_eq!(canonical_json(&result.graph), canonical_json(&original));
@@ -375,7 +391,7 @@ fn generic_md_then_bgraph_md_canonical_equal() {
         ("Blockquote", "> q", 1, 4),
         ("Table", "| h |\n|---|\n| c |", 1, 5),
     ]);
-    let bgraph_str = emit_bgraph_md(&original);
+    let bgraph_str = emit_bgraph_md(&original, &synthetic_provenance());
     let result = parse_markdown(&bgraph_str, ParseOptions::default())
         .expect("bgraph.md round-trips through the unified dispatcher");
     assert!(matches!(result.identity, ParseIdentity::Verified));
@@ -394,7 +410,7 @@ fn generic_md_to_bgraph_md_preserves_body_shape() {
     let fixture_path = fixtures_dir().join("round_trip_sample.md");
     let input = std::fs::read_to_string(&fixture_path).expect("fixture present");
     let g1 = parse_generic(&input);
-    let bgraph_str = emit_bgraph_md(&g1);
+    let bgraph_str = emit_bgraph_md(&g1, &synthetic_provenance());
     let result = parse_markdown(
         &bgraph_str,
         ParseOptions {
@@ -434,13 +450,9 @@ fn parse_markdown_routes_generic_to_generic_md_parser() {
     assert!(matches!(result.identity, ParseIdentity::Verified));
     // Generic-md sets provenance.source_format = "markdown" and
     // config_hash = "none" — distinct from a bgraph.md parse where
-    // provenance comes from the embedded doc-level block.
-    let prov = result
-        .graph
-        .document_info
-        .parse_provenance
-        .as_ref()
-        .expect("provenance present");
+    // provenance comes from the embedded doc-level block. Block A:
+    // provenance rides on the ParseResult, not the graph.
+    let prov = &result.provenance;
     assert_eq!(prov.source_format, "markdown");
     assert_eq!(prov.config_hash, "none");
 }

@@ -3,70 +3,59 @@
 //! Wire-format spec is the source of truth:
 //! `docs/P2/core/architecture/08-bgraph-md-format.md`. The emitted
 //! `schema` field is sourced from
-//! [`crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION`].
+//! [`crate::preprocessors::md::BGRAPH_FORMAT_VERSION`] — the same
+//! serialization-neutral const the json wrapper stamps into
+//! `schema_version` (CR-87).
 //!
 //! Public surface: [`emit_markdown`] (default options) and
 //! [`emit_markdown_with_options`] (opt-in flags). Everything else is
 //! private.
 
 use super::canonical;
-use crate::preprocessors::md::BGRAPH_MD_FORMAT_VERSION;
+use super::version::FormatVersion;
 use crate::types::*;
 use serde::Serialize;
 
-/// Emitter options. Defaults are the wire-format default — anything
-/// gated behind a flag is opt-in.
+/// Emitter options — the opt-in-flags slot of the versioned-codec seam
+/// (`emit_markdown_as`). **Currently empty.**
 ///
-/// CR-59 (v2.1.0+): `include_style_info` gates whether the per-element
-/// JSON carries the `style` field. CR-45 introduced the field but
-/// shipped with a default of "always emit"; CR-59 reverted the default
-/// to opt-in because the 178-line-per-Shannon bloat outweighed the
-/// debug-readability benefit. The in-memory pipeline still populates
-/// `DocumentNode.style_info` regardless — library consumers of the
-/// `Graph` data structure see style on every PDF-source body node. Only
-/// the bgraph.md serializer gates on the flag.
+/// CR-86 / DT-12 removed the former `include_style_info` flag: `style_info`
+/// is no longer *emit*-gated. It is an always-present, config-valued node
+/// field whose value is gated at **build** time
+/// (`ParsingConfig::include_style_info` → `processor::rules_and_graph`).
+/// The emitter is now dumb — it serializes exactly what the graph holds
+/// (`null` when the build stripped style, data when it kept it), so
+/// `graph_sha256` equals the wire in every mode. The struct is retained as
+/// the seam for future *serialization-time* flags; there are none today.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct EmitOptions {
-    /// When `true`, the per-element JSON carries the `style` field for
-    /// every node whose `style_info` is `Some(...)`. When `false`
-    /// (default), the `style` field is omitted unconditionally. Round-
-    /// trip identity holds in both modes; the parser tolerates either
-    /// shape on input.
-    pub include_style_info: bool,
-}
+pub struct EmitOptions {}
 
 /// Emit a `DocumentGraph` to bgraph.md format. Targets the current
-/// [`BGRAPH_MD_FORMAT_VERSION`]. Uses [`EmitOptions::default()`] — the
+/// [`BGRAPH_FORMAT_VERSION`]. Uses [`EmitOptions::default()`] — the
 /// wire-format default (no opt-in flags set).
 ///
-/// For PDF-source graphs whose emitted bgraph.md should carry `style`
-/// on every per-element fence, call [`emit_markdown_with_options`] with
-/// `EmitOptions { include_style_info: true }`.
+/// `provenance` is an explicit, compile-time-required argument (Block A
+/// / Amendment M): it feeds only the doc-level *envelope* block — never
+/// `graph_sha256`, which covers the content body alone. It used to live
+/// on `graph.document_info` (with a runtime `.expect()` here); threading
+/// it as a value keeps zero hidden state on `DocumentGraph`.
 ///
-/// # Panics
-///
-/// Panics if `graph.document_info.parse_provenance` is `None`. Build
-/// the graph via
-/// `GraphBuilder::build_graph_deterministic(elements, &id_gen, provenance)`
-/// — the legacy `build_graph` path (random UUIDv4 IDs, no provenance)
-/// is incompatible with round-trip identity and must not reach this
-/// emitter.
-pub fn emit_markdown(graph: &DocumentGraph) -> String {
-    emit_markdown_with_options(graph, EmitOptions::default())
+/// Whether the emitted bgraph.md carries `style` data on its per-element
+/// fences is decided at **build** time (`ParsingConfig::include_style_info`
+/// → the graph's `style_info` values), not here — this emitter always
+/// serializes exactly what the graph holds (`null` when stripped).
+pub fn emit_markdown(graph: &DocumentGraph, provenance: &ParseProvenance) -> String {
+    emit_markdown_with_options(graph, provenance, EmitOptions::default())
 }
 
 /// Emit a `DocumentGraph` to bgraph.md format with explicit options. See
-/// [`EmitOptions`] for the available flags.
-///
-/// # Panics
-///
-/// Same panic contract as [`emit_markdown`].
-pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> String {
-    let provenance = graph.document_info.parse_provenance.as_ref().expect(
-        "emit_markdown requires graph.document_info.parse_provenance; \
-         build the graph via GraphBuilder::build_graph_deterministic with provenance",
-    );
-
+/// [`EmitOptions`] (currently empty — the seam for future serialization-
+/// time flags) and [`emit_markdown`] for the provenance contract.
+pub fn emit_markdown_with_options(
+    graph: &DocumentGraph,
+    provenance: &ParseProvenance,
+    _opts: EmitOptions,
+) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(graph.nodes.len() + 6);
     parts.push(emit_document_level_block(graph, provenance));
     parts.push(String::new()); // blank line after doc-level block
@@ -74,13 +63,11 @@ pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> S
     // v2.1.0+ (CR-56 § I.3): the `bgraph-metadata` fence is REQUIRED on
     // every emitted bgraph.md, even when all fields are null. Placed
     // immediately after the doc-level `bgraph` block, before any
-    // `bgraph-bookmarks` fence.
-    parts.push(emit_metadata_block(
-        &graph.document_info.document_metadata,
-    ));
+    // `bgraph-outline` fence.
+    parts.push(emit_metadata_block(&graph.document_info.document_metadata));
     parts.push(String::new());
 
-    // Optional `bgraph-bookmarks` fence — emitted only when the source
+    // Optional `bgraph-outline` fence — emitted only when the source
     // graph carries an outline. Placed immediately after `bgraph-metadata`
     // so the doc-level identity block stays a single readable JSON line
     // even when the bookmark payload is large (rfc-quic ~14 KB).
@@ -99,7 +86,7 @@ pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> S
     nodes.sort_by_key(|n| n.text_order.expect("filtered above"));
 
     for node in nodes {
-        if let Some(chunk) = emit_node(node, opts) {
+        if let Some(chunk) = emit_node(node) {
             parts.push(chunk);
             parts.push(String::new()); // blank line between elements
         }
@@ -108,14 +95,14 @@ pub fn emit_markdown_with_options(graph: &DocumentGraph, opts: EmitOptions) -> S
     parts.join("\n")
 }
 
-/// Document-level bookmarks block. Tag: `bgraph-bookmarks`. Optional —
-/// returns `None` when `graph.document_info.bookmark_data` is `None`.
+/// Document-level bookmarks block. Tag: `bgraph-outline`. Optional —
+/// returns `None` when `graph.document_info.outline_data` is `None`.
 /// JSON shape mirrors `BookmarkData` exactly (one `serde_json::to_string`
 /// pass, compact, single line).
 fn emit_bookmarks_block(graph: &DocumentGraph) -> Option<String> {
-    let bookmarks = graph.document_info.bookmark_data.as_ref()?;
+    let bookmarks = graph.document_info.outline_data.as_ref()?;
     let json = serde_json::to_string(bookmarks).expect("BookmarkData is always serializable");
-    Some(format!("```bgraph-bookmarks\n{json}\n```"))
+    Some(format!("```bgraph-outline\n{json}\n```"))
 }
 
 /// Document-extracted metadata block. Tag: `bgraph-metadata`. Carries
@@ -125,8 +112,7 @@ fn emit_bookmarks_block(graph: &DocumentGraph) -> Option<String> {
 /// Always emitted by v2.1.0+ even when every field is null — the fence's
 /// presence is part of the wire-format contract (CR-56 § I.3).
 fn emit_metadata_block(metadata: &DocumentMetadata) -> String {
-    let json = serde_json::to_string(metadata)
-        .expect("DocumentMetadata is always serializable");
+    let json = serde_json::to_string(metadata).expect("DocumentMetadata is always serializable");
     format!("```bgraph-metadata\n{json}\n```")
 }
 
@@ -149,6 +135,9 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
     #[derive(Serialize)]
     struct DocLevelBlock<'a> {
         schema: &'static str,
+        // CR-82: artifact discriminator, emitted right after `schema`.
+        // Always present (default `document`); part of graph identity.
+        kind: &'a str,
         blazegraph_version: &'a str,
         source: DocLevelSource<'a>,
         flow_type: &'a FlowType,
@@ -166,14 +155,20 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
     }
 
     let block = DocLevelBlock {
-        schema: BGRAPH_MD_FORMAT_VERSION,
+        // Block C: stamp the version through the codec seam
+        // (`FormatVersion::CURRENT`), not a bare const — the write-side
+        // version and the read-side recognizer are now the same enum.
+        // For `V1_0` this is exactly `BGRAPH_FORMAT_VERSION` ("1.0.0"),
+        // so the emit is byte-identical.
+        schema: FormatVersion::CURRENT.schema_str(),
+        kind: &graph.document_info.kind,
         blazegraph_version: &provenance.blazegraph_version,
         source: DocLevelSource {
             format: &provenance.source_format,
             filename: &provenance.source_filename,
             sha256: &provenance.source_sha256,
         },
-        flow_type: &graph.structural_profile.flow_type,
+        flow_type: &graph.document_info.flow_type,
         topology: &graph.document_info.topology,
         config_hash: &provenance.config_hash,
         graph_sha256: canonical::graph_sha256(graph),
@@ -188,15 +183,15 @@ fn emit_document_level_block(graph: &DocumentGraph, provenance: &ParseProvenance
 ///
 /// Body placement follows spec convention C-3: content fences carry
 /// body on the line(s) preceding the fence; metadata fences (doc-level,
-/// `bgraph-metadata`, `bgraph-bookmarks`) have no body outside. Section
+/// `bgraph-metadata`, `bgraph-outline`) have no body outside. Section
 /// gains an `#`-prefix heading line; all other content variants emit
 /// body verbatim.
 ///
 /// Fence-tag derivation goes through [`node_type_to_fence_tag`] so
 /// multi-word variants get kebab-case per CR-56 § I.5 / F-11
 /// (`CodeBlock` → `bgraph-code-block`, `Blockquote` → `bgraph-block-quote`).
-fn emit_node(node: &DocumentNode, opts: EmitOptions) -> Option<String> {
-    let meta = node_metadata_json(node, opts);
+fn emit_node(node: &DocumentNode) -> Option<String> {
+    let meta = node_metadata_json(node);
     let text = &node.content.text;
     if node.node_type == "Document" {
         return None; // synthetic root; not a content node
@@ -248,8 +243,8 @@ fn node_type_to_fence_tag(node_type: &str) -> &'static str {
 /// `content.text` (lives in markdown body or inside fence) and
 /// `parent`/`children` (derivable from heading structure on reverse
 /// parse).
-fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
-    use crate::types::{is_zero_u8, ExternalRef, InternalRef};
+fn node_metadata_json(node: &DocumentNode) -> String {
+    use crate::types::{ExternalRef, InternalRef};
     #[derive(Serialize)]
     struct NodeMetadata<'a> {
         id: &'a NodeId,
@@ -265,32 +260,26 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         /// CR-62 (v2.3.0+): per-element refs to external locations.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         external_refs: &'a Vec<ExternalRef>,
-        /// CR-78 (v2.4.0+): per-element detection confidence (Section nodes).
-        /// Omitted when `0` so non-Section nodes and pre-CR-78 fixtures stay
-        /// byte-identical — mirrors the refs' "skip when empty" rule and keeps
-        /// the canonical hash unchanged for them.
-        #[serde(skip_serializing_if = "is_zero_u8")]
-        confidence: u8,
+        // v4.0.0 (Block A / Amendment M): the CR-78 `confidence` field is
+        // gone from the wire — schema-ahead placeholders in the identity
+        // form are retired (an empty→populated flip silently churned
+        // `graph_sha256`). The parser tolerates it on legacy inputs
+        // (unknown fields are dropped).
         /// CR-45: verbatim Tika style projection (foreground / background
         /// color, font_family, font_size, is_bold, is_italic, font_class).
-        /// CR-59 (v2.1.0+): gated on `EmitOptions::include_style_info`. When
-        /// the flag is `false` (default), this slot is always `None` so
-        /// `skip_serializing_if` omits the field entirely — regardless of
-        /// whether `node.style_info` is populated. The in-memory carrier
-        /// (`DocumentNode.style_info`) stays populated for library
-        /// consumers; only the wire-format emission is gated. Shape is
+        /// CR-86 / DT-12: **always emitted** — `null` when
+        /// `node.style_info` is `None` (the style-off edition), data when
+        /// populated. No `skip_serializing_if`: the key is always on the
+        /// wire, mirroring `DocumentNode.style_info`, so `graph_sha256`
+        /// (over the graph) equals the emitted bytes by construction. The
+        /// value is gated at build time
+        /// (`ParsingConfig::include_style_info`), never here. Shape is
         /// verbatim Tika projection — see DT-03.
-        #[serde(skip_serializing_if = "Option::is_none")]
         style: Option<&'a StyleMetadata>,
     }
-    // CR-59: style emission is opt-in. When the flag is off we pass
-    // `None` regardless of `node.style_info`; `skip_serializing_if`
-    // then drops the field.
-    let style = if opts.include_style_info {
-        node.style_info.as_ref()
-    } else {
-        None
-    };
+    // CR-86: the emitter is dumb — it serializes exactly the graph's
+    // `style_info` (always present as a key; `null` when the build gate
+    // stripped it, data when it kept it).
     let meta = NodeMetadata {
         id: &node.id,
         node_type: &node.node_type,
@@ -299,8 +288,7 @@ fn node_metadata_json(node: &DocumentNode, opts: EmitOptions) -> String {
         token_count: node.token_count,
         internal_refs: &node.internal_refs,
         external_refs: &node.external_refs,
-        confidence: node.confidence,
-        style,
+        style: node.style_info.as_ref(),
     };
     serde_json::to_string(&meta).expect("DocumentNode subset is always serializable")
 }
@@ -327,6 +315,24 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    /// Synthetic provenance for emit tests. Threaded explicitly into
+    /// every emit call (Block A: provenance is an argument, not graph
+    /// state).
+    fn test_provenance() -> ParseProvenance {
+        ParseProvenance {
+            blazegraph_version: "0.6.0".to_string(),
+            source_format: "markdown".to_string(),
+            source_filename: "synthetic.md".to_string(),
+            source_sha256: "deadbeef".to_string(),
+            config_hash: "cafef00d".to_string(),
+        }
+    }
+
+    /// Emit with the shared synthetic provenance + default options.
+    fn emit(graph: &DocumentGraph) -> String {
+        emit_markdown(graph, &test_provenance())
+    }
 
     /// Build a minimal graph with a Document root + the supplied body
     /// nodes. `nodes_in` is `(node_type, text, depth, text_order)`.
@@ -364,7 +370,6 @@ mod tests {
                     children: Vec::new(),
                     internal_refs: vec![],
                     external_refs: vec![],
-                    confidence: 0,
                 },
             );
         }
@@ -392,7 +397,6 @@ mod tests {
                 children: child_ids,
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
 
@@ -400,21 +404,15 @@ mod tests {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata {
                     title: Some("Synthetic Test Doc".to_string()),
                     ..DocumentMetadata::default()
                 },
-                bookmark_data: None,
-                parse_provenance: Some(ParseProvenance {
-                    blazegraph_version: "0.6.0".to_string(),
-                    source_format: "markdown".to_string(),
-                    source_filename: "synthetic.md".to_string(),
-                    source_sha256: "deadbeef".to_string(),
-                    config_hash: "cafef00d".to_string(),
-                }),
+                outline_data: None,
+                flow_type: FlowType::default(),
                 topology: None,
             },
-            structural_profile: StructuralProfile::default(),
         }
     }
 
@@ -424,7 +422,7 @@ mod tests {
         // fence but no `bgraph-document` (or any other tag matching the
         // root node).
         let graph = build_graph(vec![("Section", "Intro", 1, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(md.contains("```bgraph-section"), "missing section fence");
         assert!(
             !md.contains("```bgraph-document"),
@@ -440,7 +438,7 @@ mod tests {
             ("Section", "Intro", 1, 0),
             ("Paragraph", "Hello world.", 1, 1),
         ]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         // Section: heading line precedes the fence on the immediately
         // adjacent line.
         assert!(
@@ -455,33 +453,19 @@ mod tests {
     }
 
     #[test]
-    fn cr78_confidence_emitted_for_section_omitted_when_zero() {
-        // CR-78 (v2.4.0): the per-element fence carries `confidence` for a
-        // Section with a non-zero score; the Paragraph (confidence 0) omits
-        // the field entirely (skip_serializing_if), so non-Section nodes stay
-        // byte-identical to pre-CR-78 output.
-        let mut graph = build_graph(vec![
+    fn confidence_never_appears_on_the_wire_v4() {
+        // v4.0.0 (Block A / Amendment M): the CR-78 `confidence` field is
+        // gone from DocumentNode and the per-element fence — schema-ahead
+        // placeholders in the identity form are retired. No emitted fence
+        // may carry the key.
+        let graph = build_graph(vec![
             ("Section", "Intro", 1, 0),
             ("Paragraph", "Hello world.", 1, 1),
         ]);
-        let section_id = graph
-            .nodes
-            .values()
-            .find(|n| n.node_type == "Section")
-            .expect("graph has a Section")
-            .id;
-        graph.nodes.get_mut(&section_id).unwrap().confidence = 5;
-
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
-            md.contains("\"confidence\":5"),
-            "section fence should carry confidence; got:\n{md}",
-        );
-        // Exactly one `confidence` key — the Paragraph (0) must omit it.
-        assert_eq!(
-            md.matches("\"confidence\"").count(),
-            1,
-            "only the non-zero Section should emit confidence; got:\n{md}",
+            !md.contains("\"confidence\""),
+            "v4.0.0 wire must not carry a confidence key; got:\n{md}",
         );
     }
 
@@ -494,7 +478,7 @@ mod tests {
             ("Footer", "Running footer text", 1, 1),
             ("Margin", "Margin note text", 1, 2),
         ]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
             md.contains("Running header text\n```bgraph-header\n"),
             "header body should precede the fence; got:\n{md}",
@@ -514,7 +498,7 @@ mod tests {
         // Section at depth 7 should render with "######" but the JSON
         // metadata must preserve "depth":7 exactly.
         let graph = build_graph(vec![("Section", "Deeply Nested", 7, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
             md.contains("###### Deeply Nested\n"),
             "depth 7 section should still emit ######; got:\n{md}",
@@ -535,7 +519,7 @@ mod tests {
         // `bgraph` block into the `bgraph-metadata` block. The `bgraph`
         // block now carries identity-only fields.
         let graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
 
         // First line is the bgraph fence open; second line is the JSON.
         let first_line_end = md.find('\n').expect("multi-line output");
@@ -590,7 +574,7 @@ mod tests {
         let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
         graph.document_info.document_metadata.title = Some("My Doc".to_string());
         graph.document_info.document_metadata.author = Some("Alice".to_string());
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
 
         // Doc-level close → blank line → bgraph-metadata open.
         assert!(
@@ -617,7 +601,7 @@ mod tests {
         // it so we test the truly-empty case too.
         let mut graph = graph;
         graph.document_info.document_metadata = DocumentMetadata::default();
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
             md.contains("```bgraph-metadata\n"),
             "bgraph-metadata fence MUST be present under v2.1.0 even when all fields are null; \
@@ -637,7 +621,7 @@ mod tests {
             ("Section", "Intro", 1, 0),
             ("Paragraph", "Hello.", 1, 1),
         ]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let body_start = md
             .find("# Intro\n```bgraph-section\n")
             .expect("section heading should be present");
@@ -646,15 +630,17 @@ mod tests {
         let section_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"test:0");
         let paragraph_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"test:1");
 
+        // CR-86 / DT-12: `style` is always emitted — `null` here (these
+        // synthetic nodes carry no style_info).
         let expected = format!(
             "# Intro\n\
              ```bgraph-section\n\
-             {{\"id\":\"{section_id}\",\"node_type\":\"Section\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":1}}\n\
+             {{\"id\":\"{section_id}\",\"node_type\":\"Section\",\"location\":{{\"semantic\":{{\"path\":\"1\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":0,\"token_count\":1,\"style\":null}}\n\
              ```\n\
              \n\
              Hello.\n\
              ```bgraph-paragraph\n\
-             {{\"id\":\"{paragraph_id}\",\"node_type\":\"Paragraph\",\"location\":{{\"semantic\":{{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":1,\"token_count\":1}}\n\
+             {{\"id\":\"{paragraph_id}\",\"node_type\":\"Paragraph\",\"location\":{{\"semantic\":{{\"path\":\"2\",\"depth\":1,\"breadcrumbs\":[]}},\"physical\":null}},\"text_order\":1,\"token_count\":1,\"style\":null}}\n\
              ```\n\
              ",
         );
@@ -671,7 +657,7 @@ mod tests {
             ("Paragraph", "Hello world.", 1, 1),
             ("Header", "Running header", 1, 2),
         ]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         // build_graph sets token_count = 1 for every body node, so every
         // per-element block should contain `"token_count":1`.
         let occurrences = md.matches("\"token_count\":1").count();
@@ -682,20 +668,20 @@ mod tests {
     }
 
     #[test]
-    fn bookmarks_fence_is_omitted_when_bookmark_data_is_none() {
+    fn bookmarks_fence_is_omitted_when_outline_data_is_none() {
         let graph = build_graph(vec![("Section", "Intro", 1, 0)]);
-        // build_graph sets bookmark_data: None.
-        let md = emit_markdown(&graph);
+        // build_graph sets outline_data: None.
+        let md = emit(&graph);
         assert!(
-            !md.contains("```bgraph-bookmarks"),
-            "bgraph-bookmarks fence should be omitted when bookmark_data is None; got:\n{md}",
+            !md.contains("```bgraph-outline"),
+            "bgraph-outline fence should be omitted when outline_data is None; got:\n{md}",
         );
     }
 
     #[test]
-    fn bookmarks_fence_is_emitted_when_bookmark_data_is_present() {
+    fn bookmarks_fence_is_emitted_when_outline_data_is_present() {
         let mut graph = build_graph(vec![("Section", "Intro", 1, 0)]);
-        graph.document_info.bookmark_data = Some(BookmarkData {
+        graph.document_info.outline_data = Some(BookmarkData {
             sections: vec![
                 BookmarkSection {
                     title: "Introduction".to_string(),
@@ -709,19 +695,19 @@ mod tests {
                 },
             ],
         });
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
 
         // Fence appears.
         assert!(
-            md.contains("```bgraph-bookmarks\n"),
-            "bgraph-bookmarks fence should be present when bookmark_data is Some; got:\n{md}",
+            md.contains("```bgraph-outline\n"),
+            "bgraph-outline fence should be present when outline_data is Some; got:\n{md}",
         );
 
         // Fence content parses as JSON with the expected shape.
         let start = md
-            .find("```bgraph-bookmarks\n")
+            .find("```bgraph-outline\n")
             .expect("fence open present")
-            + "```bgraph-bookmarks\n".len();
+            + "```bgraph-outline\n".len();
         let end = md[start..].find("\n```").expect("fence close present") + start;
         let json_line = &md[start..end];
         let parsed: BookmarkData =
@@ -731,11 +717,9 @@ mod tests {
 
         // Placement (v2.1.0+): bookmarks fence sits between the
         // bgraph-metadata block and the first per-element fence.
-        let metadata_close = md
-            .find("```\n\n```bgraph-bookmarks")
-            .expect(
-                "bookmarks fence should follow the metadata block, separated by exactly one blank line",
-            );
+        let metadata_close = md.find("```\n\n```bgraph-outline").expect(
+            "bookmarks fence should follow the metadata block, separated by exactly one blank line",
+        );
         let first_section = md.find("```bgraph-section").expect("section fence");
         assert!(
             metadata_close < first_section,
@@ -743,13 +727,10 @@ mod tests {
         );
     }
 
-    #[test]
-    #[should_panic(expected = "parse_provenance")]
-    fn emit_markdown_panics_without_provenance() {
-        let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
-        graph.document_info.parse_provenance = None;
-        let _ = emit_markdown(&graph);
-    }
+    // Block A / Amendment M: `emit_markdown_panics_without_provenance`
+    // is gone — provenance is a compile-time-required argument now, so
+    // the emitter cannot be reached without it. The type system replaced
+    // the runtime panic contract.
 
     /// Diagnostic: prints sample emitter output for human review.
     /// Always passes; only useful with `--nocapture`. Kept as a test
@@ -768,7 +749,7 @@ mod tests {
             ("Footer", "Confidential", 2, 3),
         ]);
         eprintln!("--- BEGIN emit_markdown sample ---");
-        eprintln!("{}", emit_markdown(&graph));
+        eprintln!("{}", emit(&graph));
         eprintln!("--- END emit_markdown sample ---");
     }
 
@@ -778,7 +759,7 @@ mod tests {
     fn emit_codeblock_node_body_outside_fence_metadata_inside() {
         let raw = "```rust\nfn main() {}\n```";
         let graph = build_graph(vec![("CodeBlock", raw, 2, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         // F-11 (v2.1.0+): the CodeBlock variant uses kebab-case
         // `bgraph-code-block`.
         assert!(
@@ -796,7 +777,7 @@ mod tests {
     fn emit_list_node_body_outside() {
         let raw = "- one\n- two";
         let graph = build_graph(vec![("List", raw, 2, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
             md.contains("- one\n- two\n```bgraph-list\n"),
             "List body should be outside the bgraph fence; got:\n{md}"
@@ -807,7 +788,7 @@ mod tests {
     fn emit_blockquote_node_body_outside() {
         let raw = "> quoted\n> still";
         let graph = build_graph(vec![("Blockquote", raw, 2, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         // F-11 (v2.1.0+): the Blockquote variant uses kebab-case
         // `bgraph-block-quote`.
         assert!(
@@ -820,7 +801,7 @@ mod tests {
     fn emit_table_node_body_outside() {
         let raw = "| a | b |\n|---|---|\n| 1 | 2 |";
         let graph = build_graph(vec![("Table", raw, 2, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
             md.contains("| a | b |\n|---|---|\n| 1 | 2 |\n```bgraph-table\n"),
             "Table body should be outside the fence; got:\n{md}"
@@ -834,7 +815,7 @@ mod tests {
         // emit_node must panic — the spec/schema/emitter sync is
         // load-bearing.
         let graph = build_graph(vec![("UnknownVariant", "x", 1, 0)]);
-        let _ = emit_markdown(&graph);
+        let _ = emit(&graph);
     }
 
     // ========================================================================
@@ -859,7 +840,7 @@ mod tests {
         // C-1: The first fence in every bgraph.md file is the literal
         // ```bgraph (no -<suffix>).
         let graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let first_line = md.lines().next().expect("canonical emit cannot be empty");
         assert_eq!(
             first_line, "```bgraph",
@@ -886,7 +867,7 @@ mod tests {
         ];
         for (variant, tag) in &variants {
             let graph = build_graph(vec![(variant, "text", 1, 0)]);
-            let md = emit_markdown(&graph);
+            let md = emit(&graph);
             let expected_tag = format!("```bgraph-{tag}");
             assert!(
                 md.contains(&expected_tag),
@@ -913,7 +894,7 @@ mod tests {
         ];
         for (variant, text_marker, tag) in &cases {
             let graph = build_graph(vec![(variant, text_marker, 1, 0)]);
-            let md = emit_markdown(&graph);
+            let md = emit(&graph);
             let tag_line = format!("```bgraph-{tag}");
             let lines: Vec<&str> = md.lines().collect();
             let fence_idx = lines
@@ -931,24 +912,24 @@ mod tests {
 
     #[test]
     fn convention_c3_bookmarks_metadata_fence_has_no_body_outside() {
-        // C-3 (metadata side): bgraph-bookmarks is a metadata fence;
+        // C-3 (metadata side): bgraph-outline is a metadata fence;
         // no body content precedes it. The line immediately before the
         // fence-open is the blank-line separator from the doc-level
         // block.
         let mut graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
-        graph.document_info.bookmark_data = Some(BookmarkData {
+        graph.document_info.outline_data = Some(BookmarkData {
             sections: vec![BookmarkSection {
                 title: "Intro".to_string(),
                 order: 0,
                 level: 1,
             }],
         });
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let lines: Vec<&str> = md.lines().collect();
         let bookmarks_idx = lines
             .iter()
-            .position(|l| *l == "```bgraph-bookmarks")
-            .expect("bookmarks fence must be emitted when bookmark_data is Some");
+            .position(|l| *l == "```bgraph-outline")
+            .expect("bookmarks fence must be emitted when outline_data is Some");
         assert!(
             bookmarks_idx > 0,
             "bookmarks fence cannot be the first line"
@@ -972,7 +953,7 @@ mod tests {
             ("Paragraph", "first-body", 1, 0),
             ("Paragraph", "second-body", 1, 1),
         ]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let first_pos = md.find("first-body").expect("first-body must appear");
         let second_pos = md.find("second-body").expect("second-body must appear");
         let third_pos = md.find("third-body").expect("third-body must appear");
@@ -1004,7 +985,7 @@ mod tests {
             ("Paragraph", "First para.", 1, 1),
             ("Paragraph", "Second para.", 1, 2),
         ]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         let lines: Vec<&str> = md.lines().collect();
         for i in 0..lines.len() {
             if lines[i] == "```" {
@@ -1032,7 +1013,7 @@ mod tests {
             ("Section", "Intro", 1, 0),
             ("Paragraph", "Body text.", 1, 1),
         ]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         for (i, line) in md.lines().enumerate() {
             assert_eq!(
                 line,
@@ -1053,7 +1034,7 @@ mod tests {
         // Default-built graph: no topology.
         // The skip_serializing_if rule must keep it out of the JSON.
         let graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
             !md.contains("\"topology\""),
             "topology must be skipped when None; got:\n{md}"
@@ -1064,7 +1045,7 @@ mod tests {
     fn doc_level_block_emits_topology_when_set() {
         let mut graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
         graph.document_info.topology = Some("stream".to_string());
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         // Extract the first JSON line (doc-level block).
         let first_line_end = md.find('\n').expect("multi-line output");
         let after_first = &md[first_line_end + 1..];
@@ -1091,14 +1072,15 @@ mod tests {
     // variant + struct remain in `types.rs` as future-design sentinels.
 
     // ===================================================================
-    // CR-59 (v2.1.0+) emit tests: style emit-gating.
+    // CR-86 / DT-12 emit tests: `style` is always-emitted, value-gated.
+    // (Supersedes the CR-59 emit-gate tests — style is no longer gated at
+    // serialization; the emitter serializes exactly what the graph holds.)
     // ===================================================================
 
     #[test]
-    fn style_omitted_by_default_even_when_node_carries_it() {
-        // Build a graph and populate `style_info` on its single
-        // Paragraph node. With default `EmitOptions` the emitter must
-        // omit `style` from the per-element JSON regardless.
+    fn style_emitted_as_data_when_node_carries_it() {
+        // When a node's `style_info` is populated (the style-on edition —
+        // the build kept it), the per-element JSON carries `style` as data.
         let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
         let para_id = graph
             .nodes
@@ -1115,64 +1097,32 @@ mod tests {
             foreground_color: Some("#000000".to_string()),
             background_color: None,
         });
-        let md = emit_markdown(&graph);
-        assert!(
-            !md.contains("\"style\""),
-            "default EmitOptions must omit `style` even when node.style_info is Some; got:\n{md}"
-        );
-    }
-
-    #[test]
-    fn style_emitted_when_include_flag_set_and_node_carries_it() {
-        let mut graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
-        let para_id = graph
-            .nodes
-            .values()
-            .find(|n| n.node_type == "Paragraph")
-            .map(|n| n.id)
-            .expect("Paragraph node present");
-        graph.nodes.get_mut(&para_id).unwrap().style_info = Some(StyleMetadata {
-            font_class: "f1".to_string(),
-            font_size: Some(10.0),
-            is_bold: false,
-            is_italic: false,
-            font_family: Some("Helvetica".to_string()),
-            foreground_color: Some("#000000".to_string()),
-            background_color: None,
-        });
-        let md = emit_markdown_with_options(
-            &graph,
-            EmitOptions {
-                include_style_info: true,
-            },
-        );
+        let md = emit(&graph);
         assert!(
             md.contains("\"style\":{"),
-            "include_style_info=true must emit `style` when node.style_info is Some; got:\n{md}"
+            "populated style_info must serialize `style` as data; got:\n{md}"
         );
     }
 
     #[test]
-    fn style_omitted_when_include_flag_set_but_node_lacks_it() {
-        // skip_serializing_if=Option::is_none still applies: when the
-        // node has no style, the field is absent even with the flag on.
+    fn style_emitted_as_null_when_node_lacks_it() {
+        // When a node's `style_info` is `None` (the default null-style
+        // edition — the build stripped it), the key is STILL emitted, as
+        // `null`. This is the CR-86 always-present contract: the field is
+        // never omitted, so `graph_sha256` (which now covers `null`) equals
+        // the wire and a default-path re-parse self-verifies.
         let graph = build_graph(vec![("Paragraph", "Body.", 1, 0)]);
-        let md = emit_markdown_with_options(
-            &graph,
-            EmitOptions {
-                include_style_info: true,
-            },
-        );
+        let md = emit(&graph);
         assert!(
-            !md.contains("\"style\""),
-            "with-flag emit must still omit `style` when node.style_info is None; got:\n{md}"
+            md.contains("\"style\":null"),
+            "None style_info must serialize `style` as null (always-present); got:\n{md}"
         );
     }
 
     #[test]
     fn whitespace_contract_ends_with_single_newline() {
         let graph = build_graph(vec![("Paragraph", "body", 1, 0)]);
-        let md = emit_markdown(&graph);
+        let md = emit(&graph);
         assert!(
             md.ends_with('\n'),
             "whitespace contract: canonical emit must end with newline"

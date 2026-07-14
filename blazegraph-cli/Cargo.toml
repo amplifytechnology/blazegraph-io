@@ -39,9 +39,19 @@ zip = "0.6"             # Windows zip extraction
 dirs = "5.0"            # Cross-platform data directories
 
 # Core processing library - default to JNI backend
-blazegraph-io-core = { version = "0.2.2", path = "../blazegraph-core", package = "blazegraph-io-core", default-features = false }
+blazegraph-io-core = { version = "0.4.0", path = "../blazegraph-core", package = "blazegraph-io-core", default-features = false }
 
 [features]
-default = ["jni-backend"]
+default = ["jni-backend", "strict-identity"]
 # Use JNI backend (cross-platform, requires JRE - auto-downloaded if missing)
 jni-backend = ["blazegraph-io-core/jni-backend"]
+
+# Block C.3: always-on verification, baked in at compile time. When
+# enabled (the shipped default), the CLI parses bgraph.md strictly
+# (`accept_drift = false`) so a canon-hash mismatch is a hard reject —
+# non-zero exit, no emit — with **no runtime way to relax it** (the
+# `--accept-drift` argument was removed in Block C). A build with
+# `--no-default-features` (or otherwise without this feature) is a
+# local-debug escape that tolerates drift and emits a derivative; it is
+# deliberately not the shipped artifact. Propagates to the core feature.
+strict-identity = ["blazegraph-io-core/strict-identity"]

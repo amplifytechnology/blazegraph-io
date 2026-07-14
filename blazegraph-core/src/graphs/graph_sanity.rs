@@ -21,7 +21,7 @@ use crate::config::{
     TopologyRebalanceConfig,
 };
 use crate::preprocessors::pdf::xhtml_parser::normalize_for_match;
-use crate::types::{BoundingBox, DocumentGraph, NodeId};
+use crate::types::{BoundingBox, DocumentGraph, DocumentNode, NodeId, ParseProvenance};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Per-node record of a depth invariant violation.
@@ -118,7 +118,26 @@ impl SanityReport {
 ///
 /// Runs all enabled invariants. Returns a report of detected violations
 /// regardless of whether corrections were applied.
-pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityReport {
+///
+/// `provenance` (Block A / Amendment M): the parse-run identity is no
+/// longer carried on the graph, so the caller threads it in explicitly —
+/// consumed only for the CR-71A evidence-artifact filename stem. `None`
+/// for legacy/provenance-free build paths.
+///
+/// `section_confidence` (Block A / A3): the CR-78 detection-confidence
+/// signal, keyed by `text_order`. `DocumentNode` no longer carries
+/// `confidence` (it was a schema-ahead identity-form placeholder —
+/// removed from the wire and the hash), so the CR-78 Phase B
+/// `min_confidence` filter consumes it as a transient parse-time
+/// sidecar instead — the same discipline as the CR-71 evidence sidecar.
+/// `None` (or an absent entry) reads as confidence 0, preserving the
+/// pre-0.8.0 filter semantics exactly.
+pub fn apply(
+    graph: &mut DocumentGraph,
+    config: &GraphSanityConfig,
+    provenance: Option<&ParseProvenance>,
+    section_confidence: Option<&std::collections::HashMap<u32, u8>>,
+) -> SanityReport {
     let mut report = SanityReport::default();
 
     if !config.enabled {
@@ -171,7 +190,7 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
         }
         evidence.aggregate_verdicts(graph);
         if sp.enabled {
-            crate::graphs::prune::prune_sections(graph, &evidence, &mut report, sp);
+            crate::graphs::prune::prune_sections(graph, &evidence, &mut report, sp, provenance);
         }
     }
 
@@ -185,9 +204,14 @@ pub fn apply(graph: &mut DocumentGraph, config: &GraphSanityConfig) -> SanityRep
     // bookmark / numbered / large-font bonuses.
     let min_conf = config.invariants.min_confidence;
     if min_conf > 0 {
+        let confidence_of = |n: &DocumentNode| -> u8 {
+            n.text_order
+                .and_then(|t| section_confidence.and_then(|m| m.get(&t).copied()))
+                .unwrap_or(0)
+        };
         let mut demoted = 0usize;
         for n in graph.nodes.values_mut() {
-            if n.node_type == "Section" && n.confidence < min_conf {
+            if n.node_type == "Section" && confidence_of(n) < min_conf {
                 n.node_type = "Paragraph".to_string();
                 demoted += 1;
             }
@@ -380,13 +404,15 @@ fn check_and_correct_section_height(
         .collect();
 
     for (node_id, section_height) in violators {
-        report.section_height_violations.push(SectionHeightViolation {
-            node_id,
-            section_height,
-            title_height,
-            threshold,
-            corrected: cfg.correct,
-        });
+        report
+            .section_height_violations
+            .push(SectionHeightViolation {
+                node_id,
+                section_height,
+                title_height,
+                threshold,
+                corrected: cfg.correct,
+            });
         if cfg.correct {
             if let Some(node) = graph.nodes.get_mut(&node_id) {
                 node.node_type = "Paragraph".to_string();
@@ -433,7 +459,7 @@ fn check_and_correct_section_overlap(
 
     // Normalized bookmark titles for the bypass (only if enabled + present).
     let bookmark_titles: Option<HashSet<String>> = if cfg.bookmark_bypass {
-        graph.document_info.bookmark_data.as_ref().map(|bd| {
+        graph.document_info.outline_data.as_ref().map(|bd| {
             bd.sections
                 .iter()
                 .map(|s| normalize_for_match(&s.title))
@@ -675,13 +701,13 @@ fn numbering_level(text: &str) -> Option<u32> {
 /// - `Roman(ord)` — a roman-numeral run followed by `.` or `)` (`I.` → 1,
 ///   `IV.` → 4). Checked AFTER letter so single `I`/`V`/`X` stay letters; a
 ///   multi-glyph roman (`II.`, `IV.`) is unambiguous.
-/// - `NoneScheme` — anything else (unnumbered headings, prose).
+/// - `None` — anything else (unnumbered headings, prose).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scheme {
     Decimal { depth: u32, ordinal: u32 },
     Letter { ordinal: u32 },
     Roman { ordinal: u32 },
-    NoneScheme,
+    None,
 }
 
 /// The ordinal value of a subordinate scheme (letter/roman), if this scheme is
@@ -773,7 +799,7 @@ fn numbering_scheme(text: &str) -> Scheme {
     }
     let token = &text[start..i];
     if token.is_empty() {
-        return Scheme::NoneScheme;
+        return Scheme::None;
     }
     // The token must be terminated by `.` or `)` (optionally trailing space).
     // A bare leading word ("Appendix") is NOT a labelled item.
@@ -782,7 +808,7 @@ fn numbering_scheme(text: &str) -> Scheme {
         .map(|b| *b == b'.' || *b == b')')
         .unwrap_or(false);
     if !terminated {
-        return Scheme::NoneScheme;
+        return Scheme::None;
     }
 
     // Single letter → Letter (A–Z). This deliberately keeps single I/V/X/etc.
@@ -799,7 +825,7 @@ fn numbering_scheme(text: &str) -> Scheme {
     if let Some(v) = roman_value(token) {
         return Scheme::Roman { ordinal: v };
     }
-    Scheme::NoneScheme
+    Scheme::None
 }
 
 /// CR-72 — Sub-depth of a subordinate-scheme prefix relative to its container:
@@ -848,6 +874,9 @@ fn subordinate_sub_depth(text: &str) -> u32 {
 /// level (`container_level + sub_depth`); the container itself keeps its base
 /// level (so the level signal naturally pops it on return to the primary scheme).
 struct RestartRegion {
+    // CR-72: identifies the unnumbered container that introduces the region.
+    // Asserted on by the detector tests; not yet read by production code.
+    #[cfg_attr(not(test), allow(dead_code))]
     container_id: NodeId,
     /// Level override for each region member (subordinate sections AND the
     /// interspersed unnumbered FP sections that get absorbed). Keyed by id.
@@ -876,20 +905,20 @@ fn detect_numbering_restart(
     base_levels: &HashMap<NodeId, u32>,
 ) -> Option<RestartRegion> {
     let mut seen_decimal = false;
-    // Track the most recent unnumbered (NoneScheme) container candidate.
+    // Track the most recent unnumbered (None) container candidate.
     let mut last_unnumbered: Option<NodeId> = None;
 
     let n = ordered_section_ids.len();
     let mut idx = 0;
     while idx < n {
         let id = ordered_section_ids[idx];
-        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::NoneScheme);
+        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::None);
         match scheme {
             Scheme::Decimal { .. } => {
                 seen_decimal = true;
                 last_unnumbered = None;
             }
-            Scheme::NoneScheme => {
+            Scheme::None => {
                 last_unnumbered = Some(id);
             }
             Scheme::Letter { ordinal } | Scheme::Roman { ordinal } => {
@@ -947,7 +976,7 @@ fn try_build_region(
     let mut idx = start_idx;
     while idx < n {
         let id = ordered_section_ids[idx];
-        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::NoneScheme);
+        let scheme = schemes.get(&id).copied().unwrap_or(Scheme::None);
         match scheme {
             Scheme::Decimal { .. } => {
                 // A bare decimal prefix is the primary scheme resuming → the
@@ -980,7 +1009,7 @@ fn try_build_region(
                     break;
                 }
             }
-            Scheme::NoneScheme => {
+            Scheme::None => {
                 // Interspersed unnumbered Section absorbed into the region. Its
                 // level is `container_level + its own size-fallback level`, so a
                 // figure-callout FP (large font → fallback level 1) sits at
@@ -1393,7 +1422,10 @@ fn rebalance_topology(
         if new_parent.get(id).copied() != n.parent {
             rebalance_report.reparented += 1;
         }
-        if new_depth.get(id).copied().unwrap_or(n.location.semantic.depth)
+        if new_depth
+            .get(id)
+            .copied()
+            .unwrap_or(n.location.semantic.depth)
             != n.location.semantic.depth
         {
             rebalance_report.depths_changed += 1;
@@ -1506,7 +1538,7 @@ mod tests {
     fn test_cr28_depth_recompute_fixes_drift() {
         // child recorded at depth 3 but is a direct child of root → expected 1
         let (mut graph, _, child_id) = make_two_node_graph(3);
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert_eq!(report.depth_violations.len(), 1);
         assert_eq!(graph.nodes[&child_id].location.semantic.depth, 1);
     }
@@ -1515,7 +1547,7 @@ mod tests {
     #[test]
     fn test_cr28_noop_on_consistent_tree() {
         let (mut graph, _, _) = make_two_node_graph(1);
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report.is_clean(),
             "consistent tree must produce no diagnostics"
@@ -1537,7 +1569,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let report = apply(&mut graph, &cfg);
+        let report = apply(&mut graph, &cfg, None, None);
         assert_eq!(report.depth_violations.len(), 1);
         assert!(!report.depth_violations[0].corrected);
         // Original (wrong) depth retained
@@ -1554,7 +1586,7 @@ mod tests {
                                             // Note: NOT added to root.children — this is the "orphan" case
         graph.nodes.insert(orphan_id, orphan);
 
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert_eq!(report.orphan_nodes.len(), 1);
         assert_eq!(report.orphan_nodes[0], orphan_id);
         // Orphan's depth preserved (correction skipped)
@@ -1569,7 +1601,7 @@ mod tests {
             enabled: false,
             invariants: GraphSanityInvariants::default(),
         };
-        let report = apply(&mut graph, &cfg);
+        let report = apply(&mut graph, &cfg, None, None);
         assert!(report.is_clean());
         // Wrong depth still in place
         assert_eq!(graph.nodes[&child_id].location.semantic.depth, 3);
@@ -1621,7 +1653,7 @@ mod tests {
         // depth 2 under a doc-title that the test fixture omits. We assert
         // that the paragraph drift is corrected; full chain consistency is
         // exercised by the broader regression suite.
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report
                 .depth_violations
@@ -1693,7 +1725,7 @@ mod tests {
     #[test]
     fn test_cr65_demotes_section_exceeding_threshold() {
         let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 50.0);
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert_eq!(report.section_height_violations.len(), 1);
         assert_eq!(report.section_height_violations[0].node_id, child_id);
         assert!(report.section_height_violations[0].corrected);
@@ -1705,7 +1737,7 @@ mod tests {
     #[test]
     fn test_cr65_respects_tolerance() {
         let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 30.0);
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report.section_height_violations.is_empty(),
             "child within tolerance should not be flagged"
@@ -1719,7 +1751,7 @@ mod tests {
     #[test]
     fn test_cr65_no_title_is_noop() {
         let (mut graph, _, _) = make_two_node_graph(1);
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(
             report.section_height_violations.is_empty(),
             "no depth-1 Section with physical location → no violations"
@@ -1742,12 +1774,11 @@ mod tests {
                 ..Default::default()
             },
         };
-        let report = apply(&mut graph, &cfg);
+        let report = apply(&mut graph, &cfg, None, None);
         assert_eq!(report.section_height_violations.len(), 1);
         assert!(!report.section_height_violations[0].corrected);
         assert_eq!(
-            graph.nodes[&child_id].node_type,
-            "Section",
+            graph.nodes[&child_id].node_type, "Section",
             "check-only must preserve node_type"
         );
     }
@@ -1757,7 +1788,7 @@ mod tests {
     fn test_cr65_demoted_section_keeps_content_and_id() {
         let (mut graph, _, _, child_id) = make_graph_with_title_and_child(18.0, 50.0);
         let original_text = graph.nodes[&child_id].content.text.clone();
-        apply(&mut graph, &full_correct_config());
+        apply(&mut graph, &full_correct_config(), None, None);
         assert!(graph.nodes.contains_key(&child_id), "id must be preserved");
         assert_eq!(
             graph.nodes[&child_id].content.text, original_text,
@@ -1847,14 +1878,14 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 100.0),
             (1, 0.0, 0.0, 100.0, 50.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.20, true));
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert_eq!(report.section_overlap_violations.len(), 1);
         assert_eq!(report.section_overlap_violations[0].node_id, section_id);
         assert!(report.section_overlap_violations[0].corrected);
         assert_eq!(graph.nodes[&section_id].node_type, "Paragraph");
     }
 
-    /// CR-68 Test 2 — same overlap geometry, but bookmark_data contains a title
+    /// CR-68 Test 2 — same overlap geometry, but outline_data contains a title
     /// matching the section's text and bookmark_bypass is on → kept as Section.
     #[test]
     fn test_cr68_bookmark_bypass_protects_matching_section() {
@@ -1864,14 +1895,14 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 50.0),
         );
         // Outline writes it as "3.1 Approach 1"; normalize_for_match aligns them.
-        graph.document_info.bookmark_data = Some(BookmarkData {
+        graph.document_info.outline_data = Some(BookmarkData {
             sections: vec![BookmarkSection {
                 title: "3.1 Approach 1".into(),
                 order: 0,
                 level: 1,
             }],
         });
-        let report = apply(&mut graph, &overlap_config(0.20, true));
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "bookmark-matching section must be protected"
@@ -1888,7 +1919,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 100.0),
             (1, 0.0, 0.0, 100.0, 10.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.20, true));
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "overlap below threshold must not flag"
@@ -1905,7 +1936,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 100.0),
             (1, 0.0, 0.0, 100.0, 50.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.0, true));
+        let report = apply(&mut graph, &overlap_config(0.0, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "threshold 0.0 must early-return (OFF sentinel)"
@@ -1924,7 +1955,7 @@ mod tests {
             (1, 0.0, 0.0, 100.0, 20.0),
             (1, 0.0, 20.0, 100.0, 80.0),
         );
-        let report = apply(&mut graph, &overlap_config(0.20, true));
+        let report = apply(&mut graph, &overlap_config(0.20, true), None, None);
         assert!(
             report.section_overlap_violations.is_empty(),
             "adjacent (touching, non-overlapping) section must be kept"
@@ -1952,7 +1983,12 @@ mod tests {
 
         let bbox = |p: u32, x: f32, y: f32, w: f32, h: f32| PhysicalLocation {
             page: p,
-            bounding_box: BoundingBox { x, y, width: w, height: h },
+            bounding_box: BoundingBox {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
         };
 
         let mut section = DocumentNode::new_with_id(section_id, "Section", "candidate".into());
@@ -2002,7 +2038,7 @@ mod tests {
                 ("Section", 1, 0.0, 50.0, 50.0, 50.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.0));
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None, None);
         let v: Vec<_> = report
             .section_overlap_count_violations
             .iter()
@@ -2024,7 +2060,7 @@ mod tests {
                 ("Paragraph", 1, 0.0, 0.0, 30.0, 30.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.0));
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None, None);
         assert!(
             report.section_overlap_count_violations.is_empty(),
             "two overlaps is below the count threshold"
@@ -2044,7 +2080,7 @@ mod tests {
                 ("Paragraph", 2, 0.0, 0.0, 100.0, 100.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.0));
+        let report = apply(&mut graph, &overlap_count_config(3, 0.0), None, None);
         assert!(report.section_overlap_count_violations.is_empty());
         assert_eq!(graph.nodes[&section_id].node_type, "Section");
     }
@@ -2063,7 +2099,7 @@ mod tests {
                 ("Paragraph", 1, 90.0, 0.0, 10.0, 10.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(3, 0.10));
+        let report = apply(&mut graph, &overlap_count_config(3, 0.10), None, None);
         assert!(
             report.section_overlap_count_violations.is_empty(),
             "sub-threshold overlaps must not count"
@@ -2083,7 +2119,7 @@ mod tests {
                 ("Section", 1, 0.0, 50.0, 50.0, 50.0),
             ],
         );
-        let report = apply(&mut graph, &overlap_count_config(0, 0.0));
+        let report = apply(&mut graph, &overlap_count_config(0, 0.0), None, None);
         assert!(
             report.section_overlap_count_violations.is_empty(),
             "count_threshold 0 must early-return (OFF guard)"
@@ -2115,32 +2151,55 @@ mod tests {
     /// the node ids in list order.
     /// CR-78 Phase B — the `min_confidence` filter demotes Sections scoring below
     /// the threshold (mutator slot before the CR-70 rebalance); default 0 is a
-    /// no-op. Confidence is assigned at detection (section_detection_v2); here we
-    /// stamp it directly to isolate the filter.
+    /// no-op. Confidence is assigned at detection (section_detection_v2) and
+    /// arrives as the transient `text_order → confidence` sidecar (Block A /
+    /// A3: nodes no longer carry it); here we build the sidecar directly to
+    /// isolate the filter.
     #[test]
     fn cr78_min_confidence_demotes_below_threshold() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "high-conf header", font_family: None, font_size: None, depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "low-conf noise",   font_family: None, font_size: None, depth: 1, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "high-conf header",
+                font_family: None,
+                font_size: None,
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "low-conf noise",
+                font_family: None,
+                font_size: None,
+                depth: 1,
+                parent_idx: None,
+            },
         ];
+        // make_rebalance_graph assigns text_order by list position.
+        let confidence: std::collections::HashMap<u32, u8> = [(0u32, 6u8), (1u32, 3u8)].into();
 
         // Default (min_confidence = 0) is a no-op: both stay Sections.
         let (mut g0, _r0, ids0) = make_rebalance_graph(&specs);
-        g0.nodes.get_mut(&ids0[0]).unwrap().confidence = 6;
-        g0.nodes.get_mut(&ids0[1]).unwrap().confidence = 3;
-        apply(&mut g0, &rebalance_only_config(3, 4));
+        apply(&mut g0, &rebalance_only_config(3, 4), None, Some(&confidence));
         assert_eq!(g0.nodes[&ids0[0]].node_type, "Section");
-        assert_eq!(g0.nodes[&ids0[1]].node_type, "Section", "min_confidence=0 must not demote");
+        assert_eq!(
+            g0.nodes[&ids0[1]].node_type, "Section",
+            "min_confidence=0 must not demote"
+        );
 
         // min_confidence = 4: the conf-3 section demotes, the conf-6 survives.
         let (mut g1, _r1, ids1) = make_rebalance_graph(&specs);
-        g1.nodes.get_mut(&ids1[0]).unwrap().confidence = 6;
-        g1.nodes.get_mut(&ids1[1]).unwrap().confidence = 3;
         let mut cfg = rebalance_only_config(3, 4);
         cfg.invariants.min_confidence = 4;
-        apply(&mut g1, &cfg);
-        assert_eq!(g1.nodes[&ids1[0]].node_type, "Section", "conf 6 >= 4 survives");
-        assert_eq!(g1.nodes[&ids1[1]].node_type, "Paragraph", "conf 3 < 4 demoted");
+        apply(&mut g1, &cfg, None, Some(&confidence));
+        assert_eq!(
+            g1.nodes[&ids1[0]].node_type, "Section",
+            "conf 6 >= 4 survives"
+        );
+        assert_eq!(
+            g1.nodes[&ids1[1]].node_type, "Paragraph",
+            "conf 3 < 4 demoted"
+        );
     }
 
     fn make_rebalance_graph(specs: &[NodeSpec]) -> (DocumentGraph, NodeId, Vec<NodeId>) {
@@ -2239,18 +2298,52 @@ mod tests {
     #[test]
     fn test_cr70_numbered_hierarchy_rebuild() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1 Background",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "2. Methods",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
-        assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1, "1. Introduction → depth 1");
+        assert_eq!(
+            graph.nodes[&ids[0]].location.semantic.depth, 1,
+            "1. Introduction → depth 1"
+        );
         assert_eq!(graph.nodes[&ids[0]].parent, Some(root_id));
-        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2, "1.1 Background → depth 2");
-        assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]), "1.1 parented to 1.");
-        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1, "2. Methods → depth 1");
+        assert_eq!(
+            graph.nodes[&ids[1]].location.semantic.depth, 2,
+            "1.1 Background → depth 2"
+        );
+        assert_eq!(
+            graph.nodes[&ids[1]].parent,
+            Some(ids[0]),
+            "1.1 parented to 1."
+        );
+        assert_eq!(
+            graph.nodes[&ids[2]].location.semantic.depth, 1,
+            "2. Methods → depth 1"
+        );
         assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id));
         // Children rebuilt: 1. has 1.1 as its only child; 2. is a leaf.
         assert_eq!(graph.nodes[&ids[0]].children, vec![ids[1]]);
@@ -2264,29 +2357,80 @@ mod tests {
     #[test]
     fn sb8_document_title_nesting_nests_body_under_title() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "OAuth 2.0 DPoP", font_family: None, font_size: Some(22.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: Some(19.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: Some(19.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "2. Concept", font_family: None, font_size: Some(19.0), depth: 1, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "OAuth 2.0 DPoP",
+                font_family: None,
+                font_size: Some(22.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: Some(19.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1 Background",
+                font_family: None,
+                font_size: Some(19.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "2. Concept",
+                font_family: None,
+                font_size: Some(19.0),
+                depth: 1,
+                parent_idx: None,
+            },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
         let mut cfg = rebalance_only_config(4, 5);
         cfg.invariants.topology_rebalance.document_title_nesting = true;
-        apply(&mut graph, &cfg);
+        apply(&mut graph, &cfg, None, None);
 
-        assert_eq!(graph.nodes[&ids[0]].parent, Some(root_id), "title is the root section");
+        assert_eq!(
+            graph.nodes[&ids[0]].parent,
+            Some(root_id),
+            "title is the root section"
+        );
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
-        assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]), "1. nests under the title");
+        assert_eq!(
+            graph.nodes[&ids[1]].parent,
+            Some(ids[0]),
+            "1. nests under the title"
+        );
         assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
-        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[0]), "2. nests under the title");
-        assert_eq!(graph.nodes[&ids[2]].parent, Some(ids[1]), "1.1 stays under 1.");
-        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 3, "1.1 rides one level deeper, still distinct");
+        assert_eq!(
+            graph.nodes[&ids[3]].parent,
+            Some(ids[0]),
+            "2. nests under the title"
+        );
+        assert_eq!(
+            graph.nodes[&ids[2]].parent,
+            Some(ids[1]),
+            "1.1 stays under 1."
+        );
+        assert_eq!(
+            graph.nodes[&ids[2]].location.semantic.depth, 3,
+            "1.1 rides one level deeper, still distinct"
+        );
 
         // Flag off → flat level-1 siblings (the pre-Sb8 shape).
         let (mut g2, root2, ids2) = make_rebalance_graph(&specs);
-        apply(&mut g2, &rebalance_only_config(4, 5));
+        apply(&mut g2, &rebalance_only_config(4, 5), None, None);
         assert_eq!(g2.nodes[&ids2[0]].parent, Some(root2));
-        assert_eq!(g2.nodes[&ids2[1]].parent, Some(root2), "title-off: 1. stays at root");
+        assert_eq!(
+            g2.nodes[&ids2[1]].parent,
+            Some(root2),
+            "title-off: 1. stays at root"
+        );
         assert_eq!(g2.nodes[&ids2[1]].location.semantic.depth, 1);
     }
 
@@ -2298,26 +2442,73 @@ mod tests {
     #[test]
     fn sb8_document_title_nesting_appendix_becomes_sibling() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "Doc Title", font_family: None, font_size: Some(17.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1. Intro", font_family: None, font_size: Some(12.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: Some(12.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: Some(24.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Supplementary Notes", font_family: None, font_size: Some(12.0), depth: 1, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "Doc Title",
+                font_family: None,
+                font_size: Some(17.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Intro",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "2. Methods",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Appendix",
+                font_family: None,
+                font_size: Some(24.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Supplementary Notes",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 1,
+                parent_idx: None,
+            },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
         let mut cfg = rebalance_only_config(4, 5);
         cfg.invariants.topology_rebalance.document_title_nesting = true;
-        apply(&mut graph, &cfg);
+        apply(&mut graph, &cfg, None, None);
 
         // Two top-level siblings: the title and the Appendix.
-        assert_eq!(graph.nodes[&ids[0]].parent, Some(root_id), "title is a top node");
-        assert_eq!(graph.nodes[&ids[3]].parent, Some(root_id), "large-font Appendix is a top node");
+        assert_eq!(
+            graph.nodes[&ids[0]].parent,
+            Some(root_id),
+            "title is a top node"
+        );
+        assert_eq!(
+            graph.nodes[&ids[3]].parent,
+            Some(root_id),
+            "large-font Appendix is a top node"
+        );
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 1);
         // Body nests under the title; post-Appendix content under the Appendix.
         assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]), "1. under title");
         assert_eq!(graph.nodes[&ids[2]].parent, Some(ids[0]), "2. under title");
-        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[3]), "supplementary under Appendix");
+        assert_eq!(
+            graph.nodes[&ids[4]].parent,
+            Some(ids[3]),
+            "supplementary under Appendix"
+        );
     }
 
     /// CR-70 Test 2 — gap-collapse. Numbering levels 1 then 3 (a skipped level)
@@ -2325,11 +2516,25 @@ mod tests {
     #[test]
     fn test_cr70_gap_collapse() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Top", font_family: None, font_size: None, depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1.1 Deep", font_family: None, font_size: None, depth: 3, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Top",
+                font_family: None,
+                font_size: None,
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1.1 Deep",
+                font_family: None,
+                font_size: None,
+                depth: 3,
+                parent_idx: None,
+            },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(
@@ -2345,14 +2550,49 @@ mod tests {
     #[test]
     fn test_cr70_cap_flattens_deep_nest() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. A", font_family: None, font_size: None, depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1 B", font_family: None, font_size: None, depth: 2, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1.1 C", font_family: None, font_size: None, depth: 3, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1.1.1 D", font_family: None, font_size: None, depth: 4, parent_idx: None },
-            NodeSpec { node_type: "Paragraph", text: "body under D", font_family: None, font_size: None, depth: 5, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. A",
+                font_family: None,
+                font_size: None,
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1 B",
+                font_family: None,
+                font_size: None,
+                depth: 2,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1.1 C",
+                font_family: None,
+                font_size: None,
+                depth: 3,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1.1.1 D",
+                font_family: None,
+                font_size: None,
+                depth: 4,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Paragraph",
+                text: "body under D",
+                font_family: None,
+                font_size: None,
+                depth: 5,
+                parent_idx: None,
+            },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
@@ -2362,7 +2602,8 @@ mod tests {
             "level-4 section clamped to max_section_depth (3)"
         );
         assert_eq!(
-            graph.nodes[&ids[3]].parent, Some(ids[1]),
+            graph.nodes[&ids[3]].parent,
+            Some(ids[1]),
             "capped section is a level-3 sibling under the level-2 ancestor"
         );
         assert_eq!(
@@ -2381,15 +2622,36 @@ mod tests {
         // node 1 was a Section, demoted to Paragraph upstream; it still carries
         // node 2 as a stale child at the spurious extra depth.
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Paragraph", text: "Figure 2 (demoted)", font_family: None, font_size: None, depth: 2, parent_idx: Some(0) },
-            NodeSpec { node_type: "Paragraph", text: "figure body text", font_family: None, font_size: None, depth: 3, parent_idx: Some(1) },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Paragraph",
+                text: "Figure 2 (demoted)",
+                font_family: None,
+                font_size: None,
+                depth: 2,
+                parent_idx: Some(0),
+            },
+            NodeSpec {
+                node_type: "Paragraph",
+                text: "figure body text",
+                font_family: None,
+                font_size: None,
+                depth: 3,
+                parent_idx: Some(1),
+            },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
         // Precondition: the demoted node has a child (the stale spurious level).
         assert!(!graph.nodes[&ids[1]].children.is_empty());
 
-        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // The demoted node is now a leaf...
         assert!(
@@ -2398,7 +2660,8 @@ mod tests {
         );
         // ...and its former child re-attaches to the enclosing section.
         assert_eq!(
-            graph.nodes[&ids[2]].parent, Some(ids[0]),
+            graph.nodes[&ids[2]].parent,
+            Some(ids[0]),
             "orphaned child re-parents to the enclosing section"
         );
         assert_eq!(graph.nodes[&ids[1]].parent, Some(ids[0]));
@@ -2415,12 +2678,33 @@ mod tests {
     #[test]
     fn test_cr70_font_size_rank_fallback_unnumbered() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: Some("ABCDEF+XCharter-Bold"), font_size: Some(12.0), depth: 1, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: Some("ABCDEF+XCharter-Bold"), font_size: Some(10.0), depth: 2, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Appendix", font_family: Some("ABCDEF+XCharter-Bold"), font_size: Some(14.0), depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: Some("ABCDEF+XCharter-Bold"),
+                font_size: Some(12.0),
+                depth: 1,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1 Background",
+                font_family: Some("ABCDEF+XCharter-Bold"),
+                font_size: Some(10.0),
+                depth: 2,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Appendix",
+                font_family: Some("ABCDEF+XCharter-Bold"),
+                font_size: Some(14.0),
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 2);
@@ -2436,16 +2720,44 @@ mod tests {
     #[test]
     fn test_cr70_idempotent_second_run_is_noop() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Paragraph", text: "body", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1 Background",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Paragraph",
+                text: "body",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "2. Methods",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, _root, _ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // Second run: no topology changes.
-        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
         {
             let tr = report
                 .topology_rebalance
@@ -2465,14 +2777,31 @@ mod tests {
     #[test]
     fn test_cr70_check_only_does_not_mutate() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "1.1 Background", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "1.1 Background",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
         let cfg = GraphSanityConfig {
             enabled: true,
             invariants: GraphSanityInvariants {
-                depth_consistency: InvariantToggle { check: false, correct: false },
+                depth_consistency: InvariantToggle {
+                    check: false,
+                    correct: false,
+                },
                 topology_rebalance: TopologyRebalanceConfig {
                     check: true,
                     correct: false,
@@ -2483,10 +2812,15 @@ mod tests {
                 ..Default::default()
             },
         };
-        let report = apply(&mut graph, &cfg);
-        let tr = report.topology_rebalance.expect("report present in check mode");
+        let report = apply(&mut graph, &cfg, None, None);
+        let tr = report
+            .topology_rebalance
+            .expect("report present in check mode");
         assert!(!tr.corrected, "check-only must report corrected = false");
-        assert!(tr.depths_changed >= 1, "check-only still diagnoses pending changes");
+        assert!(
+            tr.depths_changed >= 1,
+            "check-only still diagnoses pending changes"
+        );
         // The stale depth (9) is preserved because nothing was written.
         assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 9);
     }
@@ -2526,28 +2860,40 @@ mod tests {
     fn test_cr72_numbering_scheme_classification() {
         assert_eq!(
             numbering_scheme("3. Title"),
-            Scheme::Decimal { depth: 1, ordinal: 3 }
+            Scheme::Decimal {
+                depth: 1,
+                ordinal: 3
+            }
         );
         assert_eq!(
             numbering_scheme("3.1. Sub"),
-            Scheme::Decimal { depth: 2, ordinal: 3 }
+            Scheme::Decimal {
+                depth: 2,
+                ordinal: 3
+            }
         );
-        assert_eq!(numbering_scheme("A. Appendix item"), Scheme::Letter { ordinal: 1 });
+        assert_eq!(
+            numbering_scheme("A. Appendix item"),
+            Scheme::Letter { ordinal: 1 }
+        );
         assert_eq!(numbering_scheme("B. Next"), Scheme::Letter { ordinal: 2 });
         assert_eq!(numbering_scheme("J. Tenth"), Scheme::Letter { ordinal: 10 });
-        assert_eq!(numbering_scheme("A) paren form"), Scheme::Letter { ordinal: 1 });
+        assert_eq!(
+            numbering_scheme("A) paren form"),
+            Scheme::Letter { ordinal: 1 }
+        );
         // Single I/V/X stay letters (ambiguous-by-design); multi-glyph romans
         // are roman.
         assert_eq!(numbering_scheme("I. one"), Scheme::Letter { ordinal: 9 });
         assert_eq!(numbering_scheme("II. two"), Scheme::Roman { ordinal: 2 });
         assert_eq!(numbering_scheme("IV. four"), Scheme::Roman { ordinal: 4 });
         // Unnumbered / prose / acronyms.
-        assert_eq!(numbering_scheme("Appendix"), Scheme::NoneScheme);
-        assert_eq!(numbering_scheme("References"), Scheme::NoneScheme);
-        assert_eq!(numbering_scheme("FLOPS. ratio"), Scheme::NoneScheme);
-        assert_eq!(numbering_scheme("Abstract"), Scheme::NoneScheme);
+        assert_eq!(numbering_scheme("Appendix"), Scheme::None);
+        assert_eq!(numbering_scheme("References"), Scheme::None);
+        assert_eq!(numbering_scheme("FLOPS. ratio"), Scheme::None);
+        assert_eq!(numbering_scheme("Abstract"), Scheme::None);
         // A bare leading word (no `.`/`)` terminator) is not a labelled item.
-        assert_eq!(numbering_scheme("Appendix A"), Scheme::NoneScheme);
+        assert_eq!(numbering_scheme("Appendix A"), Scheme::None);
     }
 
     /// CR-72 helper unit — `subordinate_sub_depth` counts the decimal tail.
@@ -2584,13 +2930,25 @@ mod tests {
     /// region members (nested), Appendix is the container.
     #[test]
     fn test_cr72_detector_fires_on_appendix_letter_run() {
-        let (region, ids) = run_detector(&["1. Intro", "2. Methods", "Appendix", "A. Data", "B. Code"]);
+        let (region, ids) =
+            run_detector(&["1. Intro", "2. Methods", "Appendix", "A. Data", "B. Code"]);
         let region = region.expect("restart must fire on a clean appendix letter run");
         assert_eq!(region.container_id, ids[2], "Appendix is the container");
         assert_eq!(region.nested_count, 2, "A and B nested");
-        assert_eq!(region.overrides.get(&ids[3]).copied(), Some(2), "A → level 2");
-        assert_eq!(region.overrides.get(&ids[4]).copied(), Some(2), "B → level 2");
-        assert!(!region.overrides.contains_key(&ids[2]), "container is not overridden");
+        assert_eq!(
+            region.overrides.get(&ids[3]).copied(),
+            Some(2),
+            "A → level 2"
+        );
+        assert_eq!(
+            region.overrides.get(&ids[4]).copied(),
+            Some(2),
+            "B → level 2"
+        );
+        assert!(
+            !region.overrides.contains_key(&ids[2]),
+            "container is not overridden"
+        );
     }
 
     /// CR-72 detector — does NOT fire on a pure-decimal document.
@@ -2633,13 +2991,22 @@ mod tests {
     /// A,B all become region members under the container.
     #[test]
     fn test_cr72_detector_absorbs_interleaved_unnumbered() {
-        let (region, ids) =
-            run_detector(&["1. Intro", "Appendix", "A. Data", "FigFP callout", "B. Code"]);
+        let (region, ids) = run_detector(&[
+            "1. Intro",
+            "Appendix",
+            "A. Data",
+            "FigFP callout",
+            "B. Code",
+        ]);
         let region = region.expect("restart fires with an interleaved FP in the run");
         assert_eq!(region.container_id, ids[1]);
         // A, FigFP, B all overridden to nest under the container.
         assert_eq!(region.overrides.get(&ids[2]).copied(), Some(2), "A nested");
-        assert_eq!(region.overrides.get(&ids[3]).copied(), Some(2), "FigFP absorbed");
+        assert_eq!(
+            region.overrides.get(&ids[3]).copied(),
+            Some(2),
+            "FigFP absorbed"
+        );
         assert_eq!(region.overrides.get(&ids[4]).copied(), Some(2), "B nested");
         assert_eq!(region.nested_count, 2, "only A and B count as subordinate");
     }
@@ -2651,8 +3018,16 @@ mod tests {
         let (region, ids) =
             run_detector(&["1. Intro", "Appendix", "A. Data", "B. Code", "B.2 Detail"]);
         let region = region.expect("restart fires");
-        assert_eq!(region.overrides.get(&ids[2]).copied(), Some(2), "A → level 2");
-        assert_eq!(region.overrides.get(&ids[3]).copied(), Some(2), "B → level 2");
+        assert_eq!(
+            region.overrides.get(&ids[2]).copied(),
+            Some(2),
+            "A → level 2"
+        );
+        assert_eq!(
+            region.overrides.get(&ids[3]).copied(),
+            Some(2),
+            "B → level 2"
+        );
         assert_eq!(
             region.overrides.get(&ids[4]).copied(),
             Some(3),
@@ -2666,25 +3041,77 @@ mod tests {
     #[test]
     fn test_cr72_rebalance_nests_letters_under_appendix() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "2. Methods",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Appendix",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "A. Training Data",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "B. Hyperparameters",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // 1., 2., Appendix are level-1 siblings under root.
         assert_eq!(graph.nodes[&ids[0]].location.semantic.depth, 1);
         assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 1);
-        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1, "Appendix stays level 1");
+        assert_eq!(
+            graph.nodes[&ids[2]].location.semantic.depth, 1,
+            "Appendix stays level 1"
+        );
         assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id));
         // A and B nest UNDER Appendix at depth 2.
-        assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 2, "A → depth 2");
-        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[2]), "A parented to Appendix");
-        assert_eq!(graph.nodes[&ids[4]].location.semantic.depth, 2, "B → depth 2");
-        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[2]), "B parented to Appendix");
+        assert_eq!(
+            graph.nodes[&ids[3]].location.semantic.depth, 2,
+            "A → depth 2"
+        );
+        assert_eq!(
+            graph.nodes[&ids[3]].parent,
+            Some(ids[2]),
+            "A parented to Appendix"
+        );
+        assert_eq!(
+            graph.nodes[&ids[4]].location.semantic.depth, 2,
+            "B → depth 2"
+        );
+        assert_eq!(
+            graph.nodes[&ids[4]].parent,
+            Some(ids[2]),
+            "B parented to Appendix"
+        );
         // Appendix now has A and B as children (text_order).
         assert_eq!(graph.nodes[&ids[2]].children, vec![ids[3], ids[4]]);
         // Report records the nesting.
@@ -2698,20 +3125,70 @@ mod tests {
     #[test]
     fn test_cr72_rebalance_region_absorbs_interleaved_fp() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "FLOPS", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Appendix",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "A. Training Data",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "FLOPS",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "B. Hyperparameters",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, _root, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // Appendix is the container; A, FigFP(FLOPS), B all sit under it.
-        assert_eq!(graph.nodes[&ids[1]].location.semantic.depth, 1, "Appendix level 1");
-        assert_eq!(graph.nodes[&ids[2]].parent, Some(ids[1]), "A under Appendix");
-        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[1]), "interleaved FP under Appendix");
-        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[1]), "B under Appendix");
+        assert_eq!(
+            graph.nodes[&ids[1]].location.semantic.depth, 1,
+            "Appendix level 1"
+        );
+        assert_eq!(
+            graph.nodes[&ids[2]].parent,
+            Some(ids[1]),
+            "A under Appendix"
+        );
+        assert_eq!(
+            graph.nodes[&ids[3]].parent,
+            Some(ids[1]),
+            "interleaved FP under Appendix"
+        );
+        assert_eq!(
+            graph.nodes[&ids[4]].parent,
+            Some(ids[1]),
+            "B under Appendix"
+        );
         assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 2);
         assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 2);
         assert_eq!(graph.nodes[&ids[4]].location.semantic.depth, 2);
@@ -2727,31 +3204,96 @@ mod tests {
     #[test]
     fn test_cr72_rebalance_unnumbered_subsection_nests_under_letter() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "A. Model Card", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Model Details", font_family: None, font_size: Some(10.0), depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "B. Trained Models", font_family: None, font_size: Some(12.0), depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "FLOPS", font_family: None, font_size: Some(20.0), depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "2. Methods",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Appendix",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "A. Model Card",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Model Details",
+                font_family: None,
+                font_size: Some(10.0),
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "B. Trained Models",
+                font_family: None,
+                font_size: Some(12.0),
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "FLOPS",
+                font_family: None,
+                font_size: Some(20.0),
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
         // Appendix is the level-1 container.
         assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1);
         assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id));
         // Letters A, B nest directly under Appendix at depth 2.
-        assert_eq!(graph.nodes[&ids[3]].parent, Some(ids[2]), "A under Appendix");
+        assert_eq!(
+            graph.nodes[&ids[3]].parent,
+            Some(ids[2]),
+            "A under Appendix"
+        );
         assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 2);
-        assert_eq!(graph.nodes[&ids[5]].parent, Some(ids[2]), "B under Appendix");
+        assert_eq!(
+            graph.nodes[&ids[5]].parent,
+            Some(ids[2]),
+            "B under Appendix"
+        );
         assert_eq!(graph.nodes[&ids[5]].location.semantic.depth, 2);
         // Genuine subsection (smaller font) nests UNDER its open letter A at depth 3 —
         // NOT flattened to a direct Appendix child.
-        assert_eq!(graph.nodes[&ids[4]].parent, Some(ids[3]), "Model Details under letter A");
+        assert_eq!(
+            graph.nodes[&ids[4]].parent,
+            Some(ids[3]),
+            "Model Details under letter A"
+        );
         assert_eq!(graph.nodes[&ids[4]].location.semantic.depth, 3);
         // Figure-callout FP (larger font) stays at container + 1 (direct Appendix child).
-        assert_eq!(graph.nodes[&ids[6]].parent, Some(ids[2]), "FLOPS under Appendix");
+        assert_eq!(
+            graph.nodes[&ids[6]].parent,
+            Some(ids[2]),
+            "FLOPS under Appendix"
+        );
         assert_eq!(graph.nodes[&ids[6]].location.semantic.depth, 2);
     }
 
@@ -2761,10 +3303,38 @@ mod tests {
     #[test]
     fn test_cr72_disabled_is_cr70_behavior() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Appendix",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "A. Training Data",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "B. Hyperparameters",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, root_id, ids) = make_rebalance_graph(&specs);
         let mut cfg = rebalance_only_config(3, 4);
@@ -2772,14 +3342,28 @@ mod tests {
             check: false,
             correct: false,
         };
-        apply(&mut graph, &cfg);
+        apply(&mut graph, &cfg, None, None);
 
         // Without the rule, A and B fall to the size fallback (level 1) and sit
         // as level-1 siblings of Appendix under root.
-        assert_eq!(graph.nodes[&ids[2]].location.semantic.depth, 1, "A stays level 1");
-        assert_eq!(graph.nodes[&ids[2]].parent, Some(root_id), "A sibling of Appendix");
-        assert_eq!(graph.nodes[&ids[3]].location.semantic.depth, 1, "B stays level 1");
-        assert_eq!(graph.nodes[&ids[3]].parent, Some(root_id), "B sibling of Appendix");
+        assert_eq!(
+            graph.nodes[&ids[2]].location.semantic.depth, 1,
+            "A stays level 1"
+        );
+        assert_eq!(
+            graph.nodes[&ids[2]].parent,
+            Some(root_id),
+            "A sibling of Appendix"
+        );
+        assert_eq!(
+            graph.nodes[&ids[3]].location.semantic.depth, 1,
+            "B stays level 1"
+        );
+        assert_eq!(
+            graph.nodes[&ids[3]].parent,
+            Some(root_id),
+            "B sibling of Appendix"
+        );
     }
 
     /// CR-72 integration — idempotency: a second rebalance over the already
@@ -2787,16 +3371,51 @@ mod tests {
     #[test]
     fn test_cr72_idempotent_second_run_is_noop() {
         let specs = [
-            NodeSpec { node_type: "Section", text: "1. Introduction", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "2. Methods", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "Appendix", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "A. Training Data", font_family: None, font_size: None, depth: 9, parent_idx: None },
-            NodeSpec { node_type: "Section", text: "B. Hyperparameters", font_family: None, font_size: None, depth: 9, parent_idx: None },
+            NodeSpec {
+                node_type: "Section",
+                text: "1. Introduction",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "2. Methods",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "Appendix",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "A. Training Data",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
+            NodeSpec {
+                node_type: "Section",
+                text: "B. Hyperparameters",
+                font_family: None,
+                font_size: None,
+                depth: 9,
+                parent_idx: None,
+            },
         ];
         let (mut graph, _root, _ids) = make_rebalance_graph(&specs);
-        apply(&mut graph, &rebalance_only_config(3, 4));
+        apply(&mut graph, &rebalance_only_config(3, 4), None, None);
 
-        let report = apply(&mut graph, &rebalance_only_config(3, 4));
+        let report = apply(&mut graph, &rebalance_only_config(3, 4), None, None);
         let tr = report
             .topology_rebalance
             .as_ref()
@@ -2830,7 +3449,12 @@ mod tests {
 
         let bbox = |y: f32, h: f32| PhysicalLocation {
             page: 1,
-            bounding_box: BoundingBox { x: 0.0, y, width: 100.0, height: h },
+            bounding_box: BoundingBox {
+                x: 0.0,
+                y,
+                width: 100.0,
+                height: h,
+            },
         };
         let style = |fam: &str| StyleMetadata {
             font_class: String::new(),
@@ -2863,20 +3487,42 @@ mod tests {
             enabled: true,
             invariants: GraphSanityInvariants {
                 // Old demoters parked OFF.
-                section_height_bounded_by_title: SectionHeightInvariantConfig { check: false, correct: false, tolerance: 2.0 },
-                section_paragraph_overlap: SectionParagraphOverlapInvariantConfig { check: false, correct: false, threshold: 0.0, bookmark_bypass: false },
-                section_overlap_count: SectionOverlapCountInvariantConfig { check: false, correct: false, count_threshold: 3, min_overlap_frac: 0.0 },
+                section_height_bounded_by_title: SectionHeightInvariantConfig {
+                    check: false,
+                    correct: false,
+                    tolerance: 2.0,
+                },
+                section_paragraph_overlap: SectionParagraphOverlapInvariantConfig {
+                    check: false,
+                    correct: false,
+                    threshold: 0.0,
+                    bookmark_bypass: false,
+                },
+                section_overlap_count: SectionOverlapCountInvariantConfig {
+                    check: false,
+                    correct: false,
+                    count_threshold: 3,
+                    min_overlap_frac: 0.0,
+                },
                 // New detectors ON.
-                section_detectors: SectionDetectorsConfig { height_flag: true, overlap_flag: false, count_flag: true },
+                section_detectors: SectionDetectorsConfig {
+                    height_flag: true,
+                    overlap_flag: false,
+                    count_flag: true,
+                },
                 // Prune enabled, mutate switch OFF.
-                section_prune: SectionPruneConfig { enabled: true, prune_on_detection: false, emit_evidence_artifact: false },
+                section_prune: SectionPruneConfig {
+                    enabled: true,
+                    prune_on_detection: false,
+                    emit_evidence_artifact: false,
+                },
                 // Rebalance off to isolate the node_type assertion.
                 topology_rebalance: topology_off(),
                 ..Default::default()
             },
         };
 
-        let report = apply(&mut graph, &cfg);
+        let report = apply(&mut graph, &cfg, None, None);
 
         // Accepted regression: NOTHING demoted — both stay Section.
         assert_eq!(graph.nodes[&title_id].node_type, "Section");
@@ -2896,7 +3542,7 @@ mod tests {
     #[test]
     fn test_cr71a_default_config_does_not_run_prune() {
         let (mut graph, _, _) = make_two_node_graph(1);
-        let report = apply(&mut graph, &full_correct_config());
+        let report = apply(&mut graph, &full_correct_config(), None, None);
         assert!(report.section_prune.is_none(), "prune step off by default");
     }
 }

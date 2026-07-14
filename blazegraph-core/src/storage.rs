@@ -13,15 +13,23 @@ use std::path::Path;
 
 /// A discrete cache point in the processing pipeline.
 /// Ordered by pipeline position: C0 < C1 < C2 < C3.
+///
+/// The tier split is intermediate-vs-output: C0–C2 are config-independent
+/// **intermediates** (keyed by `pdf_hash` alone); C3 is the config-dependent
+/// **output** — the finished `DocumentGraph`, keyed by `pdf_hash + config_hash`.
+/// `bgraph.md`/`bgraph.json` are serializations *of* C3, emitted on demand;
+/// the graph is the canonical, format-neutral output (`graph_sha256` is over
+/// it). This is why C3, and only C3, folds config into its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CachePoint {
-    /// C0: Original PDF bytes
+    /// C0: Original PDF bytes (source)
     C0,
-    /// C1: Blazegraph XHTML from Tika/JNI extraction
+    /// C1: Blazegraph XHTML from Tika/JNI extraction (intermediate)
     C1,
-    /// C2: PreprocessorOutput (parsed elements + metadata)
+    /// C2: PreprocessorOutput — parsed elements + metadata (intermediate)
     C2,
-    /// C3: DocumentGraph (bgraph.json, config-dependent)
+    /// C3: the cached **output** — the config-keyed `DocumentGraph`
+    /// (serialized to bgraph.md/json on demand)
     C3,
 }
 
@@ -136,6 +144,11 @@ pub struct CacheDefaults {
     pub c1_xhtml: bool,
     pub c2_preprocessor: bool,
     pub c3_graph: bool,
+    /// Analytics sidecar (`stat/**`) write policy. Not a cache tier — a
+    /// run-mode gate on the `dump_stats` write into the cache dir. A read-only
+    /// replay (golden freeze) sets this `false` so it never dirties the
+    /// committed fixture, independent of the config's `dump_analytics`.
+    pub stat: bool,
 }
 
 impl Default for CacheDefaults {
@@ -145,6 +158,7 @@ impl Default for CacheDefaults {
             c1_xhtml: true,
             c2_preprocessor: true,
             c3_graph: false,
+            stat: true,
         }
     }
 }

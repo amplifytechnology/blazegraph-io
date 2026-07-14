@@ -45,6 +45,24 @@ pub struct Region {
     /// `for i in leaf.element_indices: page.body_element_indices[i]` →
     /// document-wide index → `preprocessor_output.text_elements[that]`.
     pub element_indices: Vec<u32>,
+    /// CR-79 v2 grid-collapse signal. Set by `collapse_to_leaf` when the
+    /// column-divider merge flattens a v-cut subtree into this leaf — it
+    /// captures the absorbed column-boundary x-positions before the cut
+    /// structure is discarded (the 2026-05-04 table signal the merge would
+    /// otherwise throw away). `None` for natural leaves where no grid was
+    /// collapsed. Analytics-internal; never on the wire.
+    #[serde(default)]
+    pub grid: Option<GridSignal>,
+}
+
+/// The column grid a `collapse_to_leaf` absorbed. `vcut_xs` are the v-cut
+/// (column-boundary) x-positions gathered from the collapsed subtree;
+/// `n_vcuts` is their deduped count. A table absorbs a real column grid; a
+/// reference entry absorbs only the ragged number/text split.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GridSignal {
+    pub n_vcuts: u32,
+    pub vcut_xs: Vec<f32>,
 }
 
 /// Per-page Region tree plus the body-element index map the leaves refer
@@ -478,6 +496,7 @@ fn xy_cut(
             children,
             label: String::new(),
             element_indices: Vec::new(),
+            grid: None,
         };
     }
 
@@ -493,6 +512,7 @@ fn leaf(region_box: RegionBox, indices: &[u32]) -> Region {
         children: Vec::new(),
         label: String::new(),
         element_indices: indices.to_vec(),
+        grid: None,
     }
 }
 
@@ -760,10 +780,37 @@ fn aligns_with_divider(cut: f32, dividers: &[f32], tolerance: f32) -> bool {
 
 fn collapse_to_leaf(region: &mut Region) {
     let indices = gather_leaf_indices(region);
+    // CR-79 v2: capture the column grid the merge is about to discard. The
+    // node is a v-cut (column boundaries in `cut_coords`); gather every v-cut
+    // x-position in the subtree before flattening it into a leaf.
+    let grid = capture_grid_signal(region);
     region.axis = None;
     region.cut_coords.clear();
     region.children.clear();
     region.element_indices = indices;
+    region.grid = Some(grid);
+}
+
+/// Gather the v-cut (column-boundary) x-positions across `region`'s subtree,
+/// dedup'd within a small tolerance — the CR-79 v2 grid-collapse signal.
+fn capture_grid_signal(region: &Region) -> GridSignal {
+    let mut xs: Vec<f32> = Vec::new();
+    gather_vcut_xs(region, &mut xs);
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs.dedup_by(|a, b| (*a - *b).abs() < 2.0);
+    GridSignal {
+        n_vcuts: xs.len() as u32,
+        vcut_xs: xs,
+    }
+}
+
+fn gather_vcut_xs(region: &Region, out: &mut Vec<f32>) {
+    if matches!(region.axis, Some(CutAxis::V)) {
+        out.extend_from_slice(&region.cut_coords);
+    }
+    for child in &region.children {
+        gather_vcut_xs(child, out);
+    }
 }
 
 fn gather_leaf_indices(region: &Region) -> Vec<u32> {

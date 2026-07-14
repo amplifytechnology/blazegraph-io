@@ -400,6 +400,9 @@ impl<'a> NodeTypeClusteringRule<'a> {
             ParsedElementType::Header => &cfg.header,
             ParsedElementType::Footer => &cfg.footer,
             ParsedElementType::Margin => &cfg.margin,
+            // CR-79: a whole region tagged Table merges into one Table node
+            // (region IS the boundary; line/paragraph/depth gates dropped).
+            ParsedElementType::Table => &cfg.table,
         }
     }
 
@@ -589,6 +592,7 @@ mod tests {
                 ParsedElementType::Header => &cfg.header,
                 ParsedElementType::Footer => &cfg.footer,
                 ParsedElementType::Margin => &cfg.margin,
+                ParsedElementType::Table => &cfg.table,
             }
         };
 
@@ -1062,5 +1066,92 @@ merge_bands: false
         ];
         let out = run_rule(els, &cfg);
         assert_eq!(out.len(), 2);
+    }
+
+    /// CR-79 — a whole region tagged `Table` fuses into exactly ONE Table node
+    /// whose bbox is the union, regardless of line / paragraph / Y-gap.
+    /// `default_table()` drops every within-region gate, so multiple rows
+    /// (distinct paragraph_number + a large inter-row Y-gap) collapse to one.
+    #[test]
+    fn table_region_fuses_to_one_node_with_union_bbox() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        // Three "cells" in one region leaf "2-1": distinct paragraph numbers,
+        // distinct lines, and a deliberately large Y-gap between rows. Under
+        // the Paragraph default these would split; under Table they must fuse.
+        let mut p_a = mk_placement_in_region(5, 0, 0, 100.0, Some("2-1"));
+        p_a.bounding_box = BoundingBox {
+            x: 0.0,
+            y: 100.0,
+            width: 50.0,
+            height: 10.0,
+        };
+        let mut p_b = mk_placement_in_region(5, 1, 1, 300.0, Some("2-1"));
+        p_b.bounding_box = BoundingBox {
+            x: 60.0,
+            y: 300.0,
+            width: 50.0,
+            height: 10.0,
+        };
+        let mut p_c = mk_placement_in_region(5, 2, 2, 500.0, Some("2-1"));
+        p_c.bounding_box = BoundingBox {
+            x: 20.0,
+            y: 500.0,
+            width: 80.0,
+            height: 10.0,
+        };
+
+        let els = vec![
+            mk_element(ParsedElementType::Table, "h1 h2", 3, 0, p_a),
+            mk_element(ParsedElementType::Table, "a b", 3, 1, p_b),
+            mk_element(ParsedElementType::Table, "c d", 3, 2, p_c),
+        ];
+        let out = run_rule(els, &cfg);
+        assert_eq!(out.len(), 1, "whole table region must fuse into one node");
+        assert_eq!(out[0].element_type, ParsedElementType::Table);
+
+        // bbox = union of the three cells: x in [0, 110], y in [100, 510].
+        let bb = &out[0].pdf_placement().bounding_box;
+        assert!((bb.x - 0.0).abs() < 1e-3, "min x");
+        assert!((bb.y - 100.0).abs() < 1e-3, "min y");
+        assert!((bb.x + bb.width - 110.0).abs() < 1e-3, "max x = 60 + 50");
+        assert!((bb.y + bb.height - 510.0).abs() < 1e-3, "max y = 500 + 10");
+    }
+
+    /// CR-79 — two stacked tables in *different* region leaves on the same page
+    /// stay distinct (region IS the boundary), and a Table region never fuses
+    /// with an adjacent Paragraph region (type differs).
+    #[test]
+    fn distinct_table_regions_and_paragraphs_stay_separate() {
+        let cfg = crate::config::NodeTypeClusteringConfig::default();
+        let els = vec![
+            mk_element(
+                ParsedElementType::Table,
+                "table one",
+                3,
+                0,
+                mk_placement_in_region(5, 0, 0, 100.0, Some("2-1")),
+            ),
+            mk_element(
+                ParsedElementType::Table,
+                "table two",
+                3,
+                1,
+                mk_placement_in_region(5, 0, 0, 300.0, Some("3-1")),
+            ),
+            mk_element(
+                ParsedElementType::Paragraph,
+                "prose between",
+                4,
+                2,
+                mk_placement_in_region(5, 0, 0, 200.0, Some("2-2")),
+            ),
+        ];
+        let out = run_rule(els, &cfg);
+        assert_eq!(out.len(), 3, "two table regions + one paragraph = 3 nodes");
+        let tables = out
+            .iter()
+            .filter(|e| e.element_type == ParsedElementType::Table)
+            .count();
+        assert_eq!(tables, 2);
     }
 }

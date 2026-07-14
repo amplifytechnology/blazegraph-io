@@ -1,0 +1,305 @@
+# GENERATED — the complete, materialized config for this golden edition.
+# Every field is pinned explicitly so `config_hash` (hashed from the whole
+# config and embedded in document.bgraph.md) is immune to code-default drift:
+# moving a #[serde(default)] in code cannot silently re-key this frozen anchor.
+# Rewritten on BLESS_GOLDEN=1; do not hand-edit. (CR-89.)
+document_type: Generic
+section_and_hierarchy:
+  large_header_threshold: 0.7
+  medium_header_threshold: 0.5
+  small_header_threshold: 0.15
+  min_header_size: 9.5
+  use_bold_indicator: true
+  bold_size_strict: true
+  max_depth: 6
+  font_size_tolerance: 0.1
+  enforce_max_depth: true
+  starting_section_level: 1
+  min_alpha_ratio: 0.9
+  pattern_detection:
+    enabled: true
+    patterns:
+    - ^[A-Z][A-Z\s]{2,}$
+    - ^\d+\.\s+[A-Z][a-z]{3,}
+    - ^(Chapter|Section|Part|Article)\s+\d+
+    - ^[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*:$
+    respect_font_constraints: true
+spatial_clustering:
+  enabled: true
+  enable_paragraph_merging: true
+  enable_spatial_adjacency: true
+  min_line_height: 8.0
+  vertical_gap_threshold_multiplier: 10.0
+  horizontal_alignment_tolerance: 15.0
+  line_grouping_tolerance: 0.5
+  sections:
+    min_segment_size: 20
+    max_segment_size: 300
+  paragraphs:
+    min_segment_size: 50
+    max_segment_size: 3000
+section_patterns: []
+include_raw_tika: false
+include_style_info: false
+pipeline:
+  rules:
+  - name: TableDetection
+    enabled: false
+  - name: SectionDetectionV2
+    enabled: true
+  - name: PatternBasedSectionDetection
+    enabled: false
+  - name: ListDetection
+    enabled: false
+  - name: NodeTypeClustering
+    enabled: true
+  - name: SizeEnforcer
+    enabled: false
+  - name: Validation
+    enabled: false
+list_detection:
+  enabled: true
+  sequence_lookahead_elements: 10
+  sequence_boundary_extension: 3
+  y_tolerance: 10.0
+  bullet_patterns:
+  - •
+  - ·
+  - ●
+  - ■
+  - ▪
+  - ▫
+  - ◦
+  - ‣
+  - ⁃
+  - '-'
+  - '*'
+  - →
+  numbered_patterns:
+  - ^\d+\.
+  - ^\d+\)
+  - ^\(\d+\)
+  - ^[a-z]\.
+  - ^[a-z]\)
+  - ^[A-Z]\.
+  - ^[A-Z]\)
+  - ^[ivx]+\.
+  - ^[IVX]+\.
+  create_list_containers: true
+  preserve_list_items: false
+  max_lookahead_elements: 25
+  last_item_boundary_gap: 80.0
+  validation:
+    enabled: true
+    minimum_size_check: true
+    first_item_validation: true
+    parenthetical_context_check: true
+    sequential_numbering_check: true
+    mathematical_context_check: true
+    hyphen_context_check: true
+    sequential_numbering:
+      allow_letter_sequences: true
+      max_gap_tolerance: 0
+    mathematical_context:
+      symbols:
+      - →
+      - ←
+      - ⇒
+      - ⇐
+      - ∀
+      - ∃
+      terms:
+      - equation
+      - formula
+      - coordinates
+      - system
+      - transform
+    hyphen_context:
+      strategy: strict
+      require_space_after: true
+    sequence_pattern_check: false
+    content_quality_check: false
+    spatial_coherence_check: false
+size_enforcer:
+  enabled: true
+  max_size: 400
+  size_unit: characters
+  preserve_sentences: true
+  min_split_size_ratio: 0.25
+  recursive: true
+  max_iterations: 10
+  split_direction: vertical
+minimal_parse: false
+section_detection_v2:
+  line_height_tolerance: 3.0
+  font_size_tolerance: 0.1
+  structural_size_margin: 4.0
+  structural_size_ratio: null
+  min_alpha_ratio: 0.7
+  max_depth: 6
+  enforce_max_depth: true
+  starting_section_level: 1
+  numbered_seed_promotion: true
+  inclusion_patterns:
+  - pattern: (?i)^chapter\s+[IVXLCDM\d]+([\s\.\-–—:].*)?\s*$
+    require_bold: true
+    require_isolation: true
+  - pattern: (?i)^article\s+\d+[a-z]?\s*$
+    require_bold: true
+    require_isolation: true
+  - pattern: (?i)^section\s+\d+[a-z]?\s*$
+    require_bold: true
+    require_isolation: true
+  - pattern: (?i)^appendix\s+[A-Z\d]+\s*$
+    require_bold: true
+    require_isolation: true
+  inclusion_max_length: 20
+  exclusion_patterns:
+  - ^Figure\s+[A-Z0-9]
+  - ^Table\s+[A-Z0-9]
+  - ^\d+\.?\d*$
+  - ^[\d\s\.]+$
+  tiebreaker_keywords:
+  - name: part
+    pattern: (?i)^part\s+[IVXLCDM\d]+
+  - name: chapter
+    pattern: (?i)^chapter\s+[IVXLCDM\d]+
+  - name: article
+    pattern: (?i)^article\s+\d+[a-z]?
+  - name: section
+    pattern: (?i)^section\s+\d+[a-z]?
+  - name: appendix
+    pattern: (?i)^appendix\s+[A-Z\d]+
+  - name: schedule
+    pattern: (?i)^schedule\s+\d+
+  - name: annex
+    pattern: (?i)^annex\s+[IVX\d]+
+  - name: numbered
+    pattern: ^\d+\s+[A-Z]
+table_detection:
+  enabled: true
+  min_rows: 2
+  min_cols: 2
+  min_grid_vcuts: 1
+  min_column_consistency: 0.6
+  min_density: 0.0
+node_type_clustering:
+  section:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: false
+    region_overflow_threshold: null
+    same_depth: true
+    max_y_gap: 50.0
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  paragraph:
+    same_line: false
+    same_paragraph: true
+    ignore_region_label: false
+    region_overflow_threshold: 10
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  list:
+    same_line: false
+    same_paragraph: true
+    ignore_region_label: false
+    region_overflow_threshold: 10
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  list_item:
+    same_line: false
+    same_paragraph: true
+    ignore_region_label: false
+    region_overflow_threshold: 10
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  header:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: true
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  footer:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: true
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  margin:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: false
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+  table:
+    same_line: false
+    same_paragraph: false
+    ignore_region_label: false
+    region_overflow_threshold: null
+    same_depth: false
+    max_y_gap: null
+    prose_line_separator: ' '
+    table_line_separator: |2+
+
+graph_sanity:
+  enabled: true
+  invariants:
+    depth_consistency:
+      check: true
+      correct: true
+    section_height_bounded_by_title:
+      check: false
+      correct: false
+      tolerance: 2.0
+    section_paragraph_overlap:
+      check: false
+      correct: false
+      threshold: 0.2
+      bookmark_bypass: false
+    section_overlap_count:
+      check: false
+      correct: false
+      count_threshold: 3
+      min_overlap_frac: 0.0
+    topology_rebalance:
+      check: true
+      correct: true
+      max_section_depth: 4
+      max_total_depth: 5
+      document_title_nesting: true
+    numbering_restart:
+      check: true
+      correct: true
+    section_detectors:
+      height_flag: true
+      overlap_flag: true
+      count_flag: true
+    section_prune:
+      enabled: true
+      prune_on_detection: true
+      emit_evidence_artifact: false
+    min_confidence: 0
+dump_analytics: false

@@ -166,9 +166,7 @@ mod tests {
     fn xhtml_with(meta: &[(&str, &str)]) -> String {
         let mut s = String::from("<html><head>");
         for (name, content) in meta {
-            s.push_str(&format!(
-                "<meta name=\"{name}\" content=\"{content}\"/>"
-            ));
+            s.push_str(&format!("<meta name=\"{name}\" content=\"{content}\"/>"));
         }
         s.push_str("</head><body/></html>");
         s

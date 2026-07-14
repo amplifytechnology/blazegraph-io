@@ -204,6 +204,18 @@ pub struct GeometryStatsConfig {
     /// letter page) preserve enough resolution to distinguish body row
     /// from inter-line gap while collapsing PDF rendering noise.
     pub heatmap_cell_size: u32,
+
+    /// Maximum fraction of page height a detected header (or footer) zone
+    /// may occupy before it is rejected as untrustworthy (DT-08). The
+    /// header/footer walks assume content straddles the page middle and
+    /// that the aggregate heatmap is a structural signal; on a low-content
+    /// / single-page doc the middle can land in a gap, collapsing the body
+    /// band and tagging the whole body as chrome. A genuine running
+    /// header/footer is a small slice of the page (typically <10%); a zone
+    /// larger than this fraction is treated as a detection failure and the
+    /// band is disabled (boundary pushed to the page edge → that side is
+    /// all body). Default: 0.25.
+    pub max_chrome_zone_fraction: f32,
 }
 
 impl Default for GeometryStatsConfig {
@@ -219,6 +231,7 @@ impl Default for GeometryStatsConfig {
             column_min_drop_cols: 8,
             column_high_ratio: 0.50,
             heatmap_cell_size: 8,
+            max_chrome_zone_fraction: 0.25,
         }
     }
 }
@@ -394,8 +407,32 @@ fn finalize_geometry(
         config.min_gap_rows,
         config.max_footer_extent,
     );
-    let body_y_start = header.line.min(footer.line);
-    let body_y_end = header.line.max(footer.line);
+
+    // DT-08 guard: reject an over-large header/footer zone. A genuine running
+    // header/footer is a small slice of the page; a zone larger than
+    // `max_chrome_zone_fraction` means the walk landed in the wrong place
+    // (e.g. a low-content / single-page doc whose content doesn't straddle
+    // the page middle, collapsing the body band). Disable the offending band
+    // by pushing its boundary to the page edge so that side is treated as
+    // body, not chrome. Fires only on degenerate geometry — normal chrome is
+    // well under the threshold — so non-degenerate docs are untouched.
+    let max_chrome = (config.max_chrome_zone_fraction * height as f32).round() as usize;
+    let (header_line, header_reason) = if header.line > max_chrome {
+        (0usize, "rejected-oversized-header-zone".to_string())
+    } else {
+        (header.line, header.reason)
+    };
+    let (footer_line, footer_reason) = if height.saturating_sub(footer.line) > max_chrome {
+        (
+            height.saturating_sub(1),
+            "rejected-oversized-footer-zone".to_string(),
+        )
+    } else {
+        (footer.line, footer.reason)
+    };
+
+    let body_y_start = header_line.min(footer_line);
+    let body_y_end = header_line.max(footer_line);
     let left = find_left_margin(
         &heatmap,
         width,
@@ -413,8 +450,8 @@ fn finalize_geometry(
 
     let column_layout_result = find_column_layout(
         &heatmap,
-        header.line,
-        footer.line,
+        header_line,
+        footer_line,
         left.line,
         right.line,
         config.column_drop_ratio,
@@ -445,8 +482,8 @@ fn finalize_geometry(
         downsample_to_density_grid(&heatmap, width, height, config.heatmap_cell_size);
 
     GeometryStats {
-        header_y: header.line as f32,
-        doc_footer_y: footer.line as f32,
+        header_y: header_line as f32,
+        doc_footer_y: footer_line as f32,
         left_x: left.line as f32,
         right_x: right.line as f32,
         per_page_footer_y,
@@ -462,8 +499,8 @@ fn finalize_geometry(
         heatmap: density_grid,
         diagnostic: GeometryDiagnostic {
             heatmap_max,
-            header_reason: header.reason,
-            doc_footer_reason: footer.reason,
+            header_reason,
+            doc_footer_reason: footer_reason,
             left_margin_reason: left.reason,
             right_margin_reason: right.reason,
             column_peak: column_layout_result.peak,
@@ -1215,6 +1252,31 @@ mod tests {
             s.doc_footer_y
         );
         assert_eq!(s.diagnostic.header_reason, "found-significant-gap");
+    }
+
+    // --- 1b. DT-08 oversized-chrome guard (low-content / single page) ---------
+    #[test]
+    fn dt08_oversized_chrome_zone_rejected_on_low_content_page() {
+        // Content sits entirely in the top half of an 792pt page ([78, 365]).
+        // The header walk (up from middle≈396) and footer walk (down from
+        // middle) both collapse to the page middle, which would tag the whole
+        // body as chrome and leave an empty body band. The guard rejects both
+        // over-large zones and treats the page as all-body.
+        let mut elements = Vec::new();
+        push_solid_body(&mut elements, 1, 78.0, 365.0);
+        // Anchor page height at ~792.
+        elements.push(make_element(1, 599.9, 791.9, 0.05, 0.05, 10.0, 0));
+        let s = build_stats(&elements);
+        assert_eq!(s.header_y, 0.0, "oversized header zone reset to page top");
+        assert_eq!(
+            s.diagnostic.header_reason, "rejected-oversized-header-zone",
+            "header guard should fire"
+        );
+        assert!(
+            s.doc_footer_y > s.header_y && s.doc_footer_y >= 365.0,
+            "body band must span the content, not collapse; doc_footer_y={}",
+            s.doc_footer_y
+        );
     }
 
     // --- 2. No-header case ----------------------------------------------------

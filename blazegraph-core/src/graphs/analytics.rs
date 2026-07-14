@@ -2,19 +2,29 @@ use crate::types::*;
 use std::collections::HashMap;
 
 impl DocumentGraph {
-    /// Compute structural profile analytics for the entire graph
-    pub fn compute_structural_profile(&mut self) {
+    /// Compute the structural-profile aggregate for the entire graph.
+    ///
+    /// Block A / Amendment M (schema 0.8.0): `DocumentGraph` no longer
+    /// *carries* a `structural_profile` — the profile is a pure function
+    /// of the node set, json-only, recomputed at serialization time
+    /// (`to_sorted_graph` / `to_sequential_format`) and never hashed.
+    /// `document_type` is stamped `Generic`, mirroring the builder's
+    /// historical placeholder (classification is not implemented).
+    pub fn compute_structural_profile(&self) -> StructuralProfile {
         let all_nodes: Vec<&DocumentNode> = self.nodes.values().collect();
         let analytics = GraphAnalytics::compute_analytics(&all_nodes);
 
         // Extract total_tokens before moving analytics fields
         let total_tokens = analytics.token_distribution.overall.total_tokens;
 
-        // Update structural profile with analytics results
-        self.structural_profile.token_distribution = analytics.token_distribution;
-        self.structural_profile.node_type_distribution = analytics.node_type_distribution;
-        self.structural_profile.depth_distribution = analytics.depth_distribution;
-        self.structural_profile.total_tokens = total_tokens;
+        StructuralProfile {
+            document_type: DocumentType::Generic,
+            total_nodes: self.nodes.len(),
+            total_tokens,
+            token_distribution: analytics.token_distribution,
+            node_type_distribution: analytics.node_type_distribution,
+            depth_distribution: analytics.depth_distribution,
+        }
     }
 }
 

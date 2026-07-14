@@ -46,17 +46,41 @@ pub mod types;
 /// [`crate::preprocessors::md::strip`] and
 /// [`crate::preprocessors::md::types`] at module-root for downstream
 /// pinning. The re-export pattern follows the
-/// [`BGRAPH_MD_FORMAT_VERSION`] precedent.
+/// [`BGRAPH_FORMAT_VERSION`] precedent.
 pub use strip::strip;
 pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode};
 
-/// Current bgraph.md wire-format version targeted by the emitter.
-/// Follows X.Y.Z semantics formalized in spec § Versioning policy.
+/// The **schema/format version** — the single, serialization-neutral
+/// version of the emitted artifact. Stamped identically in **both**
+/// serializations: the bgraph.md doc-level `schema` field *and* the
+/// json wrapper's `SortedDocumentGraph.schema_version` (CR-87). The
+/// canonical graph is one thing; md and json are two faithful
+/// serializations of it (arch-14 §2/§6), so they advertise **one**
+/// version. Re-exported at crate root as [`crate::BGRAPH_FORMAT_VERSION`]
+/// so json-side and downstream consumers reach it without importing
+/// through a preprocessor module.
 ///
-/// Distinct from [`crate::types::SCHEMA_VERSION`] (in-memory graph
-/// schema), which moves at a different cadence. Downstream consumers
-/// pinning to the wire-format axis (URD's compile-time adapter assert,
-/// future tooling) target this constant.
+/// This is the **schema/format axis** of the version model (arch-15):
+/// "can my code read this shape?" — the structural contract, distinct
+/// from the **code axis** ([`crate::VERSION`], byte-stability /
+/// attribution) and the **preprocessor axis**
+/// ([`crate::cache::versions::PREPROCESSOR_INTERFACE_VERSION`], debug).
+///
+/// Follows X.Y.Z semantics = the *scale of node-ID churn* a consumer
+/// should expect (MAJOR: derivation rule changed, all IDs move; MINOR:
+/// additive structure, some IDs move; PATCH: affected nodes only). It
+/// is **not** the content discriminator — `graph_sha256` moves on any
+/// content change; this version tells a consumer how much to
+/// diff/migrate. See arch-15 § Version model.
+///
+/// CR-87 harmonized the json side onto this `5.x` lineage (json's
+/// `schema_version` went `0.9.0 → 5.0.0`, adopting the honest,
+/// consumer-visible history); the retired `SCHEMA_VERSION = 0.9.0`
+/// const was a mislabel. `graph_sha256` is unchanged — this const is a
+/// wrapper/envelope field, outside the hash.
+///
+/// Downstream consumers pinning to the format axis (URD's compile-time
+/// adapter assert, future tooling) target this constant.
 ///
 /// The parser at [`bgraph_md::parse`] accepts every previous major's
 /// shape as well, per the dual-support contract (spec § Amendment H).
@@ -64,7 +88,80 @@ pub use types::{ParseError, ParseIdentity, ParseOptions, ParseResult, StripMode}
 /// v2.4.0 (CR-78): additive — the per-element fence gains an optional
 /// `confidence: u8` field on Section nodes (detection-confidence
 /// annotation; omitted when `0`). No consumer reads it yet (Phase A).
-pub const BGRAPH_MD_FORMAT_VERSION: &str = "2.4.0";
+///
+/// v2.5.0 (CR-81 + CR-82): coordinated bump. CR-82 adds the doc-level
+/// `kind` discriminator (default `document`). CR-81 renames the
+/// navigational-outline fence `bgraph-bookmarks` → `bgraph-outline` and
+/// the JSON field `bookmark_data` → `outline_data`, and adds DOCX
+/// Table-of-Contents-SDT outline extraction. Pre-2.5.0 files still parse
+/// (kind defaults, both fence names accepted on read).
+///
+/// v3.0.0 (CR-83): **major** — every node ID's derivation changes. Node
+/// IDs move from positional-in-a-source-hash-namespace
+/// (`UUIDv5(UUIDv5(NS, "{source}:{config}"), text_order)`) to
+/// content+breadcrumb (`UUIDv5(NS, breadcrumb ‖ content ‖ occurrence)`).
+/// The result is document-unique (faithful round-trip) and edit-stable (a
+/// node keeps its ID unless its own content or heading-path changes).
+/// `text_order` stays as a node field (ordering/emission) but is no longer
+/// an ID input. The **read path / walk algorithm is unchanged** — the
+/// structural rule (split at the `` ```bgraph-<tag> `` line) is identical;
+/// only the *values* of the embedded `id` fields change. Files emitted
+/// under 1.x/2.x still parse structurally; their embedded IDs simply
+/// differ from what a fresh 3.0.0 reparse derives. See
+/// `docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment L.
+///
+/// v4.0.0 (Block A / Amendment M): **major** — the inaugural
+/// **content-only edition: identity became the content body.**
+/// `graph_sha256` is redefined from "canonical json incl. provenance"
+/// to the hash of the content body alone: `parse_provenance` and
+/// `structural_profile` leave the hash (envelope / json-wrapper
+/// concerns), the CR-78 `confidence` placeholder leaves the wire
+/// entirely, `flow_type` relocates onto `DocumentInfo`, and
+/// `token_count` stays (deterministic `words/4`, a function of the
+/// text alone — DT-01). Node IDs are **unchanged** (the Amendment L
+/// key never referenced the evicted fields); only the doc-level
+/// `graph_sha256` re-baselines. The walk algorithm is byte-identical
+/// to v2/v3, so 2.x/3.x files still parse structurally — but their
+/// stamped hashes were computed under the old definition and will not
+/// verify under the v4 recompute (use `--accept-drift` or regenerate).
+/// See `docs/P2/core/architecture/08-bgraph-md-format.md` § Amendment M.
+///
+/// v5.0.0 (CR-84): **major** — **node identity is finalized after
+/// topology settles.** The forward deterministic path re-keys every
+/// node ID from the post-`graph_sanity` topology (the shared
+/// derivation walk in `graphs::builder`), so the emitted IDs equal
+/// what the reverse parser re-derives from the emitted tree — the
+/// round-trip contract CR-83 promised but sanity-mutated (PDF)
+/// documents violated. The same pass finalizes `location.semantic.path`
+/// (the other build-time structural derivation sanity mutated out from
+/// under — hashed content, so it must be derivable too). **Node-canon
+/// impact:** IDs move *only* for documents where `graph_sanity` mutated
+/// topology (PDF rebalance / demotions); MD, DOCX, and clean PDFs emit
+/// byte-identical IDs v4→v5 (the re-key is idempotent on settled
+/// topology). Also: per-element
+/// `internal_refs` / `external_refs` are now retained on reverse parse
+/// (they were parse-and-dropped; always in the forward hash — a
+/// faithfulness fix riding this bump). The walk algorithm is
+/// byte-identical to v2/v3/v4, so older files still parse
+/// structurally; sanity-mutated v4 PDFs' stamped IDs/hashes will not
+/// verify under v5 (that is the honest answer — regenerate or
+/// `--accept-drift`).
+///
+/// **1.0.0 (Block C — the honest reset).** The `1.x → 5.x` lineage above
+/// is **internal pre-museum churn with no external consumer** (the "no
+/// fictional users" principle). Block C renumbers the format to its true
+/// inaugural edition — `1.0.0`, "edition one of the content-body-identity
+/// substrate" — declared once in the no-users window; arch-15's increment
+/// semantics apply normally from `1.0.0` forward. The read path now
+/// accepts **only `1.x`** (via the codec seam
+/// [`crate::graphs::serialization::version::FormatVersion`]); every other
+/// schema — including the retired `2.x`–`5.x` — is a clean
+/// `UnsupportedSchema`, not something to best-effort-read. Emit is
+/// byte-identical to the pre-reset `5.0.0` output except this version
+/// string and the json envelope's new `graph_sha256` field; the
+/// `graph_sha256` *value* is unchanged (the reset is a renumber, not a
+/// canonical-form change).
+pub const BGRAPH_FORMAT_VERSION: &str = "1.0.0";
 
 /// Parse a markdown string into a `DocumentGraph`.
 ///
@@ -121,9 +218,9 @@ mod tests {
     /// detection test, not a reconstruction test).
     fn sample_bgraph_md_header() -> &'static str {
         // v2.1.0+: doc-level block carries no `title` (moved to
-        // bgraph-metadata fence — CR-56 § I.4).
+        // bgraph-metadata fence — CR-56 § I.4). Block C: honest 1.0.0.
         "```bgraph\n\
-         {\"schema\":\"2.3.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
+         {\"schema\":\"1.0.0\",\"blazegraph_version\":\"0.6.0\",\"source\":{\"format\":\"pdf\",\"filename\":\"x.pdf\",\"sha256\":\"abc\"},\"flow_type\":\"Fixed\",\"config_hash\":\"def\",\"graph_sha256\":\"deadbeef\"}\n\
          ```\n"
     }
 
@@ -162,7 +259,6 @@ mod tests {
                 children: vec![para_id],
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
         nodes.insert(
@@ -188,27 +284,27 @@ mod tests {
                 children: Vec::new(),
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
         let graph = DocumentGraph {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
-                bookmark_data: None,
-                parse_provenance: Some(ParseProvenance {
-                    blazegraph_version: "0.6.0".to_string(),
-                    source_format: "markdown".to_string(),
-                    source_filename: "x.md".to_string(),
-                    source_sha256: "abc".to_string(),
-                    config_hash: "def".to_string(),
-                }),
+                outline_data: None,
+                flow_type: FlowType::default(),
                 topology: None,
             },
-            structural_profile: StructuralProfile::default(),
         };
-        let md = emit_markdown(&graph);
+        let provenance = ParseProvenance {
+            blazegraph_version: "0.6.0".to_string(),
+            source_format: "markdown".to_string(),
+            source_filename: "x.md".to_string(),
+            source_sha256: "abc".to_string(),
+            config_hash: "def".to_string(),
+        };
+        let md = emit_markdown(&graph, &provenance);
         assert!(
             is_bgraph_md(&md),
             "emitter output should sniff as bgraph.md"
@@ -266,13 +362,13 @@ mod tests {
     /// non-empty numeric segments — without locking in the exact
     /// value, which moves with each Amendment.
     #[test]
-    fn bgraph_md_format_version_is_valid_semver() {
-        let v = BGRAPH_MD_FORMAT_VERSION;
+    fn bgraph_format_version_is_valid_semver() {
+        let v = BGRAPH_FORMAT_VERSION;
         let parts: Vec<&str> = v.split('.').collect();
         assert_eq!(
             parts.len(),
             3,
-            "BGRAPH_MD_FORMAT_VERSION must be `major.minor.patch`; got {v:?}",
+            "BGRAPH_FORMAT_VERSION must be `major.minor.patch`; got {v:?}",
         );
         for (i, part) in parts.iter().enumerate() {
             assert!(

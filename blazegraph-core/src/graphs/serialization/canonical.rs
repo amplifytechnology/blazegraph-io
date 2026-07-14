@@ -39,11 +39,16 @@ use sha2::{Digest, Sha256};
 /// `serde_json::Value`, then walk the `Value` tree producing JSON with
 /// object keys sorted lexicographically.
 ///
-/// Note: `parse_provenance` is a sub-object inside `document_info` and
-/// is included in the canonical output. The bgraph.md `graph_sha256`
-/// field is *not* part of `DocumentGraph` (it's only stamped into the
-/// emitted markdown's document-level block), so canonical_json has no
-/// per-field exclusion list.
+/// Content-body invariant (Block A / Amendment M, arch-14 §3.1):
+/// `DocumentGraph` *is* the content body — provenance, derived
+/// aggregates (`structural_profile`), and envelope fields
+/// (`graph_sha256` itself, `schema_version`, `created_at`) live on the
+/// `SortedDocumentGraph` wrapper or are threaded as explicit values,
+/// never on this type. The body is hashed whole: canonical_json has no
+/// per-field exclusion list, and must never grow one — a field stored
+/// in the body but excluded from the hash would break `bytes ==
+/// identity` for every content-addressed consumer downstream (the
+/// CAS/URD composability argument, arch-11).
 pub fn canonical_json(graph: &DocumentGraph) -> String {
     let value = serde_json::to_value(graph).expect("DocumentGraph is always JSON-serializable");
     let mut out = String::new();
@@ -144,7 +149,6 @@ mod tests {
                 children: vec![para_id],
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
         nodes.insert(
@@ -170,7 +174,6 @@ mod tests {
                 children: Vec::new(),
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
 
@@ -178,18 +181,12 @@ mod tests {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
-                bookmark_data: None,
-                parse_provenance: Some(ParseProvenance {
-                    blazegraph_version: "0.6.0".to_string(),
-                    source_format: "markdown".to_string(),
-                    source_filename: "synthetic.md".to_string(),
-                    source_sha256: format!("{seed}-src"),
-                    config_hash: format!("{seed}-cfg"),
-                }),
+                outline_data: None,
+                flow_type: FlowType::default(),
                 topology: None,
             },
-            structural_profile: StructuralProfile::default(),
         }
     }
 
@@ -235,12 +232,77 @@ mod tests {
         assert_ne!(graph_sha256(&g_a), graph_sha256(&g_b));
     }
 
+    /// Block A / Amendment M gate test — the direct proof the
+    /// content-body line was drawn correctly. Builds a graph through
+    /// the real deterministic builder (the production path) and asserts
+    /// on the canonical form itself:
+    ///
+    /// - **absent**: `parse_provenance` (envelope — content-not-
+    ///   provenance rule, arch-14 §3.1), `structural_profile` (json-only
+    ///   derived aggregate — intersection rule, arch-14 §6),
+    ///   `confidence` (schema-ahead placeholder, removed).
+    /// - **present**: `flow_type` (identity scalar, relocated onto
+    ///   `document_info`) and `token_count` (deterministic `words/4`,
+    ///   deliberately in identity — DT-01).
+    #[test]
+    fn canonical_form_is_the_content_body_amendment_m() {
+        use crate::graphs::builder::GraphBuilder;
+        use crate::graphs::node_id::NodeIdGenerator;
+
+        let elements = vec![
+            SemanticTreeElement {
+                text: "Intro".to_string(),
+                element_type: SemanticElementType::Section,
+                hierarchy_level: 1,
+                text_order: 0,
+                physical_location: None,
+                style: None,
+                token_count: 1,
+                internal_refs: vec![],
+                external_refs: vec![],
+                // Non-zero upstream ingredient: must NOT surface in the
+                // canonical form (the old CR-78 path would have).
+                confidence: 6,
+            },
+            SemanticTreeElement {
+                text: "Hello world.".to_string(),
+                element_type: SemanticElementType::Paragraph,
+                hierarchy_level: 1,
+                text_order: 1,
+                physical_location: None,
+                style: None,
+                token_count: 2,
+                internal_refs: vec![],
+                external_refs: vec![],
+                confidence: 0,
+            },
+        ];
+        let graph = GraphBuilder::new()
+            .build_graph_deterministic(elements, &NodeIdGenerator::new())
+            .expect("graph builds");
+
+        let canonical = canonical_json(&graph);
+
+        for evicted in ["\"parse_provenance\"", "\"structural_profile\"", "\"confidence\""] {
+            assert!(
+                !canonical.contains(evicted),
+                "canonical form must not contain {evicted} — it is not content; got:\n{canonical}",
+            );
+        }
+        for kept in ["\"flow_type\"", "\"token_count\""] {
+            assert!(
+                canonical.contains(kept),
+                "canonical form must contain {kept} — it is content; got:\n{canonical}",
+            );
+        }
+    }
+
     #[test]
     fn canonical_json_keys_are_sorted() {
         // Spot-check: in canonical output the document_info object's
         // first key must be the lex-smallest of its present keys.
-        // Without bookmark_data (skip_serializing_if = None), the
-        // present keys are: document_metadata, parse_provenance, root_id
+        // Without outline_data (skip_serializing_if = None), the
+        // present keys are: document_metadata, kind, root_id
         // → smallest is "document_metadata".
         let graph = build_minimal_graph("seed");
         let canonical = canonical_json(&graph);

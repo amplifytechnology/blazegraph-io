@@ -54,26 +54,44 @@ pub enum FlowType {
 pub struct DocumentInfo {
     /// References the Document node in nodes[] (the tree root)
     pub root_id: NodeId,
+    /// Artifact discriminator (CR-82): what this bgraph *is*, orthogonal
+    /// to `source.format` (input format) and `flow_type` (topology).
+    /// `document` for the base parse; future producers emit `summary`,
+    /// `embedding`, etc. Defaults to `document` on read of pre-2.5.0
+    /// files (back-compatible). Part of the canonical graph identity, so
+    /// a `summary` and a `document` with identical content hash apart.
+    #[serde(default = "default_kind")]
+    pub kind: String,
     /// Metadata extracted from the source format (title, author, page count, etc.)
     pub document_metadata: DocumentMetadata,
-    /// PDF bookmarks/table of contents (if available in the source PDF)
+    /// Navigational outline, when the source carries a standardized one
+    /// (PDF `/Outlines` bookmarks; DOCX Table-of-Contents SDT — CR-81).
+    /// `None` otherwise (the slot is conditional). Inner type names keep
+    /// the `Bookmark*` spelling (Tika's term) by design; the wire/JSON
+    /// field is the cross-format-correct `outline_data`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bookmark_data: Option<BookmarkData>,
+    pub outline_data: Option<BookmarkData>,
 
-    /// Origin of this graph — the (version, source, config) triple that
-    /// reproduces it. Persisted on the graph so the bgraph.md emitter
-    /// (and any future round-trip consumer) has the load-bearing
-    /// identity inputs without re-deriving them.
+    /// Whether physical location data is meaningful for this document
+    /// (`Fixed` = PDF page geometry; `Free` = reflowable md/docx).
     ///
-    /// `None` for legacy graphs loaded from pre-0.6.0 graph.json files
-    /// and for graphs built via the legacy `GraphBuilder::build_graph`
-    /// path (random UUIDv4 IDs, no hash inputs anyway).
-    /// `Some(_)` for any graph built fresh through
-    /// `GraphBuilder::build_graph_deterministic`.
-    /// Schema 0.6.0 (B2 of MD+DOCX flow).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parse_provenance: Option<ParseProvenance>,
+    /// Schema 0.8.0 (Block A / Amendment M): relocated here from
+    /// `StructuralProfile`. It is a doc-level *identity scalar* — set
+    /// once by the source channel, part of the content body, in
+    /// `graph_sha256` — unlike the profile's derived aggregates, which
+    /// left the hash. `#[serde(default)]` (= `Fixed`) keeps pre-0.8.0
+    /// graph.json loadable.
+    #[serde(default)]
+    pub flow_type: FlowType,
 
+    // Schema 0.8.0 (Block A / Amendment M): `parse_provenance` no longer
+    // lives here. Provenance is *about the parse run*, not *of the
+    // document* (content-not-provenance rule, arch-14 §3.1) — keeping it
+    // on `DocumentInfo` put it inside `canonical_json(&DocumentGraph)`
+    // and thus inside `graph_sha256`, so every build/config change
+    // churned identity without the content changing. It now rides on
+    // `SortedDocumentGraph` (the on-disk wrapper) and is threaded as an
+    // explicit value through the emit/serialize paths.
     /// Parsing-semantics signal. Bgraph.md v2.1.0+ (CR-49):
     ///
     /// - `"tree"` — spacelike content (documents, notes, derived corpus.md
@@ -86,7 +104,6 @@ pub struct DocumentInfo {
     /// (cross-pack global vs pack-scoped) at write time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
-
     // CR-60 (2026-05-22) retracted `source_identity` and `supersedes`
     // here per the byte-in/byte-out schema-boundary principle
     // (`docs/P2/core/architecture/11-byte-in-byte-out.md`,
@@ -148,68 +165,28 @@ pub struct ParseProvenance {
     /// (hex-encoded).
     pub config_hash: String,
 }
-/// The schema version stamped on every graph output.
-/// Bump this when the output shape changes.
-///
-/// 0.4.0 — Block 05 of the document-analytics flow: dropped `document_info.document_analysis`.
-/// Analytics live in pipeline memory + sidecar dumps under `cache/stat/<name>/<hash>.json`,
-/// not in the graph output schema.
-///
-/// 0.5.0 — Block 06b reading-order resort: dropped legacy `Placement.band`,
-/// `Placement.column`, `Placement.nr_band_columns` (zeroed out since the
-/// Block 1 layout-reasoning consolidation); added `Placement.region_label`
-/// for region tree leaf annotation produced by `analytics::reading_order::tag_and_resort`.
-///
-/// 0.5.1 — Block 07 header/footer/margin classification: added `Header`,
-/// `Footer`, `Margin` variants to `ParsedElementType` (and matching
-/// `GroupType` variants). Element type is assigned at the
-/// `PdfTextElement` → `ParsedPdfElement` boundary from `region_label`
-/// (`H-*` → Header, `F-*` → Footer, `None` → Margin, body leaf labels →
-/// Paragraph). Section detection skips Header / Footer / Margin.
-///
-/// 0.6.0 — B2 of MD+DOCX flow:
-///   1. Added `DocumentInfo.parse_provenance: Option<ParseProvenance>`
-///      so the bgraph.md emitter can produce real (not placeholder)
-///      doc-level identity fields and downstream round-trip consumers
-///      can re-derive deterministic node IDs without re-reading the
-///      source bytes.
-///   2. Moved `created_at` from `StructuralProfile` to
-///      `SortedDocumentGraph` (the on-disk wrapper). `DocumentGraph`
-///      is now time-free, which is the canonical-input invariant
-///      required for `canonical_json(&DocumentGraph)` to be byte-
-///      deterministic across runs of the same logical graph.
-///
-/// Backwards-compatible: existing 0.5.1 graphs deserialize cleanly
-/// with `parse_provenance = None` and `SortedDocumentGraph.created_at`
-/// defaulting to the Unix epoch (clearly "no real value").
-///
-/// 0.7.0 — B6 of MD+DOCX flow:
-///   1. Added `CodeBlock`, `List`, `Blockquote`, `Table` variants to
-///      `SemanticElementType` (and their string counterparts in
-///      `DocumentNode.node_type`). These are produced by the markdown
-///      channel; the PDF channel never produces them. The union schema
-///      absorbs this asymmetry by design — graphs from one channel are
-///      a subset of `SemanticElementType` and that is a feature.
-///   2. Added canonical frontmatter fields to `DocumentMetadata`:
-///      `date: Option<String>`, `tags: Vec<String>` (default empty),
-///      `draft: Option<bool>`. These are the starting point for
-///      normalizing metadata across MD / PDF / DOCX.
-///   3. Added `DocumentMetadata.extras: BTreeMap<String,
-///      serde_json::Value>` — an opaque pass-through bucket for
-///      non-canonical frontmatter keys. YAML values are converted to
-///      JSON values at the frontmatter-parse boundary so the schema
-///      does not depend on the YAML library.
-///
-/// Backwards-compatible: existing 0.6.0 graphs deserialize cleanly
-/// because all new fields default (`Option::None` / `Vec::new` /
-/// `BTreeMap::new`), and the new enum variants are additive.
-pub const SCHEMA_VERSION: &str = "0.7.0";
+// CR-87 (version-axis harmonization): the standalone `SCHEMA_VERSION`
+// const (last value `0.9.0`) is **retired**. The json wrapper's
+// `schema_version` and the bgraph.md doc-level `schema` field now carry
+// the **one** serialization-neutral schema/format version —
+// [`crate::BGRAPH_FORMAT_VERSION`] (`5.x`). The old json-only `0.x`
+// lineage (0.4.0 → 0.9.0) was a mislabel diverging from the honest,
+// consumer-visible `5.x` format history; it is preserved in git and in
+// the version-model arch doc (arch-15). See `graph.rs::to_sorted_graph`
+// (the stamp site) and the drift-guard test in `graphs::serialization`.
 
+/// The in-memory graph — and, definitionally, the **content body**:
+/// `canonical_json(&DocumentGraph)` is the exact input to
+/// `graph_sha256`, hashed whole with no per-field exclusions (Block A /
+/// Amendment M; arch-14 §3.1). Anything that is not content — parse
+/// provenance, derived aggregates (`structural_profile`), emission
+/// metadata (`created_at`, `schema_version`) — lives on
+/// `SortedDocumentGraph` (the envelope/wrapper) or is threaded as an
+/// explicit value, never here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentGraph {
     pub nodes: HashMap<NodeId, DocumentNode>,
     pub document_info: DocumentInfo,
-    pub structural_profile: StructuralProfile,
 }
 
 /// The serialization-ready output format. Carries a schema version
@@ -217,6 +194,20 @@ pub struct DocumentGraph {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortedDocumentGraph {
     pub schema_version: String,
+    /// The content-body identity hash, embedded so a loaded graph.json is
+    /// **self-verifiable** — symmetric with the md doc-level block (Block
+    /// C.3). This is an **envelope** field: it wraps identity, is *not*
+    /// part of `canonical_json` / `graph_sha256` (which is computed over
+    /// `DocumentGraph` — the content body alone), and its value *equals*
+    /// the md doc-level block's `graph_sha256` for the same graph. Stamped
+    /// in `to_sorted_graph`; checked by
+    /// [`SortedDocumentGraph::verify_identity`].
+    ///
+    /// `#[serde(default)]` keeps pre-Block-C fixtures (which never carried
+    /// it) loadable — the default is the empty string, which
+    /// `verify_identity` treats as "no embedded hash to check against".
+    #[serde(default)]
+    pub graph_sha256: String,
     /// Wall-clock time at which this graph was serialized to disk.
     /// Lives on the wrapper (not on `DocumentGraph`) so `canonical_json`
     /// is deterministic across runs of the same logical graph — see
@@ -228,8 +219,27 @@ pub struct SortedDocumentGraph {
     /// sentinel rather than the misleading `Utc::now()`.
     #[serde(default = "default_created_at")]
     pub created_at: DateTime<Utc>,
+    /// Origin of this graph — the (version, source, config) triple that
+    /// reproduces it. Lives on the wrapper (not on `DocumentGraph`) so
+    /// it stays *outside* `canonical_json` / `graph_sha256`: provenance
+    /// is about the parse run, not of the document (content-not-
+    /// provenance rule — Block A / Amendment M, schema 0.8.0). Threaded
+    /// as an explicit value from the build/parse path via
+    /// `to_sorted_graph`. `#[serde(default)]` keeps pre-0.8.0 fixtures
+    /// (which carried it on `document_info`) loadable — the stale copy
+    /// inside `document_info` is silently dropped as an unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_provenance: Option<ParseProvenance>,
     pub nodes: Vec<DocumentNode>,
     pub document_info: DocumentInfo,
+    /// Derived aggregate view of the node set — json-only convenience,
+    /// recomputed at serialization time (`to_sorted_graph`), never part
+    /// of the canonical hash. Schema 0.8.0 (Block A / Amendment M):
+    /// relocated off `DocumentGraph` — it was in `graph_sha256` but
+    /// never in the stored md body, the inverse form of the arch-14 §6
+    /// intersection violation. `flow_type` (the one identity scalar it
+    /// carried) moved to `DocumentInfo`.
+    #[serde(default)]
     pub structural_profile: StructuralProfile,
 }
 
@@ -248,7 +258,16 @@ pub struct DocumentNode {
     pub location: NodeLocation,
     pub text_order: Option<u32>,
     pub content: NodeContent,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // CR-86 / DT-12: `style_info` is an **always-present, config-valued**
+    // field — never omitted. It serializes as `null` when style is off
+    // (the default edition) and as data when `--include-style-info` is on.
+    // The `skip_serializing_if` was removed so the key is always on the
+    // wire and always in `canonical_json` / `graph_sha256`: the value is
+    // gated at build time (see `processor::rules_and_graph`), so the graph
+    // carries the config-correct value and hash-equals-wire holds by
+    // construction. Always-present (not sometimes-present) keeps the field
+    // inside the arch-14 §6 intersection invariant trivially and out of the
+    // DT-11 empty→populated churn hazard.
     pub style_info: Option<StyleMetadata>,
     pub token_count: usize,
     pub parent: Option<NodeId>,
@@ -261,22 +280,17 @@ pub struct DocumentNode {
     /// CR-62 (v2.3.0+): references to external locations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_refs: Vec<ExternalRef>,
-    /// CR-78 (v2.4.0+): detection confidence for Section nodes
-    /// (`size_spine + Σ marker_bonuses`; see `ParsedPdfElement.confidence`).
-    /// `0` for non-Section nodes (and for any pre-v2.4.0 graph), and omitted
-    /// from the wire when `0` so those nodes stay byte-identical — the same
-    /// "skip when empty" discipline CR-62 used for the refs vecs. Phase A is
-    /// annotation-only; no consumer reads this yet.
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
-    pub confidence: u8,
-}
-
-/// `skip_serializing_if` predicate for [`DocumentNode::confidence`] (and the
-/// bgraph.md per-element fence emitter): omit the field from the wire (and the
-/// canonical hash) when it is `0`, so non-Section nodes and pre-CR-78 graphs
-/// serialize byte-identically to v2.3.0.
-pub(crate) fn is_zero_u8(v: &u8) -> bool {
-    *v == 0
+    // Schema 0.8.0 (Block A / Amendment M): the CR-78 `confidence`
+    // schema-ahead placeholder is REMOVED outright — no
+    // `skip_serializing_if` slot kept. A placeholder that is
+    // empty-now/populated-later silently churns `graph_sha256` at the
+    // empty→populated moment (absent-from-canonical-bytes →
+    // present-in-canonical-bytes) with no declared bump, so
+    // schema-ahead into the identity form is retired. The upstream
+    // ingredients (`ParsedPdfElement.confidence` →
+    // `SemanticTreeElement.confidence`) stay as the parser-internal
+    // signal; when a real consumer lands, the field enters via its own
+    // honest major bump.
 }
 
 impl DocumentNode {
@@ -301,7 +315,6 @@ impl DocumentNode {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
-            confidence: 0,
         }
     }
 
@@ -326,7 +339,6 @@ impl DocumentNode {
             children: Vec::new(),
             internal_refs: vec![],
             external_refs: vec![],
-            confidence: 0,
         }
     }
 
@@ -466,7 +478,9 @@ pub type StyleInfo = StyleMetadata;
 #[serde(default)]
 pub struct StructuralProfile {
     pub document_type: DocumentType,
-    pub flow_type: FlowType,
+    // Schema 0.8.0 (Block A): `flow_type` moved to `DocumentInfo` — it
+    // is a doc-level identity scalar, not a derived aggregate; it stays
+    // in `graph_sha256` while this struct leaves it.
     pub total_nodes: usize,
 
     // Analytics fields
@@ -691,9 +705,7 @@ pub enum PdfLinkKind {
     },
     /// External URI (typically `https://...`; future enrichment slice
     /// CR-63 may also produce `mailto:...` for pattern-detected emails).
-    ExternalUri {
-        url: String,
-    },
+    ExternalUri { url: String },
 }
 
 impl PdfTextElement {
@@ -769,14 +781,14 @@ pub struct DocumentMetadata {
 /// per `09-metadata-first-class.md` § Channel-specific (pdf).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PdfMetadata {
-    pub version: Option<String>,           // pdf:PDFVersion
-    pub producer: Option<String>,          // pdf:producer
-    pub creator_tool: Option<String>,      // xmp:CreatorTool
-    pub publisher: Option<String>,         // xmp:dc:publisher | dc:publisher
-    pub page_count: Option<u32>,           // xmpTPg:NPages
-    pub encrypted: Option<bool>,           // pdf:encrypted
-    pub has_marked_content: Option<bool>,  // pdf:hasMarkedContent
-    pub modified: Option<String>,          // dcterms:modified
+    pub version: Option<String>,          // pdf:PDFVersion
+    pub producer: Option<String>,         // pdf:producer
+    pub creator_tool: Option<String>,     // xmp:CreatorTool
+    pub publisher: Option<String>,        // xmp:dc:publisher | dc:publisher
+    pub page_count: Option<u32>,          // xmpTPg:NPages
+    pub encrypted: Option<bool>,          // pdf:encrypted
+    pub has_marked_content: Option<bool>, // pdf:hasMarkedContent
+    pub modified: Option<String>,         // dcterms:modified
     #[serde(default)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
@@ -874,6 +886,13 @@ pub struct BookmarkSection {
 
 fn default_bookmark_level() -> u32 {
     1
+}
+
+/// Default artifact kind for the base document parse (CR-82). Single
+/// source of truth for the `document` discriminator value, shared by the
+/// `DocumentInfo` serde default and the bgraph.md parse-side default.
+pub fn default_kind() -> String {
+    "document".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -1012,8 +1031,11 @@ pub struct SemanticTreeElement {
     /// CR-78 (v2.4.0+): detection confidence for spans promoted to Section
     /// (size spine R1=3/R2=2/R3=1 + marker bonuses: bookmark +3, numbered +2,
     /// isolated +1, bold +1). `0` for non-Section elements. Threaded from the
-    /// rule engine's `ParsedPdfElement.confidence` and projected onto
-    /// `DocumentNode.confidence`. Phase A is annotation-only.
+    /// rule engine's `ParsedPdfElement.confidence`. **Parser-internal
+    /// only** since schema 0.8.0 (Block A / Amendment M): it no longer
+    /// flows onto `DocumentNode` or the wire — kept as the upstream
+    /// ingredient for when a confidence signal earns a real, consumed
+    /// home via its own honest major bump.
     #[serde(default)]
     pub confidence: u8,
 }
@@ -1181,11 +1203,7 @@ impl SemanticElementType {
     /// wire-format domain.
     pub fn body_is_markdown_inline(self) -> bool {
         match self {
-            Self::Section
-            | Self::Paragraph
-            | Self::Header
-            | Self::Footer
-            | Self::Margin => true,
+            Self::Section | Self::Paragraph | Self::Header | Self::Footer | Self::Margin => true,
             Self::CodeBlock | Self::List | Self::Blockquote | Self::Table => false,
             Self::Message => panic!(
                 "SemanticElementType::Message::body_is_markdown_inline called — \
@@ -1250,8 +1268,9 @@ pub struct ParsedPdfElement {
     /// detection time in `rules::section_detection_v2`. `0` for non-Section
     /// elements (no consumer reads it there). Carried through clustering as
     /// the max across merged fragments, then projected onto
-    /// `SemanticTreeElement.confidence` → `DocumentNode.confidence`.
-    /// Phase A is annotation-only: nothing reads this to gate admission.
+    /// `SemanticTreeElement.confidence` — where the flow now stops
+    /// (schema 0.8.0 / Block A: no longer stamped on `DocumentNode` or
+    /// the wire). Nothing reads this to gate admission.
     #[serde(default)]
     pub confidence: u8,
 }
@@ -1275,6 +1294,12 @@ pub enum ParsedElementType {
     Header,
     Footer,
     Margin,
+    /// CR-79 (Tier 1): a region leaf the `TableDetectionRule` tagged as a
+    /// table from its `RegionSignature` (multi-column + regular rows). It is
+    /// an additive marker — set on every element in a qualifying region so
+    /// NodeTypeClustering fuses the whole region into one `Table` node (bbox =
+    /// union). No cell/row/column structure (that is Tier 2).
+    Table,
 }
 
 impl ParsedElementType {

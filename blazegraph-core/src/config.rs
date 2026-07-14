@@ -23,6 +23,20 @@ pub struct ParsingConfig {
     /// Include raw Tika XML/HTML output in graph metadata for debugging
     #[serde(default)]
     pub include_raw_tika: bool,
+    /// CR-86 / DT-12: when `true`, the build populates
+    /// `DocumentNode.style_info` (verbatim Tika style projection); when
+    /// `false` (default) the build leaves it `None` so the emitted
+    /// `style_info` is `null` on every node. This is a **build-time value
+    /// gate**, not a serialization gate — the field is *always* on the wire
+    /// (see `DocumentNode.style_info`); this flag only decides whether it
+    /// carries data. Because it lives on `ParsingConfig` it flows into
+    /// `config_hash`, so the null-style and data-style editions have
+    /// distinct `config_hash` (and distinct C3 cache keys — no collision).
+    /// Default `false`: style is debug / data-science-lab payload (~20%
+    /// output size, DT-03), kept behind the flag. `#[serde(default)]` keeps
+    /// pre-CR-86 YAML configs deserializing.
+    #[serde(default)]
+    pub include_style_info: bool,
     /// Pipeline configuration - defines which rules to run and in what order
     #[serde(default)]
     pub pipeline: PipelineConfig,
@@ -39,6 +53,12 @@ pub struct ParsingConfig {
     /// Uses `#[serde(default)]` so existing YAML configs without this key still deserialize.
     #[serde(default)]
     pub section_detection_v2: SectionDetectionV2Config,
+    /// Configuration for the CR-79 Tier 1 table-detection rule. Reads the
+    /// per-region `RegionSignature` (page_stats) and tags qualifying region
+    /// leaves `Table`. `#[serde(default)]` keeps configs that predate this key
+    /// deserializing.
+    #[serde(default)]
+    pub table_detection: TableDetectionConfig,
     /// Configuration for the NodeTypeClustering rule (CR-29; Block 05b — renamed
     /// from ParagraphClustering once Section started flowing through the same rule).
     /// Uses `#[serde(default)]` so existing YAML configs without this key still
@@ -75,6 +95,9 @@ pub struct NodeTypeClusteringConfig {
     pub header: NodeTypeMergeConfig,
     pub footer: NodeTypeMergeConfig,
     pub margin: NodeTypeMergeConfig,
+    /// CR-79 (Tier 1): merge config for region leaves tagged Table by the
+    /// TableDetectionRule. Tuned to fuse the *whole* region into one node.
+    pub table: NodeTypeMergeConfig,
 }
 
 impl Default for NodeTypeClusteringConfig {
@@ -87,6 +110,7 @@ impl Default for NodeTypeClusteringConfig {
             header: NodeTypeMergeConfig::default_header_footer(),
             footer: NodeTypeMergeConfig::default_header_footer(),
             margin: NodeTypeMergeConfig::default_margin(),
+            table: NodeTypeMergeConfig::default_table(),
         }
     }
 }
@@ -243,6 +267,26 @@ impl NodeTypeMergeConfig {
             table_line_separator: "\n".to_string(),
         }
     }
+
+    /// CR-79 (Tier 1) Table default: fuse the *whole* region into one node.
+    /// A table spans many lines / paragraphs / Y-gaps, so every within-region
+    /// gate is dropped — the region IS the table boundary (one node per
+    /// region leaf). `ignore_region_label: false` keeps two stacked tables in
+    /// distinct leaves separate; type differs from Paragraph so a table never
+    /// fuses with adjacent prose. `max_y_gap: None` keeps a big inter-row gap
+    /// from splitting the table.
+    pub fn default_table() -> Self {
+        Self {
+            same_line: false,
+            same_paragraph: false,
+            ignore_region_label: false,
+            same_depth: false,
+            max_y_gap: None,
+            region_overflow_threshold: None,
+            prose_line_separator: " ".to_string(),
+            table_line_separator: "\n".to_string(),
+        }
+    }
 }
 
 // ── Migration shim ───────────────────────────────────────────────────────────
@@ -322,6 +366,8 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
                 header: NodeTypeMergeConfig::default_header_footer(),
                 footer: NodeTypeMergeConfig::default_header_footer(),
                 margin: NodeTypeMergeConfig::default_margin(),
+                // CR-79: legacy configs predate Table — use the documented default.
+                table: NodeTypeMergeConfig::default_table(),
             });
         }
 
@@ -343,6 +389,8 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             footer: NodeTypeMergeConfig,
             #[serde(default = "NodeTypeMergeConfig::default_margin")]
             margin: NodeTypeMergeConfig,
+            #[serde(default = "NodeTypeMergeConfig::default_table")]
+            table: NodeTypeMergeConfig,
         }
         let n: NewShape = serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -353,7 +401,81 @@ impl<'de> Deserialize<'de> for NodeTypeClusteringConfig {
             header: n.header,
             footer: n.footer,
             margin: n.margin,
+            table: n.table,
         })
+    }
+}
+
+// ─── TableDetection config (CR-79; Tier 1 table-node detection) ───────────
+
+/// Configuration for the CR-79 `TableDetectionRule` (v2). The rule reads each
+/// body region leaf's `RegionSignature` (computed in `analytics/page_stats`)
+/// and tags the region `Table` when it passes the AND-gated metric:
+/// `n_peaks_y >= min_rows && aligned_cols >= min_cols
+///   && grid_vcuts >= min_grid_vcuts && column_consistency >= min_column_consistency
+///   && density >= min_density`.
+///
+/// v1's `y_peak_cv` row-regularity gate was dropped — it was backwards
+/// (reference lists are *more* regular than tables). v2 uses two complementary
+/// signals: **grid-collapse** (`grid_vcuts`, signal A — the XY-cut column grid
+/// the merge absorbed) and **column-consistency** (`aligned_cols` /
+/// `column_consistency`, signal B — columns recurring across rows, sparsity-
+/// robust). AND-gated for precision (a spurious Table steals content, so we'd
+/// rather miss one than flag a wrong node). `min_column_consistency` and
+/// `min_density` are the eyeball-tuned thresholds — calibrate against the
+/// off-wire debug dump + `scripts/table_overlay.py`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableDetectionConfig {
+    /// Master switch. When `false` the rule is a pass-through (no tagging, no
+    /// dump). The pipeline entry in `config.pipeline.rules` is the other gate.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Minimum visual rows (`n_peaks_y`). ≥2 ⇒ multi-row.
+    #[serde(default = "default_min_rows")]
+    pub min_rows: u32,
+    /// Minimum columns recurring across rows (`aligned_cols`). ≥2 separates a
+    /// table from a reference entry (whose only cross-row column is the indent).
+    #[serde(default = "default_min_cols")]
+    pub min_cols: u32,
+    /// Signal A floor: minimum v-cut column-boundaries the merge absorbed
+    /// (`grid_vcuts`). ≥1 ⇒ the XY-cut found a real column gutter here.
+    #[serde(default = "default_min_grid_vcuts")]
+    pub min_grid_vcuts: u32,
+    /// Signal B floor: minimum mean fill of the aligned columns. TUNE.
+    #[serde(default = "default_min_column_consistency")]
+    pub min_column_consistency: f32,
+    /// Fill-ratio floor on the per-document-normalized `density`. Soft floor,
+    /// default off (0.0). TUNE if needed.
+    #[serde(default = "default_min_density")]
+    pub min_density: f32,
+}
+
+fn default_min_rows() -> u32 {
+    2
+}
+fn default_min_cols() -> u32 {
+    2
+}
+fn default_min_grid_vcuts() -> u32 {
+    1
+}
+fn default_min_column_consistency() -> f32 {
+    0.6
+}
+fn default_min_density() -> f32 {
+    0.0
+}
+
+impl Default for TableDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            min_rows: default_min_rows(),
+            min_cols: default_min_cols(),
+            min_grid_vcuts: default_min_grid_vcuts(),
+            min_column_consistency: default_min_column_consistency(),
+            min_density: default_min_density(),
+        }
     }
 }
 
@@ -1448,11 +1570,13 @@ impl ConfigManager {
                 "references".to_string(),
             ],
             include_raw_tika: false, // Default to false for backward compatibility
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase - document type specific tuning
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            table_detection: TableDetectionConfig::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
             dump_analytics: true,
@@ -1503,11 +1627,13 @@ impl ConfigManager {
                 "conditions".to_string(),
             ],
             include_raw_tika: false, // Default to false for backward compatibility
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            table_detection: TableDetectionConfig::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
             dump_analytics: true,
@@ -1551,11 +1677,13 @@ impl ConfigManager {
                 "approach".to_string(),
             ],
             include_raw_tika: false, // Default to false for backward compatibility
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(), // TODO: OPTIMIZATION_DESIGN phase
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            table_detection: TableDetectionConfig::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
             dump_analytics: true,
@@ -1575,6 +1703,19 @@ impl ParsingConfig {
         let content = std::fs::read_to_string(path)?;
         let config: ParsingConfig = serde_yaml::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Serialize the fully-resolved config to YAML with **every field explicit**.
+    ///
+    /// This is the *complete* form frozen into a golden edition. Because
+    /// `config_hash` hashes the whole resolved config (and is embedded in the
+    /// emitted `document.bgraph.md` header), a *partial* config lets any
+    /// `#[serde(default)]` change in code silently re-key the frozen anchor:
+    /// the same file would load to a different struct → different hash → broken
+    /// freeze. Materializing every field pins the edition's identity to the
+    /// committed file alone, so we stay free to move defaults in code. (CR-89.)
+    pub fn to_yaml(&self) -> Result<String> {
+        Ok(serde_yaml::to_string(self)?)
     }
 
     /// Load config with fallback to default
@@ -1614,11 +1755,13 @@ impl Default for ParsingConfig {
             },
             section_patterns: vec![],
             include_raw_tika: false,
+            include_style_info: false, // CR-86: null-style default edition
             pipeline: PipelineConfig::default(),
             list_detection: ListDetectionConfig::default(),
             size_enforcer: SizeEnforcerConfig::default(),
             minimal_parse: false,
             section_detection_v2: SectionDetectionV2Config::default(),
+            table_detection: TableDetectionConfig::default(),
             node_type_clustering: NodeTypeClusteringConfig::default(),
             graph_sanity: GraphSanityConfig::default(),
             dump_analytics: true,

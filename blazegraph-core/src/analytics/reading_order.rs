@@ -344,6 +344,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: (0..n_body as u32).collect(),
+            grid: None,
         };
         PageRegions {
             page_number,
@@ -377,6 +378,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: left_indices,
+            grid: None,
         };
         let right = Region {
             r#box: RegionBox {
@@ -390,6 +392,7 @@ mod tests {
             children: vec![],
             label: "2".to_string(),
             element_indices: right_indices,
+            grid: None,
         };
         let root = Region {
             r#box: RegionBox {
@@ -403,6 +406,7 @@ mod tests {
             children: vec![left, right],
             label: "root".to_string(),
             element_indices: vec![],
+            grid: None,
         };
         PageRegions {
             page_number,
@@ -506,6 +510,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: vec![0, 1, 2],
+            grid: None,
         };
         let page = PageRegions {
             page_number: 1,
@@ -548,6 +553,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: vec![0, 1, 2],
+            grid: None,
         };
         let page = PageRegions {
             page_number: 1,
@@ -592,6 +598,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: vec![0],
+            grid: None,
         };
         let page = PageRegions {
             page_number: 1,
@@ -643,6 +650,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: vec![0],
+            grid: None,
         };
         let p2_leaf = p1_leaf.clone();
         let page1 = PageRegions {
@@ -708,6 +716,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: vec![0, 1, 2],
+            grid: None,
         };
         let page = PageRegions {
             page_number: 1,
@@ -850,6 +859,7 @@ mod tests {
             children: vec![],
             label: "1".to_string(),
             element_indices: vec![0, 1],
+            grid: None,
         };
         let page = PageRegions {
             page_number: 1,

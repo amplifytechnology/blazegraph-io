@@ -289,7 +289,7 @@ pub fn flag_section_overlap(
         .collect();
 
     let bookmark_titles: Option<HashSet<String>> = if cfg.bookmark_bypass {
-        graph.document_info.bookmark_data.as_ref().map(|bd| {
+        graph.document_info.outline_data.as_ref().map(|bd| {
             bd.sections
                 .iter()
                 .map(|s| crate::preprocessors::pdf::xhtml_parser::normalize_for_match(&s.title))
@@ -388,9 +388,7 @@ mod tests {
         SectionHeightInvariantConfig, SectionOverlapCountInvariantConfig,
         SectionParagraphOverlapInvariantConfig,
     };
-    use crate::types::{
-        BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation, StyleMetadata,
-    };
+    use crate::types::{BoundingBox, DocumentGraph, DocumentNode, PhysicalLocation, StyleMetadata};
     use uuid::Uuid;
 
     /// Spec for one node in a detector fixture.
@@ -461,16 +459,38 @@ mod tests {
     fn test_height_detector_flags_without_mutating() {
         // idx0 = title (h=18, depth-1 first-in-order), idx1 = tall section (h=50).
         let (graph, ids) = build(&[
-            Spec { node_type: "Section", text: "Title", font_family: Some("Times"), page: 1, bbox: (0.0, 0.0, 100.0, 18.0) },
-            Spec { node_type: "Section", text: "FLOPS", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 30.0, 100.0, 50.0) },
+            Spec {
+                node_type: "Section",
+                text: "Title",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 0.0, 100.0, 18.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "FLOPS",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 30.0, 100.0, 50.0),
+            },
         ]);
-        let cfg = SectionHeightInvariantConfig { check: true, correct: true, tolerance: 2.0 };
+        let cfg = SectionHeightInvariantConfig {
+            check: true,
+            correct: true,
+            tolerance: 2.0,
+        };
         let mut evidence = SectionEvidence::default();
         flag_section_height(&graph, &mut evidence, &cfg);
 
         // Threshold = 18 * 2.0 = 36; title h=18 (not flagged), FLOPS h=50 > 36 (flagged).
-        assert!(!evidence.per_node.contains_key(&ids[0]), "title not flagged");
-        let f = evidence.per_node.get(&ids[1]).expect("tall section flagged");
+        assert!(
+            !evidence.per_node.contains_key(&ids[0]),
+            "title not flagged"
+        );
+        let f = evidence
+            .per_node
+            .get(&ids[1])
+            .expect("tall section flagged");
         assert!(f.height_flag);
         assert!(!f.overlap_flag && !f.count_flag);
         assert_eq!(f.font_stem, "dejavusans");
@@ -482,10 +502,34 @@ mod tests {
     #[test]
     fn test_count_detector_flags_without_mutating() {
         let (graph, ids) = build(&[
-            Spec { node_type: "Section", text: "1B", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 0.0, 100.0, 100.0) },
-            Spec { node_type: "Paragraph", text: "p", font_family: Some("Times"), page: 1, bbox: (0.0, 0.0, 50.0, 50.0) },
-            Spec { node_type: "Figure", text: "f", font_family: None, page: 1, bbox: (50.0, 0.0, 50.0, 50.0) },
-            Spec { node_type: "Section", text: "x", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 50.0, 50.0, 50.0) },
+            Spec {
+                node_type: "Section",
+                text: "1B",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 0.0, 100.0, 100.0),
+            },
+            Spec {
+                node_type: "Paragraph",
+                text: "p",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 0.0, 50.0, 50.0),
+            },
+            Spec {
+                node_type: "Figure",
+                text: "f",
+                font_family: None,
+                page: 1,
+                bbox: (50.0, 0.0, 50.0, 50.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "x",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 50.0, 50.0, 50.0),
+            },
         ]);
         let cfg = SectionOverlapCountInvariantConfig {
             check: true,
@@ -496,13 +540,12 @@ mod tests {
         let mut evidence = SectionEvidence::default();
         flag_section_overlap_count(&graph, &mut evidence, &cfg);
 
-        let f = evidence.per_node.get(&ids[0]).expect("clustered section flagged");
+        let f = evidence
+            .per_node
+            .get(&ids[0])
+            .expect("clustered section flagged");
         assert!(f.count_flag);
-        assert_no_node_type_mutation(
-            &graph,
-            &ids,
-            &["Section", "Paragraph", "Figure", "Section"],
-        );
+        assert_no_node_type_mutation(&graph, &ids, &["Section", "Paragraph", "Figure", "Section"]);
     }
 
     /// CR-71A — the overlap-fraction detector flags a section sitting on top of a
@@ -510,12 +553,27 @@ mod tests {
     #[test]
     fn test_overlap_detector_and_off_sentinel() {
         let (graph, ids) = build(&[
-            Spec { node_type: "Section", text: "callout", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 0.0, 100.0, 100.0) },
-            Spec { node_type: "Paragraph", text: "body", font_family: Some("Times"), page: 1, bbox: (0.0, 0.0, 100.0, 100.0) },
+            Spec {
+                node_type: "Section",
+                text: "callout",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 0.0, 100.0, 100.0),
+            },
+            Spec {
+                node_type: "Paragraph",
+                text: "body",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 0.0, 100.0, 100.0),
+            },
         ]);
         // Off-sentinel: nothing flagged.
         let off = SectionParagraphOverlapInvariantConfig {
-            check: true, correct: true, threshold: 0.0, bookmark_bypass: false,
+            check: true,
+            correct: true,
+            threshold: 0.0,
+            bookmark_bypass: false,
         };
         let mut ev_off = SectionEvidence::default();
         flag_section_overlap(&graph, &mut ev_off, &off);
@@ -523,7 +581,10 @@ mod tests {
 
         // On: full overlap (frac 1.0 > 0.5) flags the section.
         let on = SectionParagraphOverlapInvariantConfig {
-            check: true, correct: true, threshold: 0.5, bookmark_bypass: false,
+            check: true,
+            correct: true,
+            threshold: 0.5,
+            bookmark_bypass: false,
         };
         let mut ev = SectionEvidence::default();
         flag_section_overlap(&graph, &mut ev, &on);
@@ -537,11 +598,41 @@ mod tests {
     fn test_aggregate_verdicts_plurality_and_bad() {
         // 3 Times sections (plurality), 2 DejaVuSans sections (the figure font).
         let (graph, ids) = build(&[
-            Spec { node_type: "Section", text: "1. A", font_family: Some("Times"), page: 1, bbox: (0.0, 0.0, 10.0, 10.0) },
-            Spec { node_type: "Section", text: "2. B", font_family: Some("Times"), page: 1, bbox: (0.0, 20.0, 10.0, 10.0) },
-            Spec { node_type: "Section", text: "3. C", font_family: Some("Times"), page: 1, bbox: (0.0, 40.0, 10.0, 10.0) },
-            Spec { node_type: "Section", text: "FLOPS", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 60.0, 10.0, 10.0) },
-            Spec { node_type: "Section", text: "1B", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 80.0, 10.0, 10.0) },
+            Spec {
+                node_type: "Section",
+                text: "1. A",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 0.0, 10.0, 10.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "2. B",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 20.0, 10.0, 10.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "3. C",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 40.0, 10.0, 10.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "FLOPS",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 60.0, 10.0, 10.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "1B",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 80.0, 10.0, 10.0),
+            },
         ]);
         let mut evidence = SectionEvidence::default();
         // Flag one DejaVuSans section (geometric seed) + one Times section.
@@ -561,14 +652,29 @@ mod tests {
     #[test]
     fn test_aggregate_verdicts_main_never_bad() {
         let (graph, ids) = build(&[
-            Spec { node_type: "Section", text: "1. A", font_family: Some("Times"), page: 1, bbox: (0.0, 0.0, 10.0, 10.0) },
-            Spec { node_type: "Section", text: "2. B", font_family: Some("Times"), page: 1, bbox: (0.0, 20.0, 10.0, 10.0) },
+            Spec {
+                node_type: "Section",
+                text: "1. A",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 0.0, 10.0, 10.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "2. B",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 20.0, 10.0, 10.0),
+            },
         ]);
         let mut evidence = SectionEvidence::default();
         evidence.entry_mut(ids[0], "times").count_flag = true; // a clustered real heading
         evidence.aggregate_verdicts(&graph);
         assert_eq!(evidence.main_font.as_deref(), Some("times"));
-        assert!(evidence.bad_fonts.is_empty(), "one clustered main-font heading can't condemn the doc");
+        assert!(
+            evidence.bad_fonts.is_empty(),
+            "one clustered main-font heading can't condemn the doc"
+        );
     }
 
     /// CR-71A — multiple detectors firing on the same section accumulate flags in
@@ -576,24 +682,66 @@ mod tests {
     #[test]
     fn test_multiple_flags_accumulate() {
         let (graph, ids) = build(&[
-            Spec { node_type: "Section", text: "Title", font_family: Some("Times"), page: 1, bbox: (0.0, 0.0, 100.0, 18.0) },
-            Spec { node_type: "Section", text: "FLOPS", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 0.0, 100.0, 100.0) },
-            Spec { node_type: "Paragraph", text: "p", font_family: Some("Times"), page: 1, bbox: (0.0, 0.0, 50.0, 50.0) },
-            Spec { node_type: "Figure", text: "f", font_family: None, page: 1, bbox: (50.0, 0.0, 50.0, 50.0) },
-            Spec { node_type: "Section", text: "x", font_family: Some("DejaVuSans"), page: 1, bbox: (0.0, 50.0, 50.0, 50.0) },
+            Spec {
+                node_type: "Section",
+                text: "Title",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 0.0, 100.0, 18.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "FLOPS",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 0.0, 100.0, 100.0),
+            },
+            Spec {
+                node_type: "Paragraph",
+                text: "p",
+                font_family: Some("Times"),
+                page: 1,
+                bbox: (0.0, 0.0, 50.0, 50.0),
+            },
+            Spec {
+                node_type: "Figure",
+                text: "f",
+                font_family: None,
+                page: 1,
+                bbox: (50.0, 0.0, 50.0, 50.0),
+            },
+            Spec {
+                node_type: "Section",
+                text: "x",
+                font_family: Some("DejaVuSans"),
+                page: 1,
+                bbox: (0.0, 50.0, 50.0, 50.0),
+            },
         ]);
         let mut evidence = SectionEvidence::default();
         flag_section_height(
             &graph,
             &mut evidence,
-            &SectionHeightInvariantConfig { check: true, correct: true, tolerance: 2.0 },
+            &SectionHeightInvariantConfig {
+                check: true,
+                correct: true,
+                tolerance: 2.0,
+            },
         );
         flag_section_overlap_count(
             &graph,
             &mut evidence,
-            &SectionOverlapCountInvariantConfig { check: true, correct: true, count_threshold: 3, min_overlap_frac: 0.0 },
+            &SectionOverlapCountInvariantConfig {
+                check: true,
+                correct: true,
+                count_threshold: 3,
+                min_overlap_frac: 0.0,
+            },
         );
         let f = evidence.per_node.get(&ids[1]).expect("FLOPS flagged");
-        assert!(f.height_flag && f.count_flag, "both predicates recorded on one node");
+        assert!(
+            f.height_flag && f.count_flag,
+            "both predicates recorded on one node"
+        );
     }
 }

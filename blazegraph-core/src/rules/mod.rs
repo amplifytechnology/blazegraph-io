@@ -12,6 +12,7 @@ pub mod node_type_clustering;
 pub mod section_detection;
 pub mod section_detection_v2;
 pub mod spatial_clustering;
+pub mod table_detection;
 pub mod validation;
 
 // Disabled modules (will be rewritten):

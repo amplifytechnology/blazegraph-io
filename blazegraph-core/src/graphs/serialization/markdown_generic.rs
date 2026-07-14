@@ -323,7 +323,6 @@ mod tests {
                     children: Vec::new(),
                     internal_refs: vec![],
                     external_refs: vec![],
-                    confidence: 0,
                 },
             );
         }
@@ -351,7 +350,6 @@ mod tests {
                 children: child_ids,
                 internal_refs: vec![],
                 external_refs: vec![],
-                confidence: 0,
             },
         );
 
@@ -359,12 +357,12 @@ mod tests {
             nodes,
             document_info: DocumentInfo {
                 root_id,
+                kind: crate::types::default_kind(),
                 document_metadata: DocumentMetadata::default(),
-                bookmark_data: None,
-                parse_provenance: None, // generic emitter doesn't need provenance
+                outline_data: None,
+                flow_type: FlowType::default(),
                 topology: None,
             },
-            structural_profile: StructuralProfile::default(),
         }
     }
 

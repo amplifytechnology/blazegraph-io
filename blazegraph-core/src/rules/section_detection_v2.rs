@@ -848,9 +848,18 @@ impl<'a> SectionDetectionV2Rule<'a> {
         // `placement.region_label` (Block 07). Skip section detection on them
         // so running headers, footers, and out-of-region marginalia never get
         // promoted to Section.
+        // CR-79: TableDetection runs before V2 and tags whole region leaves
+        // `Table`. Section detection must not re-type them — preserve the tag
+        // so the leaf reaches NodeTypeClustering as `Table` and fuses into one
+        // table node. (V2 only ever promotes Paragraph→Section, so this is a
+        // belt-and-suspenders guard against the pattern-refinement pass ever
+        // matching a Table fragment.)
         if matches!(
             current_element.element_type,
-            ParsedElementType::Header | ParsedElementType::Footer | ParsedElementType::Margin
+            ParsedElementType::Header
+                | ParsedElementType::Footer
+                | ParsedElementType::Margin
+                | ParsedElementType::Table
         ) {
             let content_level = hierarchy_context.get_content_level();
             return (current_element.element_type.clone(), content_level, 0);
@@ -1139,8 +1148,14 @@ impl<'a> SectionDetectionV2Rule<'a> {
             }
             // Leftmost segment on the line.
             let Some(&lead) = idxs.iter().min_by(|&&a, &&b| {
-                let xa = out[a].placement.as_ref().map_or(f32::MAX, |p| p.bounding_box.x);
-                let xb = out[b].placement.as_ref().map_or(f32::MAX, |p| p.bounding_box.x);
+                let xa = out[a]
+                    .placement
+                    .as_ref()
+                    .map_or(f32::MAX, |p| p.bounding_box.x);
+                let xb = out[b]
+                    .placement
+                    .as_ref()
+                    .map_or(f32::MAX, |p| p.bounding_box.x);
                 xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal)
             }) else {
                 continue;
@@ -1389,7 +1404,8 @@ mod tests {
             placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,            raw_tags: vec![],
+            token_count: 1,
+            raw_tags: vec![],
             link: None,
         }
     }
@@ -1427,7 +1443,8 @@ mod tests {
             },
             reading_order: 1,
             bookmark_match: None,
-            token_count: 1,            raw_tags: vec![],
+            token_count: 1,
+            raw_tags: vec![],
             link: None,
         }
     }
@@ -1983,7 +2000,8 @@ mod tests {
             placement: make_placement(line_number, 0),
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,            raw_tags: vec![],
+            token_count: 1,
+            raw_tags: vec![],
             link: None,
         }
     }
@@ -2077,7 +2095,8 @@ mod tests {
             },
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,            raw_tags: vec![],
+            token_count: 1,
+            raw_tags: vec![],
             link: None,
         }
     }
@@ -2262,7 +2281,8 @@ mod tests {
             },
             reading_order: 0,
             bookmark_match: None,
-            token_count: 1,            raw_tags: vec![],
+            token_count: 1,
+            raw_tags: vec![],
             link: None,
         }
     }
@@ -2399,9 +2419,18 @@ mod tests {
         let (config, fa, da, sd, eng) =
             build_pattern_rule_test(&elements, vec![], vec!["^Table\\s+[A-Z0-9]"]);
         let rule = SectionDetectionV2Rule::new(&eng, &elements, &config, &da, &fa, &sd);
-        assert!(!rule.apply_pattern_refinement(true, 0, "Table 1: Results"), "numbered caption demoted");
-        assert!(!rule.apply_pattern_refinement(true, 0, "Table B-1: Summary"), "lettered caption demoted");
-        assert!(rule.apply_pattern_refinement(true, 0, "Table of Contents"), "TOC heading survives");
+        assert!(
+            !rule.apply_pattern_refinement(true, 0, "Table 1: Results"),
+            "numbered caption demoted"
+        );
+        assert!(
+            !rule.apply_pattern_refinement(true, 0, "Table B-1: Summary"),
+            "lettered caption demoted"
+        );
+        assert!(
+            rule.apply_pattern_refinement(true, 0, "Table of Contents"),
+            "TOC heading survives"
+        );
     }
 
     /// CR-26 Test 5 — Length cap rejects long body wrap-lines.
@@ -2865,7 +2894,12 @@ mod tests {
             position: 0,
             style_info: FontClass {
                 class_name: "f13".to_string(),
-                font_family: if bold { "Noto-Serif-Bold" } else { "Noto-Serif" }.to_string(),
+                font_family: if bold {
+                    "Noto-Serif-Bold"
+                } else {
+                    "Noto-Serif"
+                }
+                .to_string(),
                 font_size: 13.0,
                 font_style: "normal".to_string(),
                 font_weight: if bold { "bold" } else { "normal" }.to_string(),
@@ -2873,7 +2907,12 @@ mod tests {
             },
             placement: Some(Placement {
                 page_number: 1,
-                bounding_box: BoundingBox { x, y, width, height: 19.1 },
+                bounding_box: BoundingBox {
+                    x,
+                    y,
+                    width,
+                    height: 19.1,
+                },
                 line_number: 0,
                 segment_number: 0,
                 rotation: 0,
@@ -2900,7 +2939,13 @@ mod tests {
     /// A full-width body line so the trailing-whitespace filter knows the
     /// column's right edge (66 → 518). Real headers stop well short of it.
     fn body_line() -> ParsedPdfElement {
-        seed_el_w("Body text spanning the full column width to the margin", 66.0, 40.0, false, 452.0)
+        seed_el_w(
+            "Body text spanning the full column width to the margin",
+            66.0,
+            40.0,
+            false,
+            452.0,
+        )
     }
 
     /// Sb8 — the canonical RFC depth-3 miss. A bold "3.5.2. " number and a bold
@@ -2913,14 +2958,30 @@ mod tests {
             body_line(),
             seed_el("3.5.2. ", 66.0, 468.0, true),
             seed_el("Reset Generation", 99.0, 468.0, true),
-            seed_el("A TCP user or application can issue a reset…", 66.0, 487.0, false),
+            seed_el(
+                "A TCP user or application can issue a reset…",
+                66.0,
+                487.0,
+                false,
+            ),
         ];
 
         SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
 
-        assert_eq!(out[1].element_type, ParsedElementType::Section, "number segment seeds");
-        assert_eq!(out[2].element_type, ParsedElementType::Section, "title segment seeds");
-        assert_eq!(out[1].hierarchy_level, 3, "depth = numbering component count");
+        assert_eq!(
+            out[1].element_type,
+            ParsedElementType::Section,
+            "number segment seeds"
+        );
+        assert_eq!(
+            out[2].element_type,
+            ParsedElementType::Section,
+            "title segment seeds"
+        );
+        assert_eq!(
+            out[1].hierarchy_level, 3,
+            "depth = numbering component count"
+        );
         assert_eq!(out[2].hierarchy_level, 3);
         assert_eq!(
             out[3].element_type,
@@ -2949,7 +3010,12 @@ mod tests {
     fn sb8_numbered_seed_requires_bold_title() {
         let mut out = vec![
             seed_el("1.4:", 66.0, 100.0, true),
-            seed_el("The risk management process and its outcomes", 90.0, 100.0, false),
+            seed_el(
+                "The risk management process and its outcomes",
+                90.0,
+                100.0,
+                false,
+            ),
         ];
         SectionDetectionV2Rule::promote_numbered_line_seeds(&mut out);
         assert_eq!(out[0].element_type, ParsedElementType::Paragraph);
@@ -2964,7 +3030,13 @@ mod tests {
     fn sb8_numbered_seed_skips_full_width_line() {
         let mut out = vec![
             body_line(), // column right edge = 518
-            seed_el_w("1.0 Privacy Framework Introduction ......... 5", 66.0, 100.0, true, 452.0),
+            seed_el_w(
+                "1.0 Privacy Framework Introduction ......... 5",
+                66.0,
+                100.0,
+                true,
+                452.0,
+            ),
             seed_el("3.5.2.", 66.0, 200.0, true),
             seed_el("Reset Generation", 99.0, 200.0, true),
         ];
@@ -2974,7 +3046,11 @@ mod tests {
             ParsedElementType::Paragraph,
             "full-width numbered line (TOC/body) leaves no trailing whitespace → filtered",
         );
-        assert_eq!(out[2].element_type, ParsedElementType::Section, "short header kept");
+        assert_eq!(
+            out[2].element_type,
+            ParsedElementType::Section,
+            "short header kept"
+        );
         assert_eq!(out[3].element_type, ParsedElementType::Section);
     }
 
@@ -3000,13 +3076,7 @@ mod tests {
     #[test]
     fn cr67_promote_same_class_same_height_fires() {
         let mut elements = vec![
-            make_parsed_for_promote(
-                ParsedElementType::Paragraph,
-                "**1.1.**",
-                "f7",
-                10.5,
-                3,
-            ),
+            make_parsed_for_promote(ParsedElementType::Paragraph, "**1.1.**", "f7", 10.5, 3),
             make_parsed_for_promote(
                 ParsedElementType::Section,
                 "**Document Structure**",
@@ -3037,20 +3107,8 @@ mod tests {
     #[test]
     fn cr67_promote_height_mismatch_no_promotion() {
         let mut elements = vec![
-            make_parsed_for_promote(
-                ParsedElementType::Paragraph,
-                "**1.1.**",
-                "f7",
-                10.5,
-                3,
-            ),
-            make_parsed_for_promote(
-                ParsedElementType::Section,
-                "**Title**",
-                "f7",
-                12.6,
-                2,
-            ),
+            make_parsed_for_promote(ParsedElementType::Paragraph, "**1.1.**", "f7", 10.5, 3),
+            make_parsed_for_promote(ParsedElementType::Section, "**Title**", "f7", 12.6, 2),
         ];
 
         SectionDetectionV2Rule::promote_section_fragments(&mut elements);
