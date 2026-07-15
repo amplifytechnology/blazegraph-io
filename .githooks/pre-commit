@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+# blazegraph-io pre-commit — secret gate for the public repo.
+# Two layers: (1) a filename guard that works even without gitleaks,
+# (2) a gitleaks content scan of the staged diff. Override with
+# `git commit --no-verify` only when you are certain a hit is a false positive.
+# Enable in a fresh clone with: make hooks   (or: git config core.hooksPath .githooks)
+
+# --- Layer 1: never let obvious secret-bearing files in, tool or no tool. ---
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+blocked=$(printf '%s\n' "$staged" | grep -iE '(^|/)(\.env(\..+)?|.+\.pem|.+\.key|id_rsa|id_ed25519|.+\.p12|.+\.pfx|.*credentials.*\.json|\.mimir\.keys)$')
+if [ -n "$blocked" ]; then
+  echo "✖ pre-commit: refusing to stage secret-bearing file(s):" >&2
+  printf '    %s\n' $blocked >&2
+  echo "  These belong in the secret manager, never in git. (--no-verify to override.)" >&2
+  exit 1
+fi
+
+# --- Layer 2: gitleaks content scan of staged changes (fast). ---
+if command -v gitleaks >/dev/null 2>&1; then
+  out=$(gitleaks git --staged --no-banner --redact 2>&1) || {
+    echo "✖ pre-commit: gitleaks flagged a potential secret in staged changes:" >&2
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    echo "  Review above (values are redacted). --no-verify to override a false positive." >&2
+    exit 1
+  }
+else
+  echo "⚠ pre-commit: gitleaks not installed — content scan skipped (filename guard still active)." >&2
+  echo "  Install it: brew install gitleaks" >&2
+fi

@@ -25,7 +25,12 @@ GOLDEN_CONFIG := $(GOLDEN_DIR)/config.yaml
 GOLDEN_MD     := $(GOLDEN_DIR)/document.bgraph.md
 GOLDEN_SHA    := $(GOLDEN_DIR)/PRODUCED_BY
 
-.PHONY: build-cli golden-generate golden-test
+.PHONY: build-cli golden-generate golden-test hooks
+
+hooks: ## Enable the repo's secret-scanning git hooks (see .githooks/README.md)
+	git config core.hooksPath .githooks
+	@echo "✅ Hooks enabled (core.hooksPath=.githooks)."
+	@command -v gitleaks >/dev/null 2>&1 || echo "⚠  gitleaks not found — install it: brew install gitleaks"
 
 build-cli: ## Build the JNI CLI (release) — needed to run a fresh Tika parse
 	cargo build --release -p blazegraph-io

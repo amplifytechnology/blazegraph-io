@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# blazegraph-io pre-push — full-history secret backstop before anything leaves
+# the machine. The pre-commit hook is the primary gate; this catches secrets
+# that were committed with --no-verify or landed before the hooks were enabled.
+# Override with `git push --no-verify` only when certain a hit is a false positive.
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "⚠ pre-push: gitleaks not installed — history scan skipped." >&2
+  echo "  Install it: brew install gitleaks" >&2
+  exit 0
+fi
+
+out=$(gitleaks git --no-banner --redact 2>&1) || {
+  echo "✖ pre-push: gitleaks found a potential secret in git history:" >&2
+  printf '%s\n' "$out" | sed 's/^/    /' >&2
+  echo "  A secret in history is exposed even if later removed — rotate it and scrub history." >&2
+  echo "  --no-verify to override a confirmed false positive." >&2
+  exit 1
+}
