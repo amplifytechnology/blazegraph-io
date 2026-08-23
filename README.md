@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> **This project continues as [Bragi](https://github.com/norse-stack/bragi-io)** — same parser, new name.
+> Code and releases live at [`norse-stack/bragi-io`](https://github.com/norse-stack/bragi-io); the hosted API and docs are at [bragi-io.com](https://bragi-io.com).
+> This repository is archived and read-only.
+
 # blazegraph-io
 
 Parse PDFs into semantic document graphs with bounding boxes. Built for GraphRAG.
